@@ -334,6 +334,7 @@ project "reVC"
 
 	filter "platforms:*oal"
 		defines { "AUDIO_OAL" }
+		includedirs { "vendor/dr_libs" }
 
 	filter {}
 	if(os.getenv("GTA_VC_RE_DIR")) then

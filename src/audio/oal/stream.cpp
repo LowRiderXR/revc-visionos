@@ -16,6 +16,10 @@
 #ifdef AUDIO_OAL_USE_MPG123
 #include <mpg123.h>
 #endif
+#ifdef AUDIO_OAL_USE_DRMP3
+#define DR_MP3_IMPLEMENTATION
+#include <dr_mp3.h>
+#endif
 #ifdef AUDIO_OAL_USE_OPUS
 #include <opusfile.h>
 #endif
@@ -693,6 +697,179 @@ public:
 };
 
 #endif
+
+#ifdef AUDIO_OAL_USE_DRMP3
+
+class CDrMP3File : public IDecoder
+{
+protected:
+	drmp3 m_Mp3;
+	FILE *m_pFileHandle;
+	bool m_bOpened;
+	bool m_bFileNotOpenedYet;
+	bool m_bXorObfuscated;
+	uint32 m_nRate;
+	uint32 m_nChannels;
+	const char *m_pPath;
+
+	static size_t r_read(void *pUserData, void *pBufferOut, size_t bytesToRead)
+	{
+		CDrMP3File *self = (CDrMP3File*)pUserData;
+		size_t bytesRead = fread(pBufferOut, 1, bytesToRead, self->m_pFileHandle);
+		if (self->m_bXorObfuscated)
+		{
+			uint8 *buf = (uint8*)pBufferOut;
+			for (size_t i = 0; i < bytesToRead; i++)
+				buf[i] ^= 0x22;
+		}
+		return bytesRead;
+	}
+
+	static drmp3_bool32 r_seek(void *pUserData, int offset, drmp3_seek_origin origin)
+	{
+		CDrMP3File *self = (CDrMP3File*)pUserData;
+		int whence = origin == DRMP3_SEEK_CUR ? SEEK_CUR : (origin == DRMP3_SEEK_END ? SEEK_END : SEEK_SET);
+		return fseek(self->m_pFileHandle, offset, whence) == 0 ? DRMP3_TRUE : DRMP3_FALSE;
+	}
+
+	static drmp3_bool32 r_tell(void *pUserData, drmp3_int64 *pCursor)
+	{
+		CDrMP3File *self = (CDrMP3File*)pUserData;
+		long pos = ftell(self->m_pFileHandle);
+		if (pos < 0) return DRMP3_FALSE;
+		*pCursor = pos;
+		return DRMP3_TRUE;
+	}
+
+	// used by CADFFile, doesn't open the file yet
+	CDrMP3File(bool bXorObfuscated) :
+		m_pFileHandle(nil),
+		m_bOpened(false),
+		m_bFileNotOpenedYet(false),
+		m_bXorObfuscated(bXorObfuscated),
+		m_nRate(0),
+		m_nChannels(0),
+		m_pPath(nil)
+	{
+		memset(&m_Mp3, 0, sizeof(m_Mp3));
+	}
+
+public:
+	CDrMP3File(const char *path) :
+		m_pFileHandle(nil),
+		m_bOpened(true),
+		m_bFileNotOpenedYet(true),
+		m_bXorObfuscated(false),
+		m_nRate(0),
+		m_nChannels(0),
+		m_pPath(path)
+	{
+		memset(&m_Mp3, 0, sizeof(m_Mp3));
+		// It's possible to move this to audioFileOpsThread(), but effect isn't noticable + probably not compatible with our current cutscene audio handling
+#if 1
+		FileOpen();
+#endif
+	}
+
+	void FileOpen()
+	{
+		if (!m_bFileNotOpenedYet) return;
+
+		m_pFileHandle = fopen(m_pPath, "rb");
+		m_bOpened = m_pFileHandle != nil
+			&& drmp3_init(&m_Mp3, r_read, r_seek, r_tell, nil, this, nil);
+
+		if (m_bOpened)
+		{
+			m_nRate = m_Mp3.sampleRate;
+			m_nChannels = m_Mp3.channels;
+		}
+		else if (m_pFileHandle)
+		{
+			fclose(m_pFileHandle);
+			m_pFileHandle = nil;
+		}
+
+		m_bFileNotOpenedYet = false;
+	}
+
+	~CDrMP3File()
+	{
+		if (m_bOpened)
+			drmp3_uninit(&m_Mp3);
+		if (m_pFileHandle)
+			fclose(m_pFileHandle);
+	}
+
+	bool IsOpened()
+	{
+		return m_bOpened;
+	}
+
+	uint32 GetSampleSize()
+	{
+		return sizeof(uint16);
+	}
+
+	uint32 GetSampleCount()
+	{
+		if ( !IsOpened() || m_bFileNotOpenedYet ) return 0;
+		return (uint32)drmp3_get_pcm_frame_count(&m_Mp3);
+	}
+
+	uint32 GetSampleRate()
+	{
+		return m_nRate;
+	}
+
+	uint32 GetChannels()
+	{
+		return m_nChannels;
+	}
+
+	void Seek(uint32 milliseconds)
+	{
+		if ( !IsOpened() || m_bFileNotOpenedYet ) return;
+		drmp3_seek_to_pcm_frame(&m_Mp3, ms2samples(milliseconds));
+	}
+
+	uint32 Tell()
+	{
+		if ( !IsOpened() || m_bFileNotOpenedYet ) return 0;
+		return samples2ms((uint32)m_Mp3.currentPCMFrame);
+	}
+
+	uint32 Decode(void *buffer)
+	{
+		if ( !IsOpened() || m_bFileNotOpenedYet ) return 0;
+
+		uint32 framesToRead = GetBufferSamples() / GetChannels();
+		drmp3_uint64 framesRead = drmp3_read_pcm_frames_s16(&m_Mp3, framesToRead, (drmp3_int16*)buffer);
+		uint32 size = (uint32)(framesRead * GetChannels() * GetSampleSize());
+
+		if (GetChannels() == 2)
+			SortStereoBuffer.SortStereo(buffer, size);
+
+		return size;
+	}
+};
+
+class CADFFile : public CDrMP3File
+{
+public:
+	CADFFile(const char *path) : CDrMP3File(true)
+	{
+		m_pPath = path;
+		m_bOpened = true;
+		m_bFileNotOpenedYet = true;
+		// It's possible to move this to audioFileOpsThread(), but effect isn't noticable + probably not compatible with our current cutscene audio handling
+#if 1
+		FileOpen();
+#endif
+	}
+};
+
+#endif
 #define VAG_LINE_SIZE (0x10)
 #define VAG_SAMPLES_IN_LINE (28)
 
@@ -1282,6 +1459,11 @@ bool CStream::Open(const char* filename, uint32 overrideSampleRate)
 #ifdef AUDIO_OAL_USE_MPG123
 	else if (!strcasecmp(&m_aFilename[strlen(m_aFilename) - strlen(".mp3")], ".mp3"))
 		m_pSoundFile = new CMP3File(m_aFilename);
+	else if (!strcasecmp(&m_aFilename[strlen(m_aFilename) - strlen(".adf")], ".adf"))
+		m_pSoundFile = new CADFFile(m_aFilename);
+#elif defined AUDIO_OAL_USE_DRMP3
+	else if (!strcasecmp(&m_aFilename[strlen(m_aFilename) - strlen(".mp3")], ".mp3"))
+		m_pSoundFile = new CDrMP3File(m_aFilename);
 	else if (!strcasecmp(&m_aFilename[strlen(m_aFilename) - strlen(".adf")], ".adf"))
 		m_pSoundFile = new CADFFile(m_aFilename);
 #endif
