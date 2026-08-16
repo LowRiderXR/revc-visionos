@@ -12,5 +12,5 @@
 	branch = master
 [submodule "vendor/librw"]
 	path = vendor/librw
-	url = https://github.com/LowRiderXR/librw-visionos.git
+	url = git@github.com:LowRiderXR/librw-visionos.git
 	branch = master
