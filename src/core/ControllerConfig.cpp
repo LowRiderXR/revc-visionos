@@ -47,6 +47,7 @@ void CControllerConfigManager::MakeControllerActionsBlank()
 
 #ifdef RW_GL3
 int MapIdToButtonId(int mapId) {
+#ifndef LIBRW_VISIONOS
 	switch (mapId) {
 		case GLFW_GAMEPAD_BUTTON_A: // Cross
 			return 2;
@@ -84,6 +85,14 @@ int MapIdToButtonId(int mapId) {
 		default:
 			return 0;
 	}
+#else
+	// TODO(visionos): Button-Mapping spaeter ueber GCController. ACHTUNG: 0 ist hier
+	// ein GUELTIGER Button-Wert (Cross wird auf 2 gemappt, aber default liefert 0),
+	// NICHT "kein Button" - dieser Stub darf nicht still als "nichts gedrueckt"
+	// durchgehen, sondern muss durch echtes Mapping ersetzt werden.
+	(void)mapId;
+	return 0;
+#endif
 }
 #endif
 
@@ -2805,6 +2814,7 @@ void CControllerConfigManager::UpdateJoyButtonState(int32 padnumber)
 			m_aButtonStates[i] = false;
 	}
 #elif defined RW_GL3
+#ifndef LIBRW_VISIONOS  // TODO(visionos): Gamepad-Buttons spaeter ueber GCController; vorerst keine Eingabe
 	if (m_NewState.isGamepad) {
 		for (int32 i = 0; i < MAX_BUTTONS; i++) {
 			if (i == GLFW_GAMEPAD_BUTTON_GUIDE)
@@ -2817,6 +2827,7 @@ void CControllerConfigManager::UpdateJoyButtonState(int32 padnumber)
 			m_aButtonStates[i] = m_NewState.buttons[i];
 		}
 	}
+#endif
 #endif
 }
 

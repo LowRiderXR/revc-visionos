@@ -307,6 +307,11 @@ wchar selectedJoystickUnicode[128];
 int cachedButtonNum = -1;
 
 wchar* DetectJoystickDraw(bool* disabled, bool userHovering) {
+#ifdef LIBRW_VISIONOS
+	// TODO(visionos): Joystick-Erkennung spaeter ueber GCController; vorerst immer "kein Controller gefunden".
+	AsciiToUnicode("Not found", selectedJoystickUnicode);
+	return selectedJoystickUnicode;
+#else
 
 #if defined RW_GL3 && !defined LIBRW_SDL2
 	int numButtons;
@@ -375,6 +380,7 @@ wchar* DetectJoystickDraw(bool* disabled, bool userHovering) {
 		AsciiToUnicode(gSelectedJoystickName, selectedJoystickUnicode);
 
 	return selectedJoystickUnicode;
+#endif  // !LIBRW_VISIONOS
 }
 
 void DetectJoystickGoBack() {

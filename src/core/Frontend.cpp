@@ -649,7 +649,9 @@ CMenuManager::CentreMousePointer()
 		ClientToScreen(PSGLOBAL(window), &Point);
 		SetCursorPos(Point.x, Point.y);
 #elif defined RW_GL3
+#ifndef LIBRW_VISIONOS  // TODO(visionos): Cursor-Zentrierung entfaellt (kein Fenster/Maus)
 		glfwSetCursorPos(PSGLOBAL(window), SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
+#endif
 #endif
 
 		PSGLOBAL(lastMousePos.x) = SCREEN_WIDTH / 2;
@@ -4962,11 +4964,13 @@ CMenuManager::ProcessUserInput(uint8 goDown, uint8 goUp, uint8 optionSelected, u
 						ControlsManager.InitDefaultControlConfigJoyPad(devCaps.dwButtons);
 					}
 #else
+#ifndef LIBRW_VISIONOS  // TODO(visionos): kein Controller gefunden; Anbindung spaeter ueber GCController
 					if (PSGLOBAL(joy1id) != -1 && glfwJoystickPresent(PSGLOBAL(joy1id))) {
 						int count;
 						glfwGetJoystickButtons(PSGLOBAL(joy1id), &count);
 						ControlsManager.InitDefaultControlConfigJoyPad(count);
 					}
+#endif
 #endif
 					MousePointerStateHelper.bInvertVertically = true;
 					TheCamera.m_bHeadBob = false;

@@ -65,7 +65,11 @@ int _caserename(const char *old_filename, const char *new_filename);
 #ifdef RW_GL3
 typedef struct
 {
+#ifdef LIBRW_VISIONOS
+    void* window;   // TODO(visionos): ANGLE-Kontext statt GLFW-Fenster
+#else
     GLFWwindow* window;
+#endif
     RwBool		fullScreen;
     RwV2d		lastMousePos;
     double      mouseWheel; // glfw doesn't cache it

@@ -870,6 +870,7 @@ CMouseControllerState CMousePointerStateHelper::GetMouseSetUp()
 		}
 	}
 #else
+#ifndef LIBRW_VISIONOS  // TODO(visionos): Maus entfaellt
 	// It seems there is no way to get number of buttons on mouse, so assign all buttons if we have mouse.
 	double xpos = 1.0f, ypos;
 	glfwGetCursorPos(PSGLOBAL(window), &xpos, &ypos);
@@ -881,6 +882,7 @@ CMouseControllerState CMousePointerStateHelper::GetMouseSetUp()
 		state.WHEELDN = true;
 		state.WHEELUP = true;
 	}
+#endif  // !LIBRW_VISIONOS
 #endif
 
 	return state;
@@ -929,6 +931,7 @@ void CPad::UpdateMouse()
 		}
 	}
 #else
+#ifndef LIBRW_VISIONOS  // TODO(visionos): Maus entfaellt
 	if ( IsForegroundApp() && PSGLOBAL(cursorIsInWindow) )
 	{
 		double xpos = 1.0f, ypos;
@@ -969,6 +972,7 @@ void CPad::UpdateMouse()
 		OldMouseControllerState = NewMouseControllerState;
 		NewMouseControllerState = PCTempMouseControllerState;
 	}
+#endif  // !LIBRW_VISIONOS
 #endif
 }
 
