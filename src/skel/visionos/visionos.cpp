@@ -18,6 +18,7 @@
 
 #include <mach/mach_time.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #include "common.h"
 #include "rwcore.h"
@@ -28,6 +29,11 @@
 // Hardcoded drawable resolution of the Vision Pro (per-eye). One video mode.
 #define VISIONOS_SCREEN_WIDTH  2048
 #define VISIONOS_SCREEN_HEIGHT 1984
+
+// ANGLE bring-up lives in visionos_angle.mm (ObjC++/Metal, kept out of this
+// C++ unit to avoid Foundation vs. reVC macro clashes). Returns success and,
+// via the out-param, ANGLE's eglGetProcAddress (as void*) for librw's glad.
+extern "C" bool vcgl_init_angle(void **outGetProcAddress);
 
 // ---------------------------------------------------------------------------
 // Globals the core expects but that only ever lived in glfw.cpp / win.cpp.
@@ -89,7 +95,34 @@ psInitialize(void)
 	// bei 0 gaebe der unsigned-Underflow ein absurdes Streaming-Budget.
 	_dwMemAvailPhys = (size_t)4 * 1024 * 1024 * 1024; // 4 GiB
 
-	// TODO(visionos): echtes Startup fehlt noch (kommt mit FS-/Kontext-Schritt):
+	// --- ANGLE + RenderWare bring-up -------------------------------------
+	// On visionOS there is no main() to drive the boot, so psInitialize brings
+	// up the ANGLE GLES 3.0 context and then runs the standard RW init chain
+	// (what glfw's main() does via rsRWINITIALIZE). The success criterion for
+	// this step is the log below, not a rendered frame.
+	void *glGetProcAddress = nil;
+	if (!vcgl_init_angle(&glGetProcAddress)) {
+		printf("[vc-gl] FAIL: ANGLE/EGL bring-up failed; RenderWare not initialised\n");
+		return FALSE;
+	}
+
+	// Hand the context to librw via EngineOpenParams.window: it carries ANGLE's
+	// eglGetProcAddress so gl3device (deviceSystemVisionOS) can load its GL
+	// entry points. librw does NOT create the context itself.
+	static rw::EngineOpenParams openParams;
+	openParams.width       = VISIONOS_SCREEN_WIDTH;
+	openParams.height      = VISIONOS_SCREEN_HEIGHT;
+	openParams.windowtitle = "reVC";
+	openParams.window      = glGetProcAddress;
+
+	printf("[vc-gl] RsEventHandler(rsRWINITIALIZE) ...\n");
+	if (RsEventHandler(rsRWINITIALIZE, &openParams) == rsEVENTERROR) {
+		printf("[vc-gl] FAIL: rsRWINITIALIZE - RwEngineOpen/RwEngineStart failed\n");
+		return FALSE;
+	}
+	printf("[vc-gl] OK: RenderWare initialised (RwEngineOpen + RwEngineStart, GL3 backend up)\n");
+
+	// TODO(visionos): echtes Startup (FS-/Sprach-Schritt) fehlt noch:
 	//   CFileMgr::Initialise(); InitialiseLanguage();
 	//   C_PcSave::SetSaveDirectory(_psGetUserFilesFolder());
 	//   FrontEndMenuManager.LoadSettings(); TheText.Unload();
