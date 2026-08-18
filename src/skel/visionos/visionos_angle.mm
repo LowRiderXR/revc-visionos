@@ -61,11 +61,16 @@ typedef EGLProc     (*PFN_eglGetProcAddress)(const char *);
 typedef EGLBoolean  (*PFN_eglQueryDisplayAttribEXT)(EGLDisplay, EGLint, EGLAttrib *);
 typedef EGLBoolean  (*PFN_eglQueryDeviceAttribEXT)(EGLDeviceEXT, EGLint, EGLAttrib *);
 
+typedef EGLBoolean  (*PFN_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+
 // EGL state owned here (the context is created here and handed to librw).
 static void      *g_libEGL    = NULL;
 static void      *g_libGLESv2 = NULL;
 static EGLDisplay g_display   = NULL;
 static EGLContext g_context   = NULL;
+// Kept so the game thread can claim the context and the init thread release it.
+static PFN_eglMakeCurrent   g_eglMakeCurrent   = NULL;
+static PFN_eglGetProcAddress g_eglGetProcAddress = NULL;
 
 #define VCLOG(...) NSLog(@"[vc-gl] " __VA_ARGS__)
 
@@ -191,9 +196,49 @@ vcgl_init_angle(void **outGetProcAddress)
 		VCLOG(@"eglQuery*AttribEXT unavailable (non-fatal)");
 	}
 
+	// Keep these for the cross-thread context handoff and GL fn resolution.
+	g_eglMakeCurrent    = eglMakeCurrent;
+	g_eglGetProcAddress = eglGetProcAddress;
+
 	if (outGetProcAddress) *outGetProcAddress = (void *)eglGetProcAddress;
 	VCLOG(@"ANGLE ready; handing eglGetProcAddress to librw");
 	return true;
+}
+
+// An EGL context is current on exactly one thread at a time. psInitialize()
+// creates+uses it on the init thread; the game thread must claim it before it
+// renders, and the init thread must release it first.
+
+// Release the context from the calling (init) thread. EGL_NO_SURFACE/CONTEXT = 0.
+extern "C" void
+vcgl_release_current(void)
+{
+	if (g_eglMakeCurrent && g_display)
+		g_eglMakeCurrent(g_display, (EGLSurface)0, (EGLSurface)0, (EGLContext)0);
+	VCLOG(@"released GL context from init thread");
+}
+
+// Claim the context on the calling (game) thread, surfaceless.
+extern "C" bool
+vcgl_make_current_on_this_thread(void)
+{
+	if (!g_eglMakeCurrent || !g_display || !g_context) {
+		VCLOG(@"FAIL make current: EGL not initialised");
+		return false;
+	}
+	if (!g_eglMakeCurrent(g_display, (EGLSurface)0, (EGLSurface)0, g_context)) {
+		VCLOG(@"FAIL eglMakeCurrent on game thread");
+		return false;
+	}
+	VCLOG(@"GL context current on game thread");
+	return true;
+}
+
+// ANGLE's eglGetProcAddress as a plain void*, for resolving GL fns without glad.
+extern "C" void *
+vcgl_get_proc_address(void)
+{
+	return (void *)g_eglGetProcAddress;
 }
 
 #endif // LIBRW_VISIONOS

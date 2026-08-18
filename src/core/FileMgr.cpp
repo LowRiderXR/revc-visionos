@@ -32,11 +32,72 @@ static myFILE myfiles[NUMFILES];
 #include <dirent.h>
 #include <errno.h>
 #include <unistd.h>
+#ifdef LIBRW_VISIONOS
+#include <string.h>
+#include <strings.h>
+#include <stdio.h>
+#include <limits.h>
+#endif
 #define _getcwd getcwd
 
 // Case-insensitivity on linux (from https://github.com/OneSadCookie/fcaseopen)
 void mychdir(char const *path)
 {
+#ifdef LIBRW_VISIONOS
+	// visionOS sandbox: the app may TRAVERSE (chdir) its ancestor directories
+	// but not LIST (readdir) them. casepath() case-corrects by listing each
+	// parent, so on an absolute path it gives up mid-walk (cantProceed) and
+	// leaves the game-relative tail (e.g. "TXD") in its original upper case;
+	// chdir() then fails silently on the case-sensitive filesystem. Instead we
+	// normalise backslashes and walk component by component: try the given case
+	// first (fine for the correct-case prefix and traversable ancestors), and
+	// only case-correct against the current (readable) directory on failure.
+	char norm[PATH_MAX];
+	strncpy(norm, path, sizeof(norm));
+	norm[sizeof(norm) - 1] = '\0';
+	for (char *c = norm; *c; c++)
+		if (*c == '\\')
+			*c = '/';
+
+	// Fast path: already-correct paths (incl. the data root) chdir directly.
+	if (chdir(norm) == 0)
+		return;
+
+	if (norm[0] == '/' && chdir("/") != 0) {
+		printf("[vc-fs] chdir failed: cannot enter '/' for '%s' (errno=%d %s)\n",
+		       path, errno, strerror(errno));
+		errno = ENOENT;
+		return;
+	}
+
+	char *saveptr = nil;
+	for (char *tok = strtok_r(norm, "/", &saveptr); tok != nil;
+	     tok = strtok_r(nil, "/", &saveptr)) {
+		if (chdir(tok) == 0)
+			continue; // correct case, or a traversable ancestor
+
+		// Wrong case: find a case-insensitive match in the current directory.
+		bool matched = false;
+		DIR *d = opendir(".");
+		if (d != nil) {
+			struct dirent *e;
+			while ((e = readdir(d)) != nil) {
+				if (strcasecmp(e->d_name, tok) == 0) {
+					matched = (chdir(e->d_name) == 0);
+					break;
+				}
+			}
+			closedir(d);
+		}
+		if (!matched) {
+			printf("[vc-fs] chdir failed at component '%s' of '%s' (errno=%d %s)\n",
+			       tok, path, errno, strerror(errno));
+			errno = ENOENT;
+			return;
+		}
+	}
+	printf("[vc-fs] chdir OK (case-corrected): %s\n", path);
+#else
 	char* r = casepath(path, false);
     if (r) {
         chdir(r);
@@ -44,6 +105,7 @@ void mychdir(char const *path)
     } else {
         errno = ENOENT;
     }
+#endif
 }
 #else
 #define mychdir chdir

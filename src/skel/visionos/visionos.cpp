@@ -26,6 +26,8 @@
 #include <dirent.h>   // opendir, readdir
 #include <sys/stat.h> // mkdir, stat
 #include <locale.h>   // setlocale
+#include <pthread.h>  // game thread
+#include <atomic>     // stop flag
 
 #include "common.h"
 #include "rwcore.h"
@@ -37,6 +39,8 @@
 #include "Text.h"
 #include "Game.h"
 #include "PCSave.h"
+#include "main.h"     // LoadingScreen, InitialiseGame
+#include "Timer.h"    // CTimer
 
 // Hardcoded drawable resolution of the Vision Pro (per-eye). One video mode.
 #define VISIONOS_SCREEN_WIDTH  2048
@@ -45,7 +49,13 @@
 // ANGLE bring-up lives in visionos_angle.mm (ObjC++/Metal, kept out of this
 // C++ unit to avoid Foundation vs. reVC macro clashes). Returns success and,
 // via the out-param, ANGLE's eglGetProcAddress (as void*) for librw's glad.
-extern "C" bool vcgl_init_angle(void **outGetProcAddress);
+extern "C" bool  vcgl_init_angle(void **outGetProcAddress);
+extern "C" bool  vcgl_make_current_on_this_thread(void); // claim GL ctx on game thread
+extern "C" void  vcgl_release_current(void);             // release GL ctx (init thread)
+extern "C" void *vcgl_get_proc_address(void);            // ANGLE eglGetProcAddress
+
+// End-of-frame publish (defined near the bottom; called from psCameraShowRaster).
+static void vc_publish_frame(void);
 
 // ---------------------------------------------------------------------------
 // Globals the core expects but that only ever lived in glfw.cpp / win.cpp.
@@ -258,6 +268,11 @@ psInitialize(void)
 	}
 	printf("[vc-gl] OK: RenderWare initialised (RwEngineOpen + RwEngineStart, GL3 backend up)\n");
 
+	// The GL context is current on THIS (init) thread. Release it so the game
+	// thread can claim it (see vc_game_thread_start). An EGL context may be
+	// current on only one thread at a time.
+	vcgl_release_current();
+
 	return TRUE;
 }
 
@@ -281,9 +296,10 @@ psCameraBeginUpdate(RwCamera *camera)
 void
 psCameraShowRaster(RwCamera *camera)
 {
-	// TODO(visionos): kein SwapBuffers; das Ergebnis wird ausserhalb von reVC
-	// in eine Metal-Textur geblittet.
-	return;
+	// No SwapBuffers on visionOS. This is the end-of-frame "present" point:
+	// publish the just-rendered frame for the compositor (double-buffer swap).
+	// TODO(visionos): the compositor blit of the shared texture comes later.
+	vc_publish_frame();
 }
 
 RwImage *
@@ -538,6 +554,249 @@ _psCreateFolder(const char *path)
 
 	if (!vc_path_exists(tmp))
 		mkdir(tmp, 0755);
+}
+
+// ===========================================================================
+// Frame publish  (double-buffer + GL fence scaffold)
+// ---------------------------------------------------------------------------
+// The game thread renders into a back buffer and, at end of frame, publishes it
+// as "ready" under a short lock; a GL fence marks GPU completion. A later step
+// wires the actual shared textures and the compositor blit; here we build the
+// hand-off mechanism (double buffer / ready index / fence).
+// ===========================================================================
+static pthread_mutex_t g_pubMutex   = PTHREAD_MUTEX_INITIALIZER;
+static int             g_backIndex  = 0;
+static int             g_readyIndex = -1;   // -1 = nothing finished yet
+static uint64_t        g_frameCount = 0;
+
+// GL fence entry points, resolved via ANGLE's getProcAddress (no glad here).
+typedef void *VCGLsync;
+typedef VCGLsync (*PFN_glFenceSync)(unsigned int condition, unsigned int flags);
+typedef void     (*PFN_glDeleteSync)(VCGLsync sync);
+static PFN_glFenceSync  p_glFenceSync  = nil;
+static PFN_glDeleteSync p_glDeleteSync = nil;
+static VCGLsync         g_fences[2]    = { nil, nil };
+static bool             g_pubReady     = false;
+
+static void
+vc_publish_init(void)
+{
+	typedef void *(*GetProc)(const char *);
+	GetProc gp = (GetProc)vcgl_get_proc_address();
+	if (gp) {
+		p_glFenceSync  = (PFN_glFenceSync)gp("glFenceSync");
+		p_glDeleteSync = (PFN_glDeleteSync)gp("glDeleteSync");
+	}
+	g_pubReady = true;
+	printf("[vc-pub] publish scaffold ready (fence=%s)\n",
+	       (p_glFenceSync && p_glDeleteSync) ? "yes" : "no");
+}
+
+// Called at end of frame from psCameraShowRaster on the GAME thread.
+static void
+vc_publish_frame(void)
+{
+	if (!g_pubReady)
+		return;
+
+	// GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117; the fence covers all prior GL work.
+	VCGLsync fence = p_glFenceSync ? p_glFenceSync(0x9117u, 0u) : nil;
+
+	pthread_mutex_lock(&g_pubMutex);
+	if (p_glDeleteSync && g_fences[g_backIndex])
+		p_glDeleteSync(g_fences[g_backIndex]);
+	g_fences[g_backIndex] = fence;
+	g_readyIndex = g_backIndex;      // publish the just-finished buffer
+	g_backIndex  = 1 - g_backIndex;  // render into the other one next
+	uint64_t n = ++g_frameCount;
+	pthread_mutex_unlock(&g_pubMutex);
+
+	if ((n % 300) == 1)
+		printf("[vc-pub] published frame %llu (readyIndex=%d)\n",
+		       (unsigned long long)n, g_readyIndex);
+}
+
+// Compositor-facing (used from the Metal side in a later step): index of the
+// most recently finished buffer, or -1 if none yet. Non-blocking.
+extern "C" int
+vc_acquire_ready_frame(void)
+{
+	pthread_mutex_lock(&g_pubMutex);
+	int idx = g_readyIndex;
+	pthread_mutex_unlock(&g_pubMutex);
+	return idx;
+}
+
+// ===========================================================================
+// Game loop  (ported from glfw.cpp main(); runs on its OWN thread)
+// ===========================================================================
+
+// These were file-scope statics in glfw.cpp; keep local equivalents here.
+static RwBool ForegroundApp   = TRUE;  // TODO(visionos): kein Fokus-Modell; immer Vordergrund
+static RwBool WindowIconified = FALSE; // TODO(visionos): kein Fenster; nie minimiert
+static RwBool RwInitialised   = TRUE;
+
+static std::atomic<bool> g_stop{false};
+static pthread_t         g_gameThread;
+static bool              g_gameThreadRunning = false;
+
+static const char *
+gGameStateName(RwUInt32 s)
+{
+	switch (s) {
+		case GS_START_UP:          return "GS_START_UP";
+		case GS_INIT_LOGO_MPEG:    return "GS_INIT_LOGO_MPEG";
+		case GS_LOGO_MPEG:         return "GS_LOGO_MPEG";
+		case GS_INIT_INTRO_MPEG:   return "GS_INIT_INTRO_MPEG";
+		case GS_INTRO_MPEG:        return "GS_INTRO_MPEG";
+		case GS_INIT_ONCE:         return "GS_INIT_ONCE";
+		case GS_INIT_FRONTEND:     return "GS_INIT_FRONTEND";
+		case GS_FRONTEND:          return "GS_FRONTEND";
+		case GS_INIT_PLAYING_GAME: return "GS_INIT_PLAYING_GAME";
+		case GS_PLAYING_GAME:      return "GS_PLAYING_GAME";
+		default:                   return "GS_?";
+	}
+}
+
+static void
+run_game_loop(void)
+{
+	// Claim the GL context on this (game) thread. All reVC rendering happens here.
+	if (!vcgl_make_current_on_this_thread()) {
+		printf("[vc-loop] FAIL: could not make GL context current on game thread\n");
+		return;
+	}
+	vc_publish_init();
+	printf("[vc-loop] game thread started\n");
+
+	// Outer restart loop, mirroring glfw.cpp main().
+	while (!g_stop.load()) {
+		RwInitialised = TRUE;
+
+		// Initial mouse position (no-op on visionOS). // TODO(visionos): keine Maus
+		RwV2d pos;
+		pos.x = RsGlobal.maximumWidth * 0.5f;
+		pos.y = RsGlobal.maximumHeight * 0.5f;
+		RsMouseSetPos(&pos);
+
+		RwUInt32 lastState = 0xFFFFFFFFu;
+
+		// Inner state-machine loop. glfwWindowShouldClose() -> our stop flag.
+		while (!g_stop.load() && !RsGlobal.quit && !FrontEndMenuManager.m_bWantToRestart) {
+			// TODO(visionos): glfwPollEvents() entfaellt; Eingaben spaeter via GCController.
+
+			if (gGameState != lastState) {
+				printf("[vc-loop] gGameState = %s\n", gGameStateName(gGameState));
+				lastState = gGameState;
+			}
+
+			if (ForegroundApp) {  // always TRUE on visionOS
+				switch (gGameState) {
+					case GS_START_UP:
+						gGameState = GS_INIT_ONCE; // TODO(visionos): keine Movies -> direkt weiter
+						break;
+
+					case GS_INIT_ONCE:
+						LoadingScreen(nil, nil, "loadsc0");
+						if (!CGame::InitialiseOnceAfterRW())
+							RsGlobal.quit = TRUE;
+						gGameState = GS_INIT_FRONTEND;
+						break;
+
+					case GS_INIT_FRONTEND:
+						LoadingScreen(nil, nil, "loadsc0");
+						FrontEndMenuManager.m_bGameNotLoaded = true;
+						FrontEndMenuManager.m_bStartUpFrontEndRequested = true;
+						gGameState = GS_FRONTEND;
+						break;
+
+					case GS_FRONTEND:
+						if (!WindowIconified)
+							RsEventHandler(rsFRONTENDIDLE, nil);
+						if (!FrontEndMenuManager.m_bMenuActive || FrontEndMenuManager.m_bWantToLoad)
+							gGameState = GS_INIT_PLAYING_GAME;
+						if (FrontEndMenuManager.m_bWantToLoad) {
+							InitialiseGame();
+							FrontEndMenuManager.m_bGameNotLoaded = false;
+							gGameState = GS_PLAYING_GAME;
+						}
+						break;
+
+					case GS_INIT_PLAYING_GAME:
+						InitialiseGame();
+						FrontEndMenuManager.m_bGameNotLoaded = false;
+						gGameState = GS_PLAYING_GAME;
+						break;
+
+					case GS_PLAYING_GAME: {
+						float ms = (float)CTimer::GetCurrentTimeInCycles() /
+						           (float)CTimer::GetCyclesPerMillisecond();
+						if (RwInitialised) {
+							if (!FrontEndMenuManager.m_PrefsFrameLimiter ||
+							    (1000.0f / (float)RsGlobal.maxFPS) < ms)
+								RsEventHandler(rsIDLE, (void *)TRUE);
+						}
+						break;
+					}
+
+					default:
+						// Movie states are skipped on visionOS.
+						gGameState = GS_INIT_ONCE;
+						break;
+				}
+			}
+		}
+
+		RwInitialised = FALSE;
+		FrontEndMenuManager.UnloadTextures();
+
+		if (!FrontEndMenuManager.m_bWantToRestart)
+			break;
+		FrontEndMenuManager.m_bWantToRestart = false;
+	}
+
+	printf("[vc-loop] game loop exited (quit=%d stop=%d)\n",
+	       (int)RsGlobal.quit, (int)g_stop.load());
+	vcgl_release_current();
+}
+
+static void *
+game_thread_main(void *arg)
+{
+	(void)arg;
+	pthread_setname_np("reVC game");
+	run_game_loop();
+	return nil;
+}
+
+// --- C interface for the Swift side ----------------------------------------
+// Start AFTER psInitialize() returned TRUE. Stop on teardown.
+extern "C" void
+vc_game_thread_start(void)
+{
+	if (g_gameThreadRunning) {
+		printf("[vc-loop] game thread already running\n");
+		return;
+	}
+	g_stop.store(false);
+	if (pthread_create(&g_gameThread, nil, game_thread_main, nil) == 0) {
+		g_gameThreadRunning = true;
+		printf("[vc-loop] game thread created\n");
+	} else {
+		printf("[vc-loop] FAIL: pthread_create\n");
+	}
+}
+
+extern "C" void
+vc_game_thread_stop(void)
+{
+	if (!g_gameThreadRunning)
+		return;
+	g_stop.store(true);
+	RsGlobal.quit = TRUE;
+	pthread_join(g_gameThread, nil);
+	g_gameThreadRunning = false;
+	printf("[vc-loop] game thread stopped\n");
 }
 
 #endif // LIBRW_VISIONOS
