@@ -19,12 +19,24 @@
 #include <mach/mach_time.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>   // getenv
+#include <string.h>   // strncmp
+#include <strings.h>  // strcasecmp
+#include <unistd.h>   // getcwd, chdir
+#include <dirent.h>   // opendir, readdir
+#include <sys/stat.h> // mkdir, stat
+#include <locale.h>   // setlocale
 
 #include "common.h"
 #include "rwcore.h"
 #include "skeleton.h"
 #include "platform.h"
 #include "crossplatform.h"
+#include "FileMgr.h"
+#include "Frontend.h"
+#include "Text.h"
+#include "Game.h"
+#include "PCSave.h"
 
 // Hardcoded drawable resolution of the Vision Pro (per-eye). One video mode.
 #define VISIONOS_SCREEN_WIDTH  2048
@@ -49,6 +61,113 @@ char gSelectedJoystickName[128] = "";
 
 // Backing storage that RsGlobal.ps points at (see PSGLOBAL()).
 static psGlobalType PsGlobal;
+
+// ---------------------------------------------------------------------------
+// File system (visionOS): the game data lives in the app's Documents folder.
+// casepath() resolves relative "models\\coll\\..." against the cwd, and
+// CFileMgr::Initialise() freezes the cwd as the data root, so we must chdir()
+// into the data root BEFORE CFileMgr::Initialise() runs.
+// ---------------------------------------------------------------------------
+
+// The seven top-level folders reVC expects in the data root.
+static const char *kExpectedDataDirs[7] = {
+	"anim", "audio", "data", "models", "movies", "TEXT", "txd"
+};
+
+static char g_dataRoot[1024]  = "";
+static char g_userFiles[1024] = "";
+
+// $HOME/Documents in the app sandbox (no ObjC needed on iOS/visionOS).
+static bool
+vc_documents_path(char *out, size_t outsz)
+{
+	const char *home = getenv("HOME");
+	if (home == nil || home[0] == '\0')
+		return false;
+	snprintf(out, outsz, "%s/Documents", home);
+	return true;
+}
+
+static bool
+vc_path_exists(const char *path)
+{
+	struct stat st;
+	return stat(path, &st) == 0;
+}
+
+// Case-insensitive check whether directory `root` contains an entry `name`.
+static bool
+vc_dir_has(const char *root, const char *name)
+{
+	DIR *d = opendir(root);
+	if (d == nil)
+		return false;
+	bool found = false;
+	struct dirent *e;
+	while ((e = readdir(d)) != nil) {
+		if (strcasecmp(e->d_name, name) == 0) { found = true; break; }
+	}
+	closedir(d);
+	return found;
+}
+
+// Locate the game-data root under Documents, chdir into it, set up the
+// user-files folder path. Logs the chosen root and which folders were found.
+// Returns false (with a clear message) if the data is missing.
+static bool
+vcfs_setup(void)
+{
+	char documents[1024];
+	if (!vc_documents_path(documents, sizeof(documents))) {
+		printf("[vc-fs] ERROR: could not determine Documents folder (HOME unset)\n");
+		return false;
+	}
+	printf("[vc-fs] Documents = %s\n", documents);
+
+	// Candidate data roots, in order of preference.
+	char cand[3][1024];
+	snprintf(cand[0], sizeof(cand[0]), "%s", documents);
+	snprintf(cand[1], sizeof(cand[1]), "%s/Game", documents);
+	snprintf(cand[2], sizeof(cand[2]), "%s/GTAVC", documents);
+
+	const char *chosen = nil;
+	for (int i = 0; i < 3; i++) {
+		bool exists    = vc_path_exists(cand[i]);
+		bool hasModels = exists && vc_dir_has(cand[i], "models");
+		printf("[vc-fs] candidate '%s': exists=%s models=%s\n",
+		       cand[i], exists ? "yes" : "no", hasModels ? "yes" : "no");
+		if (hasModels && chosen == nil)
+			chosen = cand[i];
+	}
+
+	if (chosen == nil) {
+		printf("[vc-fs] ERROR: game data not found.\n");
+		printf("[vc-fs]   Looked in: %s | %s | %s\n", cand[0], cand[1], cand[2]);
+		printf("[vc-fs]   Copy the seven data folders (anim, audio, data, models,\n");
+		printf("[vc-fs]   movies, TEXT, txd) into: %s\n", documents);
+		return false;
+	}
+
+	snprintf(g_dataRoot, sizeof(g_dataRoot), "%s", chosen);
+	printf("[vc-fs] using data root: %s\n", g_dataRoot);
+	for (int i = 0; i < 7; i++) {
+		printf("[vc-fs]   %-7s : %s\n", kExpectedDataDirs[i],
+		       vc_dir_has(g_dataRoot, kExpectedDataDirs[i]) ? "found" : "MISSING");
+	}
+
+	if (chdir(g_dataRoot) != 0) {
+		printf("[vc-fs] ERROR: chdir to data root failed\n");
+		return false;
+	}
+
+	// Settings/saves live in a separate, writable sub-folder in Documents.
+	snprintf(g_userFiles, sizeof(g_userFiles), "%s/GTA Vice City User Files", documents);
+	return true;
+}
+
+// Defined further down; used by psInitialize (same signatures the core expects).
+const char *_psGetUserFilesFolder();
+void        _psCreateFolder(const char *path);
 
 // ===========================================================================
 // Timer  --  REAL implementation (the one exception to "stub everything").
@@ -95,6 +214,23 @@ psInitialize(void)
 	// bei 0 gaebe der unsigned-Underflow ein absurdes Streaming-Budget.
 	_dwMemAvailPhys = (size_t)4 * 1024 * 1024 * 1024; // 4 GiB
 
+	// --- File system: find the game data and make it the working directory ---
+	// Must run BEFORE CFileMgr::Initialise() (which captures the cwd as the data
+	// root). On missing data: clear message + orderly abort (return FALSE).
+	if (!vcfs_setup()) {
+		printf("[vc-fs] ERROR: aborting init - game data not available\n");
+		return FALSE;
+	}
+
+	// With the cwd at the data root, wire up reVC's file/text/settings layer
+	// exactly as glfw.cpp's psInitialize does.
+	CFileMgr::Initialise();                            // captures cwd = data root
+	_psCreateFolder(_psGetUserFilesFolder());          // settings/saves folder
+	C_PcSave::SetSaveDirectory(_psGetUserFilesFolder());
+	InitialiseLanguage();                              // sets language + loads TEXT
+	FrontEndMenuManager.LoadSettings();                // defaults on first run
+	TheText.Unload();
+
 	// --- ANGLE + RenderWare bring-up -------------------------------------
 	// On visionOS there is no main() to drive the boot, so psInitialize brings
 	// up the ANGLE GLES 3.0 context and then runs the standard RW init chain
@@ -122,10 +258,6 @@ psInitialize(void)
 	}
 	printf("[vc-gl] OK: RenderWare initialised (RwEngineOpen + RwEngineStart, GL3 backend up)\n");
 
-	// TODO(visionos): echtes Startup (FS-/Sprach-Schritt) fehlt noch:
-	//   CFileMgr::Initialise(); InitialiseLanguage();
-	//   C_PcSave::SetSaveDirectory(_psGetUserFilesFolder());
-	//   FrontEndMenuManager.LoadSettings(); TheText.Unload();
 	return TRUE;
 }
 
@@ -312,9 +444,72 @@ HandleExit()
 void
 InitialiseLanguage()
 {
-	// TODO(visionos): Sprach-/Locale-Erkennung (setlocale) uebernehmen; vorerst
-	// bleibt die Default-Sprache (American) aktiv.
-	return;
+	// Locale-based language selection, ported from glfw.cpp's non-Windows path
+	// (no GLFW dependency). Determines nasty/german/french flags and the menu
+	// language, then loads the text.
+	setlocale(LC_ALL, "");
+	char *systemLang   = setlocale(LC_ALL, NULL);
+	char *keyboardLang = setlocale(LC_CTYPE, NULL);
+
+	short primUserLCID, primSystemLCID;
+	primUserLCID = primSystemLCID = !strncmp(systemLang, "fr_", 3) ? LANG_FRENCH :
+	                                !strncmp(systemLang, "de_", 3) ? LANG_GERMAN :
+	                                !strncmp(systemLang, "en_", 3) ? LANG_ENGLISH :
+	                                !strncmp(systemLang, "it_", 3) ? LANG_ITALIAN :
+	                                !strncmp(systemLang, "es_", 3) ? LANG_SPANISH :
+	                                LANG_OTHER;
+	short primLayout = !strncmp(keyboardLang, "fr_", 3) ? LANG_FRENCH :
+	                   (!strncmp(keyboardLang, "de_", 3) ? LANG_GERMAN : LANG_ENGLISH);
+
+	short subUserLCID, subSystemLCID;
+	subUserLCID = subSystemLCID = !strncmp(systemLang, "en_AU", 5) ? SUBLANG_ENGLISH_AUS : SUBLANG_OTHER;
+	short subLayout = !strncmp(keyboardLang, "en_AU", 5) ? SUBLANG_ENGLISH_AUS : SUBLANG_OTHER;
+
+	if (primUserLCID == LANG_GERMAN || primSystemLCID == LANG_GERMAN || primLayout == LANG_GERMAN) {
+		CGame::nastyGame = false;
+		FrontEndMenuManager.m_PrefsAllowNastyGame = false;
+		CGame::germanGame = true;
+	}
+	if (primUserLCID == LANG_FRENCH || primSystemLCID == LANG_FRENCH || primLayout == LANG_FRENCH) {
+		CGame::nastyGame = false;
+		FrontEndMenuManager.m_PrefsAllowNastyGame = false;
+		CGame::frenchGame = true;
+	}
+	if (subUserLCID == SUBLANG_ENGLISH_AUS || subSystemLCID == SUBLANG_ENGLISH_AUS || subLayout == SUBLANG_ENGLISH_AUS)
+		CGame::noProstitutes = true;
+
+#ifdef NASTY_GAME
+	CGame::nastyGame = true;
+	FrontEndMenuManager.m_PrefsAllowNastyGame = true;
+	CGame::noProstitutes = false;
+#endif
+
+	int32 lang;
+	switch (primSystemLCID) {
+		case LANG_GERMAN:  lang = LANG_GERMAN;  break;
+		case LANG_FRENCH:  lang = LANG_FRENCH;  break;
+		case LANG_SPANISH: lang = LANG_SPANISH; break;
+		case LANG_ITALIAN: lang = LANG_ITALIAN; break;
+		default: lang = (subSystemLCID == SUBLANG_ENGLISH_AUS) ? -99 : LANG_ENGLISH; break;
+	}
+
+	FrontEndMenuManager.OS_Language = primUserLCID;
+
+	switch (lang) {
+		case LANG_GERMAN:  FrontEndMenuManager.m_PrefsLanguage = CMenuManager::LANGUAGE_GERMAN;  break;
+		case LANG_SPANISH: FrontEndMenuManager.m_PrefsLanguage = CMenuManager::LANGUAGE_SPANISH; break;
+		case LANG_FRENCH:  FrontEndMenuManager.m_PrefsLanguage = CMenuManager::LANGUAGE_FRENCH;  break;
+		case LANG_ITALIAN: FrontEndMenuManager.m_PrefsLanguage = CMenuManager::LANGUAGE_ITALIAN; break;
+		default:           FrontEndMenuManager.m_PrefsLanguage = CMenuManager::LANGUAGE_AMERICAN; break;
+	}
+
+	// Needed for strcasecmp to behave the same across locales.
+	setlocale(LC_CTYPE, "C");
+	setlocale(LC_COLLATE, "C");
+	setlocale(LC_NUMERIC, "C");
+
+	TheText.Unload();
+	TheText.Load();
 }
 
 // ===========================================================================
@@ -324,17 +519,25 @@ InitialiseLanguage()
 const char *
 _psGetUserFilesFolder()
 {
-	// TODO(visionos): echten, beschreibbaren Pfad liefern (App-Sandbox Documents).
-	// Leerer, gueltiger C-String, damit strcpy/strcat nicht auf nil laufen.
-	static char userFiles[] = "";
-	return userFiles;
+	// Absolute path under Documents, computed by vcfs_setup(). Empty (valid
+	// C-string) until then so strcpy/strcat never see nil.
+	return g_userFiles;
 }
 
 void
 _psCreateFolder(const char *path)
 {
-	// TODO(visionos): Verzeichnis anlegen (mkdir im Sandbox-Pfad).
-	return;
+	if (path == nil || path[0] == '\0')
+		return;
+
+	// Normalise Windows-style backslashes, then create the (single-level) dir.
+	char tmp[1024];
+	snprintf(tmp, sizeof(tmp), "%s", path);
+	for (char *c = tmp; *c; c++)
+		if (*c == '\\') *c = '/';
+
+	if (!vc_path_exists(tmp))
+		mkdir(tmp, 0755);
 }
 
 #endif // LIBRW_VISIONOS
