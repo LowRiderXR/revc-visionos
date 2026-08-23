@@ -54,8 +54,12 @@ extern "C" bool  vcgl_make_current_on_this_thread(void); // claim GL ctx on game
 extern "C" void  vcgl_release_current(void);             // release GL ctx (init thread)
 extern "C" void *vcgl_get_proc_address(void);            // ANGLE eglGetProcAddress
 
-// End-of-frame publish (defined near the bottom; called from psCameraShowRaster).
-static void vc_publish_frame(void);
+// Double-buffered render target + throttle + publish, all in visionos_angle.mm.
+extern "C" bool         vcrt_create(int width, int height);
+extern "C" bool         vc_use_external_framebuffer(void);
+extern "C" unsigned int vc_external_framebuffer(void);
+extern "C" bool         vcrt_begin_frame(void);   // throttle: false = park this frame
+extern "C" void         vcrt_publish_frame(void); // publish the just-rendered buffer
 
 // ---------------------------------------------------------------------------
 // Globals the core expects but that only ever lived in glfw.cpp / win.cpp.
@@ -241,37 +245,16 @@ psInitialize(void)
 	FrontEndMenuManager.LoadSettings();                // defaults on first run
 	TheText.Unload();
 
-	// --- ANGLE + RenderWare bring-up -------------------------------------
-	// On visionOS there is no main() to drive the boot, so psInitialize brings
-	// up the ANGLE GLES 3.0 context and then runs the standard RW init chain
-	// (what glfw's main() does via rsRWINITIALIZE). The success criterion for
-	// this step is the log below, not a rendered frame.
-	void *glGetProcAddress = nil;
-	if (!vcgl_init_angle(&glGetProcAddress)) {
-		printf("[vc-gl] FAIL: ANGLE/EGL bring-up failed; RenderWare not initialised\n");
+	// --- ANGLE bring-up (context only; NOT made current here) ------------
+	// Create the EGL display + GLES 3.0 context, but do not make it current on
+	// this (init) thread. The game thread is the sole owner: it makes the
+	// context current and opens RenderWare (Initialise3D) there. Keeping the
+	// context on one thread for its whole life avoids the earlier handoff.
+	if (!vcgl_init_angle(nil)) {
+		printf("[vc-gl] FAIL: ANGLE/EGL bring-up failed\n");
 		return FALSE;
 	}
-
-	// Hand the context to librw via EngineOpenParams.window: it carries ANGLE's
-	// eglGetProcAddress so gl3device (deviceSystemVisionOS) can load its GL
-	// entry points. librw does NOT create the context itself.
-	static rw::EngineOpenParams openParams;
-	openParams.width       = VISIONOS_SCREEN_WIDTH;
-	openParams.height      = VISIONOS_SCREEN_HEIGHT;
-	openParams.windowtitle = "reVC";
-	openParams.window      = glGetProcAddress;
-
-	printf("[vc-gl] RsEventHandler(rsRWINITIALIZE) ...\n");
-	if (RsEventHandler(rsRWINITIALIZE, &openParams) == rsEVENTERROR) {
-		printf("[vc-gl] FAIL: rsRWINITIALIZE - RwEngineOpen/RwEngineStart failed\n");
-		return FALSE;
-	}
-	printf("[vc-gl] OK: RenderWare initialised (RwEngineOpen + RwEngineStart, GL3 backend up)\n");
-
-	// The GL context is current on THIS (init) thread. Release it so the game
-	// thread can claim it (see vc_game_thread_start). An EGL context may be
-	// current on only one thread at a time.
-	vcgl_release_current();
+	printf("[vc-gl] ANGLE ready; RenderWare opens on the game thread\n");
 
 	return TRUE;
 }
@@ -289,17 +272,28 @@ psTerminate(void)
 RwBool
 psCameraBeginUpdate(RwCamera *camera)
 {
-	// TODO(visionos): echtes RwCameraBeginUpdate, sobald der ANGLE-Kontext steht.
+	// Throttle at frame start: block until a free back buffer is available, then
+	// select it (vc_external_framebuffer() then returns its FBO). On timeout the
+	// game thread parks -> returning FALSE makes reVC skip the frame (don't
+	// render), which is the intended park state, not an error. This is only ever
+	// the main scene camera (shadow/RTT cameras call RwCameraBeginUpdate direct).
+	if (!vcrt_begin_frame())
+		return FALSE;
+
+	// Real begin-update: binds the camera's raster/FBO via librw's
+	// setFrameBuffer, which (for the main camera) redirects the surfaceless
+	// default framebuffer to the current back buffer's EGLImage FBO.
+	if (!RwCameraBeginUpdate(camera))
+		return FALSE;
 	return TRUE;
 }
 
 void
 psCameraShowRaster(RwCamera *camera)
 {
-	// No SwapBuffers on visionOS. This is the end-of-frame "present" point:
-	// publish the just-rendered frame for the compositor (double-buffer swap).
-	// TODO(visionos): the compositor blit of the shared texture comes later.
-	vc_publish_frame();
+	// No SwapBuffers on visionOS. End-of-frame "present": publish the just-
+	// rendered back buffer (enqueue the shared-event signal, mark it ready).
+	vcrt_publish_frame();
 }
 
 RwImage *
@@ -557,75 +551,18 @@ _psCreateFolder(const char *path)
 }
 
 // ===========================================================================
-// Frame publish  (double-buffer + GL fence scaffold)
+// Frame publish
 // ---------------------------------------------------------------------------
-// The game thread renders into a back buffer and, at end of frame, publishes it
-// as "ready" under a short lock; a GL fence marks GPU completion. A later step
-// wires the actual shared textures and the compositor blit; here we build the
-// hand-off mechanism (double buffer / ready index / fence).
+// The double-buffer state machine, the throttle (vcrt_begin_frame), the
+// shared-event signal and the publish (vcrt_publish_frame) all live on the
+// ANGLE side in visionos_angle.mm, next to the MTLTexture/EGLImage/FBO buffers
+// they operate on. Here we only expose the stop flag they poll and forward the
+// depth-renderbuffer hook librw calls when it creates the shared Z buffer.
 // ===========================================================================
-static pthread_mutex_t g_pubMutex   = PTHREAD_MUTEX_INITIALIZER;
-static int             g_backIndex  = 0;
-static int             g_readyIndex = -1;   // -1 = nothing finished yet
-static uint64_t        g_frameCount = 0;
 
-// GL fence entry points, resolved via ANGLE's getProcAddress (no glad here).
-typedef void *VCGLsync;
-typedef VCGLsync (*PFN_glFenceSync)(unsigned int condition, unsigned int flags);
-typedef void     (*PFN_glDeleteSync)(VCGLsync sync);
-static PFN_glFenceSync  p_glFenceSync  = nil;
-static PFN_glDeleteSync p_glDeleteSync = nil;
-static VCGLsync         g_fences[2]    = { nil, nil };
-static bool             g_pubReady     = false;
-
-static void
-vc_publish_init(void)
-{
-	typedef void *(*GetProc)(const char *);
-	GetProc gp = (GetProc)vcgl_get_proc_address();
-	if (gp) {
-		p_glFenceSync  = (PFN_glFenceSync)gp("glFenceSync");
-		p_glDeleteSync = (PFN_glDeleteSync)gp("glDeleteSync");
-	}
-	g_pubReady = true;
-	printf("[vc-pub] publish scaffold ready (fence=%s)\n",
-	       (p_glFenceSync && p_glDeleteSync) ? "yes" : "no");
-}
-
-// Called at end of frame from psCameraShowRaster on the GAME thread.
-static void
-vc_publish_frame(void)
-{
-	if (!g_pubReady)
-		return;
-
-	// GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117; the fence covers all prior GL work.
-	VCGLsync fence = p_glFenceSync ? p_glFenceSync(0x9117u, 0u) : nil;
-
-	pthread_mutex_lock(&g_pubMutex);
-	if (p_glDeleteSync && g_fences[g_backIndex])
-		p_glDeleteSync(g_fences[g_backIndex]);
-	g_fences[g_backIndex] = fence;
-	g_readyIndex = g_backIndex;      // publish the just-finished buffer
-	g_backIndex  = 1 - g_backIndex;  // render into the other one next
-	uint64_t n = ++g_frameCount;
-	pthread_mutex_unlock(&g_pubMutex);
-
-	if ((n % 300) == 1)
-		printf("[vc-pub] published frame %llu (readyIndex=%d)\n",
-		       (unsigned long long)n, g_readyIndex);
-}
-
-// Compositor-facing (used from the Metal side in a later step): index of the
-// most recently finished buffer, or -1 if none yet. Non-blocking.
-extern "C" int
-vc_acquire_ready_frame(void)
-{
-	pthread_mutex_lock(&g_pubMutex);
-	int idx = g_readyIndex;
-	pthread_mutex_unlock(&g_pubMutex);
-	return idx;
-}
+// Attach librw's shared depth renderbuffer to BOTH back-buffer FBOs (once, at
+// FBO creation). Defined on the ANGLE side; called from gl3device.cpp.
+extern "C" void vc_attach_depth_renderbuffer(unsigned int rbo);
 
 // ===========================================================================
 // Game loop  (ported from glfw.cpp main(); runs on its OWN thread)
@@ -637,6 +574,10 @@ static RwBool WindowIconified = FALSE; // TODO(visionos): kein Fenster; nie mini
 static RwBool RwInitialised   = TRUE;
 
 static std::atomic<bool> g_stop{false};
+
+// Polled by the ANGLE-side throttle (vcrt_begin_frame) so a parked game thread
+// wakes and unwinds cleanly when shutdown is requested.
+extern "C" bool vc_should_stop(void) { return g_stop.load(); }
 static pthread_t         g_gameThread;
 static bool              g_gameThreadRunning = false;
 
@@ -666,7 +607,43 @@ run_game_loop(void)
 		printf("[vc-loop] FAIL: could not make GL context current on game thread\n");
 		return;
 	}
-	vc_publish_init();
+
+	// Create the render target (MTLTexture on ANGLE's device -> EGLImage -> GL
+	// FBO). Must happen before any rendering and before Initialise3D so the
+	// external-framebuffer redirect is armed when the first camera pass runs.
+	// TODO(visionos): resolution hardcoded; later from the CompositorServices drawable.
+	if (!vcrt_create(VISIONOS_SCREEN_WIDTH, VISIONOS_SCREEN_HEIGHT)) {
+		printf("[vc-loop] FAIL: could not create render target\n");
+		return;
+	}
+
+	// Open RenderWare on THIS thread via the event handler (Initialise3D is
+	// static in main.cpp; reVC's rsRWINITIALIZE case maps to Initialise3D(param)
+	// = RsRwInitialize (engine open via ANGLE) + CGame::InitialiseRenderWare()
+	// which creates Scene.camera). The param must point to a rw::EngineOpenParams
+	// whose .window carries ANGLE's eglGetProcAddress (librw loads glad from it).
+	static rw::EngineOpenParams openParams;
+	openParams.width       = VISIONOS_SCREEN_WIDTH;
+	openParams.height      = VISIONOS_SCREEN_HEIGHT;
+	openParams.windowtitle = "reVC";
+	openParams.window      = vcgl_get_proc_address();
+	printf("[vc-loop] rsRWINITIALIZE (Initialise3D: RwEngineOpen/Start + InitialiseRenderWare) ...\n");
+	if (RsEventHandler(rsRWINITIALIZE, &openParams) == rsEVENTERROR) {
+		printf("[vc-loop] FAIL: rsRWINITIALIZE\n");
+		return;
+	}
+	printf("[vc-loop] rsRWINITIALIZE OK\n");
+
+	// Size the main camera so it gets its CAMERA + Z rasters (CameraSize with a
+	// non-nil RwRect). Without this Scene.camera->frameBuffer stays nil and im2d
+	// crashes. // TODO(visionos): rect from the drawable later.
+	RwRect camRect;
+	camRect.x = 0; camRect.y = 0;
+	camRect.w = VISIONOS_SCREEN_WIDTH;
+	camRect.h = VISIONOS_SCREEN_HEIGHT;
+	RsEventHandler(rsCAMERASIZE, &camRect);
+	printf("[vc-loop] rsCAMERASIZE %dx%d done\n", VISIONOS_SCREEN_WIDTH, VISIONOS_SCREEN_HEIGHT);
+
 	printf("[vc-loop] game thread started\n");
 
 	// Outer restart loop, mirroring glfw.cpp main().
