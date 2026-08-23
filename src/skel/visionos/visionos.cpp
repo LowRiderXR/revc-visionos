@@ -28,6 +28,7 @@
 #include <locale.h>   // setlocale
 #include <pthread.h>  // game thread
 #include <atomic>     // stop flag
+#include <time.h>     // clock_gettime (input debug cadence)
 
 #include "common.h"
 #include "rwcore.h"
@@ -41,6 +42,7 @@
 #include "PCSave.h"
 #include "main.h"     // LoadingScreen, InitialiseGame
 #include "Timer.h"    // CTimer
+#include "Pad.h"      // CPad, CControllerState (gamepad input)
 
 // Hardcoded drawable resolution of the Vision Pro (per-eye). One video mode.
 #define VISIONOS_SCREEN_WIDTH  2048
@@ -351,11 +353,142 @@ _InputInitialiseJoys()
 	PsGlobal.joy2id = -1;
 }
 
+// ===========================================================================
+// Gamepad input seam (Swift main thread -> reVC game thread)
+// ---------------------------------------------------------------------------
+// Mirror of vc_gamepad_t in AvpViceCity/VCPlatform.h -- layout MUST match.
+// ===========================================================================
+typedef struct {
+	float         left_x, left_y;
+	float         right_x, right_y;
+	float         left_trigger, right_trigger;
+	unsigned char south, east, west, north;
+	unsigned char dpad_up, dpad_down, dpad_left, dpad_right;
+	unsigned char left_shoulder, right_shoulder;
+	unsigned char left_thumb, right_thumb;
+	unsigned char menu, options;
+} vc_gamepad_t;
+
+static vc_gamepad_t    g_pad = {};
+static pthread_mutex_t g_padMutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Called from the Swift main thread. Buffers the snapshot under a lock so it
+// never overlaps the game thread's read in CapturePad.
+extern "C" void
+vc_set_gamepad_state(const vc_gamepad_t *state)
+{
+	if (state == nil)
+		return;
+	pthread_mutex_lock(&g_padMutex);
+	g_pad = *state;
+	pthread_mutex_unlock(&g_padMutex);
+}
+
+// Sticks: reVC uses up = negative and (matching the glfw path) an ~8-bit range
+// with a 0.3 deadzone. GCController gives up = +1, so Y is negated by the caller.
+static int16
+vcpad_axis(float v)
+{
+	float a = v < 0.0f ? -v : v;
+	return a > 0.3f ? (int16)(v * 128.0f) : 0;
+}
+
+static double
+vcpad_now_seconds(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
+}
+
+// Log on CHANGE only (one line per press/release, by name), plus -- behind
+// VC_DEBUG_INPUT=1 -- the axes once per second. Game thread only.
+static void
+vcpad_log(const vc_gamepad_t &s)
+{
+	static bool         init = false;
+	static bool         dbgAxes = false;
+	static vc_gamepad_t prev;
+	if (!init) {
+		init = true;
+		memset(&prev, 0, sizeof(prev));
+		dbgAxes = (getenv("VC_DEBUG_INPUT") != NULL);
+		printf("[vc-input] gamepad wired; VC_DEBUG_INPUT %s\n", dbgAxes ? "ENABLED" : "disabled");
+	}
+
+#define VCPAD_BTN(field, name) \
+	if (s.field != prev.field) printf("[vc-input] %s %s\n", name, s.field ? "DOWN" : "UP");
+	VCPAD_BTN(south,         "Cross(A)")
+	VCPAD_BTN(east,          "Circle(B)")
+	VCPAD_BTN(west,          "Square(X)")
+	VCPAD_BTN(north,         "Triangle(Y)")
+	VCPAD_BTN(dpad_up,       "DPadUp")
+	VCPAD_BTN(dpad_down,     "DPadDown")
+	VCPAD_BTN(dpad_left,     "DPadLeft")
+	VCPAD_BTN(dpad_right,    "DPadRight")
+	VCPAD_BTN(left_shoulder, "L1")
+	VCPAD_BTN(right_shoulder,"R1")
+	VCPAD_BTN(left_thumb,    "L3")
+	VCPAD_BTN(right_thumb,   "R3")
+	VCPAD_BTN(menu,          "Start")
+	VCPAD_BTN(options,       "Select")
+#undef VCPAD_BTN
+	prev = s;
+
+	if (dbgAxes) {
+		static double last = 0.0;
+		double now = vcpad_now_seconds();
+		if (now - last >= 1.0) {
+			last = now;
+			printf("[vc-input] axes L(%.2f,%.2f) R(%.2f,%.2f) LT=%.2f RT=%.2f\n",
+			       s.left_x, s.left_y, s.right_x, s.right_y, s.left_trigger, s.right_trigger);
+		}
+	}
+}
+
 void
 CapturePad(RwInt32 padID)
 {
-	// TODO(visionos): Pad-Status ueber GCController einlesen; vorerst nichts.
-	return;
+	if (padID != 0)
+		return;
+
+	// Snapshot the buffered state under the lock, then release before touching
+	// reVC state.
+	vc_gamepad_t s;
+	pthread_mutex_lock(&g_padMutex);
+	s = g_pad;
+	pthread_mutex_unlock(&g_padMutex);
+
+	// Fill PCTempJoyState (a CControllerState) DIRECTLY. CPad::Update reconciles
+	// it with the empty PCTempKeyState into NewState (and rotates OldState itself),
+	// so we bypass the controller-config binding layer entirely -- no
+	// ControllerConfig / MapIdToButtonId is involved. Buttons are 0/255.
+	CPad *pad = CPad::GetPad(0);
+	CControllerState &js = pad->PCTempJoyState;
+
+	js.Cross          = s.south          ? 255 : 0;
+	js.Circle         = s.east           ? 255 : 0;
+	js.Square         = s.west           ? 255 : 0;
+	js.Triangle       = s.north          ? 255 : 0;
+	js.DPadUp         = s.dpad_up        ? 255 : 0;
+	js.DPadDown       = s.dpad_down      ? 255 : 0;
+	js.DPadLeft       = s.dpad_left      ? 255 : 0;
+	js.DPadRight      = s.dpad_right     ? 255 : 0;
+	js.Start          = s.menu           ? 255 : 0;
+	js.Select         = s.options        ? 255 : 0;
+	js.LeftShoulder1  = s.left_shoulder  ? 255 : 0;
+	js.RightShoulder1 = s.right_shoulder ? 255 : 0;
+	js.LeftShock      = s.left_thumb     ? 255 : 0;
+	js.RightShock     = s.right_thumb    ? 255 : 0;
+	js.LeftShoulder2  = (int16)(s.left_trigger  * 255.0f);
+	js.RightShoulder2 = (int16)(s.right_trigger * 255.0f);
+
+	js.LeftStickX  = vcpad_axis( s.left_x);
+	js.LeftStickY  = vcpad_axis(-s.left_y);   // GCController up = +1 -> reVC up = negative
+	js.RightStickX = vcpad_axis( s.right_x);
+	js.RightStickY = vcpad_axis(-s.right_y);
+
+	vcpad_log(s);
 }
 
 // ===========================================================================
