@@ -360,6 +360,14 @@ static uint64_t g_signalValue = 0;       // monotonic shared-event counter
 static uint64_t g_frameCount  = 0;       // successful publishes
 static uint64_t g_waitCount   = 0;       // how often the game thread parked
 static uint64_t g_discardCount = 0;      // phantom publishes suppressed by the gate
+// Buffer strategy (VC_BUFFER_MODE): the ONLY difference between the two modes is
+// whether vc_acquire_ready_frame recycles a superseded READY buffer to FREE.
+//   false = "wait"   (default): don't recycle; the game waits for a real release,
+//                    giving exactly the display rate with no discarded work.
+//   true  = "newest" : recycle the older READY at acquire -> game runs ahead
+//                    (~2x display rate here), compositor always sees the freshest.
+static bool     g_recycleOlderReady = false;
+static uint64_t g_recycleCount      = 0;  // READY->FREE recycles (0 in "wait")
 static id<MTLSharedEvent>   g_sharedEvent = nil;
 static id<MTLCommandQueue>  g_cmdQueue    = nil;
 static bool     g_useSharedEvent = false; // extension present and not disabled
@@ -502,6 +510,15 @@ vcrt_create(int width, int height)
 	// invisible from the Metal side, hence an explicit A/B switch.
 	g_noFence = (getenv("VC_NOFENCE") != NULL);
 
+	// Buffer strategy. Default "wait": no recycle, exactly the display rate, ~half
+	// a frame more latency but half the GPU work -- the right default in cinema
+	// mode where the game camera isn't head-locked.
+	const char *mode = getenv("VC_BUFFER_MODE");
+	g_recycleOlderReady = (mode != NULL && strcmp(mode, "newest") == 0);
+	VCLOG(@"[vc-rt] buffer mode: %s", g_recycleOlderReady
+	      ? "newest (recycle older READY at acquire -> game runs ahead)"
+	      : "wait (default; game paces to real releases, no recycle)");
+
 	const char *exts = p_eglQueryString ? p_eglQueryString(g_display, VC_EGL_EXTENSIONS) : NULL;
 	bool haveExt = exts && strstr(exts, "EGL_ANGLE_metal_shared_event_sync") != NULL;
 	if (!haveExt)
@@ -562,17 +579,18 @@ static void
 vcrt_log_rate(void)
 {
 	static double   lastLog = 0.0;
-	static uint64_t lastN = 0, lastW = 0, lastD = 0;
+	static uint64_t lastN = 0, lastW = 0, lastD = 0, lastR = 0;
 	double now = vc_now_seconds();
-	if (lastLog == 0.0) { lastLog = now; lastN = g_frameCount; lastW = g_waitCount; lastD = g_discardCount; return; }
+	if (lastLog == 0.0) { lastLog = now; lastN = g_frameCount; lastW = g_waitCount; lastD = g_discardCount; lastR = g_recycleCount; return; }
 	if (now - lastLog < 1.0) return;
-	VCLOG(@"[vc-pub] readyIndex=%d publishes/s=%llu parks/s=%llu discards/s=%llu (total pub=%llu)",
+	VCLOG(@"[vc-pub] readyIndex=%d publishes/s=%llu parks/s=%llu discards/s=%llu recycles/s=%llu (total pub=%llu)",
 	      g_readyIndex,
 	      (unsigned long long)(g_frameCount   - lastN),
 	      (unsigned long long)(g_waitCount     - lastW),
 	      (unsigned long long)(g_discardCount  - lastD),
+	      (unsigned long long)(g_recycleCount  - lastR),
 	      (unsigned long long)g_frameCount);
-	lastLog = now; lastN = g_frameCount; lastW = g_waitCount; lastD = g_discardCount;
+	lastLog = now; lastN = g_frameCount; lastW = g_waitCount; lastD = g_discardCount; lastR = g_recycleCount;
 }
 
 extern "C" bool
@@ -724,15 +742,18 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 		pthread_mutex_unlock(&g_bufMutex);
 		return false;
 	}
-	// newest wins: if the OTHER buffer is still sitting in READY (a superseded
+	// "newest" ONLY: if the OTHER buffer is still sitting in READY (a superseded
 	// frame the compositor never fetched), recycle it straight to FREE so the
-	// game isn't starved down to single buffering. Never touch an ACQUIRED one --
-	// Metal may still be reading it.
-	for (int i = 0; i < VC_NUM_BUFFERS; i++)
-		if (i != idx && g_buf[i].state == VC_BUF_READY) {
-			g_buf[i].state = VC_BUF_FREE;
-			pthread_cond_signal(&g_bufCond);
-		}
+	// game runs ahead. In "wait" (default) we skip this, so the game only gets a
+	// buffer back on a real vc_release_frame -> it paces to the display rate.
+	// Never touch an ACQUIRED buffer -- Metal may still be reading it.
+	if (g_recycleOlderReady)
+		for (int i = 0; i < VC_NUM_BUFFERS; i++)
+			if (i != idx && g_buf[i].state == VC_BUF_READY) {
+				g_buf[i].state = VC_BUF_FREE;
+				g_recycleCount++;
+				pthread_cond_signal(&g_bufCond);
+			}
 	g_buf[idx].state = VC_BUF_ACQUIRED;        // READY -> ACQUIRED (won't be reused)
 	out->texture    = VC_OBJ_TO_VOID(g_buf[idx].mtlTexture);
 	out->index      = (uint32_t)idx;
