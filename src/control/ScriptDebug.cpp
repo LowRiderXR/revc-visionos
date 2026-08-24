@@ -1525,9 +1525,6 @@ static void PrintToLog(const char* format, ...)
 	if (dbg_log)
 		fwrite(tmp, 1, strlen(tmp), dbg_log);
 #endif
-
-	// 同时打印到标准输出（终端）
-	printf("[script] %s", tmp);
 }
 
 #endif

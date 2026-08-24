@@ -1438,6 +1438,14 @@ bool CStream::Open(const char* filename, uint32 overrideSampleRate)
 // Be case-insensitive on linux (from https://github.com/OneSadCookie/fcaseopen/)
 #if !defined(_WIN32)
 	char *real = casepath(filename);
+#ifdef __APPLE__
+	// DIAGNOSE (audio): show the raw stream path, whether it is absolute, and
+	// whether casepath resolved it (casepath fails silently on absolute paths in
+	// the sandbox -> falls back to the raw name below). Log-only.
+	printf("[vc-audio] stream open '%s' (abs=%d) casepath=%s\n",
+	       filename ? filename : "(null)", (filename && filename[0] == '/') ? 1 : 0,
+	       real ? real : "FAILED(raw fallback)");
+#endif
 	if (real) {
 		strcpy(m_aFilename, real);
 		free(real);
@@ -1447,7 +1455,7 @@ bool CStream::Open(const char* filename, uint32 overrideSampleRate)
 #endif
 		strcpy(m_aFilename, filename);
 	}
-		
+
 	DEV("Stream %s\n", m_aFilename);
 
 	if (!strcasecmp(&m_aFilename[strlen(m_aFilename) - strlen(".wav")], ".wav"))

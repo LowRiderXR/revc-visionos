@@ -86,6 +86,19 @@ int defaultProvider;
 char SampleBankDescFilename[] = "audio/sfx.SDT";
 char SampleBankDataFilename[] = "audio/sfx.RAW";
 
+#ifdef __APPLE__
+// DIAGNOSE (audio): log every audio file open with the raw path, whether it is
+// absolute, the current working dir, and the result. Confirms absolute-vs-
+// relative and whether the sandbox/CWD change broke the open. Log-only.
+static void vc_audio_log_open(const char *what, const char *path, bool ok)
+{
+	char cwd[1024] = {0};
+	getcwd(cwd, sizeof(cwd));
+	printf("[vc-audio] %s '%s' (abs=%d) cwd='%s' -> %s\n",
+	       what, path ? path : "(null)", (path && path[0] == '/') ? 1 : 0, cwd, ok ? "OK" : "FAIL");
+}
+#endif
+
 FILE *fpSampleDescHandle;
 #ifdef OPUS_SFX
 OggOpusFile *fpSampleDataHandle;
@@ -923,6 +936,9 @@ cSampleManager::Initialise(void)
 
 #ifdef AUDIO_CACHE
 	FILE *cacheFile = fcaseopen("audio\\sound.cache", "rb");
+#ifdef __APPLE__
+	vc_audio_log_open("sound.cache", "audio\\sound.cache", cacheFile != NULL);
+#endif
 	if (cacheFile) {
 		debug("Loadind audio cache (If game crashes around here, then your cache is corrupted, remove audio/sound.cache)\n");
 		fread(nStreamLength, sizeof(uint32), TOTAL_STREAMED_SOUNDS, cacheFile);
@@ -2037,10 +2053,16 @@ cSampleManager::InitialiseSampleBanks(void)
 	int32 nBank = SFX_BANK_0;
 	
 	fpSampleDescHandle = fcaseopen(SampleBankDescFilename, "rb");
+#ifdef __APPLE__
+	vc_audio_log_open("sfx desc", SampleBankDescFilename, fpSampleDescHandle != NULL);
+#endif
 	if ( fpSampleDescHandle == NULL )
 		return FALSE;
 #ifndef OPUS_SFX
 	fpSampleDataHandle = fcaseopen(SampleBankDataFilename, "rb");
+#ifdef __APPLE__
+	vc_audio_log_open("sfx data", SampleBankDataFilename, fpSampleDataHandle != NULL);
+#endif
 	if ( fpSampleDataHandle == NULL )
 	{
 		fclose(fpSampleDescHandle);
@@ -2055,6 +2077,9 @@ cSampleManager::InitialiseSampleBanks(void)
 #else
 	int e;
 	fpSampleDataHandle = op_open_file(SampleBankDataFilename, &e);
+#ifdef __APPLE__
+	vc_audio_log_open("sfx data (opus)", SampleBankDataFilename, fpSampleDataHandle != NULL);
+#endif
 #endif
 	fread(m_aSamples, sizeof(tSample), TOTAL_AUDIO_SAMPLES, fpSampleDescHandle);
 #ifdef OPUS_SFX

@@ -267,6 +267,9 @@ enum {
 	VC_GL_RENDERBUFFER           = 0x8D41,
 	VC_GL_COLOR_ATTACHMENT0      = 0x8CE0,
 	VC_GL_DEPTH_STENCIL_ATTACHMENT = 0x821A,
+	VC_GL_DEPTH_ATTACHMENT       = 0x8D00,
+	VC_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE = 0x8CD0,
+	VC_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME = 0x8CD1,
 	VC_GL_FRAMEBUFFER_COMPLETE   = 0x8CD5,
 	VC_GL_TEXTURE_MAG_FILTER     = 0x2800,
 	VC_GL_TEXTURE_MIN_FILTER     = 0x2801,
@@ -298,6 +301,7 @@ typedef void     (*PFN_glBindFramebuffer)(GLenumVC, GLuintVC);
 typedef void     (*PFN_glFramebufferTexture2D)(GLenumVC, GLenumVC, GLenumVC, GLuintVC, GLintVC);
 typedef void     (*PFN_glFramebufferRenderbuffer)(GLenumVC, GLenumVC, GLenumVC, GLuintVC);
 typedef GLenumVC (*PFN_glCheckFramebufferStatus)(GLenumVC);
+typedef void     (*PFN_glGetFramebufferAttachmentParameteriv)(GLenumVC, GLenumVC, GLenumVC, GLintVC *);
 typedef GLenumVC (*PFN_glGetError)(void);
 typedef void     (*PFN_glFinish)(void);
 typedef void     (*PFN_glFlush)(void);
@@ -315,6 +319,7 @@ static PFN_glBindFramebuffer          p_glBindFramebuffer = NULL;
 static PFN_glFramebufferTexture2D     p_glFramebufferTexture2D = NULL;
 static PFN_glFramebufferRenderbuffer  p_glFramebufferRenderbuffer = NULL;
 static PFN_glCheckFramebufferStatus   p_glCheckFramebufferStatus = NULL;
+static PFN_glGetFramebufferAttachmentParameteriv p_glGetFramebufferAttachmentParameteriv = NULL;
 static PFN_glGetError                 p_glGetError = NULL;
 static PFN_glFinish                   p_glFinish = NULL;
 static PFN_glFlush                    p_glFlush = NULL;
@@ -415,6 +420,7 @@ vcrt_resolve(void)
 	VC_GL(p_glFramebufferTexture2D,   PFN_glFramebufferTexture2D,   "glFramebufferTexture2D");
 	VC_GL(p_glFramebufferRenderbuffer,PFN_glFramebufferRenderbuffer,"glFramebufferRenderbuffer");
 	VC_GL(p_glCheckFramebufferStatus, PFN_glCheckFramebufferStatus, "glCheckFramebufferStatus");
+	VC_GL(p_glGetFramebufferAttachmentParameteriv, PFN_glGetFramebufferAttachmentParameteriv, "glGetFramebufferAttachmentParameteriv");
 	VC_GL(p_glGetError,               PFN_glGetError,               "glGetError");
 	VC_GL(p_glFinish,                 PFN_glFinish,                 "glFinish");
 	// gotcha (c): resolve glFlush directly from ANGLE, not via a maybe-empty ptr.
@@ -553,15 +559,23 @@ extern "C" unsigned int vc_external_framebuffer(void) { return g_buf[g_currentBa
 extern "C" void
 vc_attach_depth_renderbuffer(unsigned int rbo)
 {
-	// Re-check and log status per FBO AFTER the depth attach, naming the depth
-	// renderbuffer -- so the log proves the Z buffer hangs on BOTH FBOs and can't
-	// be confused with the stale "colour-only" line emitted at creation time.
+	// Attach and then, for BOTH FBOs, read back what is ACTUALLY bound as the
+	// depth attachment (OBJECT_NAME) plus the framebuffer status. If OBJECT_NAME
+	// is 0 the FBO has no depth. We query the attachment (which ANGLE supports)
+	// rather than the renderbuffer's DEPTH_SIZE (which ANGLE rejects with
+	// GL_INVALID_ENUM for packed DEPTH24_STENCIL8).
 	for (int i = 0; i < VC_NUM_BUFFERS; i++) {
 		p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_buf[i].glFbo);
 		p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, rbo);
 		GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
-		VCLOG(@"[vc-rt] buffer %d FBO %u: colour+depth (depth renderbuffer %u) status = %s",
-		      i, g_buf[i].glFbo, rbo, vcrt_fbo_status_name(status));
+
+		GLintVC boundName = 0;
+		if (p_glGetFramebufferAttachmentParameteriv)
+			p_glGetFramebufferAttachmentParameteriv(VC_GL_FRAMEBUFFER,
+				VC_GL_DEPTH_ATTACHMENT, VC_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &boundName);
+
+		VCLOG(@"[vc-rt] buffer %d FBO %u: colour+depth attach rbo %u -> bound depth OBJECT_NAME=%d (0 = NO depth) status = %s",
+		      i, g_buf[i].glFbo, rbo, (int)boundName, vcrt_fbo_status_name(status));
 	}
 	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_buf[g_currentBack].glFbo);   // restore caller's fbo
 }

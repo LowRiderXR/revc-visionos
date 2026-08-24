@@ -452,21 +452,7 @@ CMenuManager::SwitchToNewScreen(int8 screen)
 		m_nCurrOption = 0;
 		m_nCurrScreen = screen;
 	}
-	
-	// 调试信息：打印切换到的菜单页面
-	printf("[MenuDebug] 切换到菜单页面: %d (%s)\n", m_nCurrScreen, 
-	       aScreens[m_nCurrScreen].m_ScreenName);
-	
-	// 打印该页面的所有选项
-	for (int i = 0; i < NUM_MENUROWS; i++) {
-		if (aScreens[m_nCurrScreen].m_aEntries[i].m_Action == MENUACTION_NOTHING)
-			break;
-		printf("[MenuDebug]   选项 %d: 动作=%d, 文本='%s'\n", 
-		       i, 
-		       aScreens[m_nCurrScreen].m_aEntries[i].m_Action,
-		       aScreens[m_nCurrScreen].m_aEntries[i].m_EntryName);
-	}
-	
+
 	SETUP_SCROLLING(m_nCurrScreen)
 	
 	if (hasNativeList(m_nPrevScreen))

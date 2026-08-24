@@ -44,9 +44,24 @@
 #include "Timer.h"    // CTimer
 #include "Pad.h"      // CPad, CControllerState (gamepad input)
 
-// Hardcoded drawable resolution of the Vision Pro (per-eye). One video mode.
-#define VISIONOS_SCREEN_WIDTH  2048
-#define VISIONOS_SCREEN_HEIGHT 1984
+// Game render-target size. THE single source: feeds the two vcrt MTLTextures,
+// rsCAMERASIZE, RsGlobal and the librw open params. This is the OFFSCREEN size
+// the game renders into for display on the world-anchored canvas -- a design
+// choice (16:9), deliberately independent of the physical drawable dimensions;
+// the canvas is a quad, not the drawable.
+// TODO(visionos): later derive dynamically from the quad geometry and the
+// angular resolution instead of a fixed 1920x1080.
+#define VISIONOS_SCREEN_WIDTH  1920
+#define VISIONOS_SCREEN_HEIGHT 1080
+
+// Single source for the render-target size, queried by librw (gl3device) over
+// the C seam -- same pattern as vc_external_framebuffer(). No duplicated
+// constant, linker-checked; when the size becomes dynamic only this file changes.
+extern "C" void vc_screen_size(int *w, int *h)
+{
+	if (w) *w = VISIONOS_SCREEN_WIDTH;
+	if (h) *h = VISIONOS_SCREEN_HEIGHT;
+}
 
 // ANGLE bring-up lives in visionos_angle.mm (ObjC++/Metal, kept out of this
 // C++ unit to avoid Foundation vs. reVC macro clashes). Returns success and,
@@ -525,7 +540,10 @@ _psSelectScreenVM(RwInt32 videoMode)
 	return;
 }
 
-static RwChar  _VMString[] = "2048 X 1984 X 32";
+// Derived from the single source above so it never drifts (stringify the macro).
+#define VC_STR2(x) #x
+#define VC_STR(x)  VC_STR2(x)
+static RwChar  _VMString[] = VC_STR(VISIONOS_SCREEN_WIDTH) " X " VC_STR(VISIONOS_SCREEN_HEIGHT) " X 32";
 static RwChar *_VMList[1]  = { _VMString };
 
 RwChar **
@@ -748,6 +766,35 @@ run_game_loop(void)
 	if (!vcrt_create(VISIONOS_SCREEN_WIDTH, VISIONOS_SCREEN_HEIGHT)) {
 		printf("[vc-loop] FAIL: could not create render target\n");
 		return;
+	}
+
+	// Once-before-RW init (Stufe 1): CGame::InitialiseOnceBeforeRW() runs
+	// CdStreamInit(MAX_CDCHANNELS). On the glfw path this fires from the
+	// rsINITIALIZE handler BEFORE rsRWINITIALIZE; we call it directly here (the
+	// RsInitialize half of rsINITIALIZE is done manually elsewhere in visionos).
+	//
+	// CWD must be exactly the data root: CdStreamInit does
+	// statvfs("models/gta3.img") with a RAW relative path (no casepath), and
+	// CFileMgr::Initialise() re-captures the cwd as the data root. The cwd was
+	// last set to the data root by chdir(g_dataRoot) in vcfs_setup() (this file,
+	// ~line 174) during psInitialize -- but InitialiseLanguage()/LoadSettings()
+	// there use CFileMgr::SetDir() and can leave it in a subdir, so we don't rely
+	// on it: re-assert it and log before/after as proof.
+	{
+		char cwdBefore[1024] = {0};
+		(void)getcwd(cwdBefore, sizeof(cwdBefore));
+		printf("[vc-loop] before InitialiseOnceBeforeRW: cwd='%s'\n", cwdBefore);
+
+		if (chdir(g_dataRoot) != 0)
+			printf("[vc-loop] WARN: chdir(data root '%s') failed before CdStreamInit\n", g_dataRoot);
+
+		extern int32 gNumChannels;   // defined in CdStream_posix.cpp
+		CGame::InitialiseOnceBeforeRW();
+
+		char cwdAfter[1024] = {0};
+		(void)getcwd(cwdAfter, sizeof(cwdAfter));
+		printf("[vc-loop] after InitialiseOnceBeforeRW: cwd='%s' gNumChannels=%d\n",
+		       cwdAfter, (int)gNumChannels);
 	}
 
 	// Open RenderWare on THIS thread via the event handler (Initialise3D is
