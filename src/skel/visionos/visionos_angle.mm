@@ -22,6 +22,7 @@
 #include <pthread.h>  // throttle mutex/cond
 #include <time.h>     // clock_gettime for the wait deadline
 #include <errno.h>    // ETIMEDOUT
+#include <mach/mach_time.h> // mach_absolute_time for the rate-window measurement
 
 #if __has_feature(objc_arc)
   #define VC_OBJ_TO_VOID(o) ((__bridge void *)(o))
@@ -448,6 +449,18 @@ vc_now_seconds(void)
 	return (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
 }
 
+// Seconds from mach_absolute_time (independent clock for the rate-window
+// measurement, so the reported window duration can't be biased by the same
+// source the throttle uses).
+static double
+vc_mach_seconds(void)
+{
+	static mach_timebase_info_data_t tb = { 0, 0 };
+	if (tb.denom == 0) mach_timebase_info(&tb);
+	unsigned __int128 ns = (unsigned __int128)mach_absolute_time() * tb.numer / tb.denom;
+	return (double)(uint64_t)ns / 1.0e9;
+}
+
 // Create one buffer: MTLTexture (ANGLE device) -> EGLImage -> GL texture ->
 // colour-only FBO. Depth is the shared renderbuffer that librw attaches later.
 static bool
@@ -592,18 +605,33 @@ vc_attach_depth_renderbuffer(unsigned int rbo)
 static void
 vcrt_log_rate(void)
 {
-	static double   lastLog = 0.0;
-	static uint64_t lastN = 0, lastW = 0, lastD = 0, lastR = 0;
-	double now = vc_now_seconds();
-	if (lastLog == 0.0) { lastLog = now; lastN = g_frameCount; lastW = g_waitCount; lastD = g_discardCount; lastR = g_recycleCount; return; }
-	if (now - lastLog < 1.0) return;
-	VCLOG(@"[vc-pub] readyIndex=%d publishes/s=%llu parks/s=%llu discards/s=%llu recycles/s=%llu (total pub=%llu)",
+	static double   startT = 0.0, lastLog = 0.0;
+	static uint64_t startN = 0, lastN = 0, lastW = 0, lastD = 0, lastR = 0;
+	double now = vc_mach_seconds();
+	if (lastLog == 0.0) {
+		startT = lastLog = now;
+		startN = lastN = g_frameCount; lastW = g_waitCount; lastD = g_discardCount; lastR = g_recycleCount;
+		return;
+	}
+	double window = now - lastLog;
+	if (window < 1.0) return;
+
+	uint64_t pubs = g_frameCount - lastN;          // publishes in this window
+	double   runtime = now - startT;               // since first rate log
+	double   instRate = pubs / window;             // window-normalised (kills case a)
+	double   longRate = runtime > 0.0 ? (double)(g_frameCount - startN) / runtime : 0.0;
+
+	// window: actual duration of THIS counting window (should be ~1 s; if it's
+	// e.g. 1.06 s while pubs=95, instRate is still ~90 -> case a).
+	// total/runtime -> longRate: the true long-term rate. ~90 = case a, 95+ = case b.
+	VCLOG(@"[vc-pub] readyIndex=%d pubs=%llu window=%.4fs instRate=%.1f/s parks=%llu discards=%llu recycles=%llu | total=%llu runtime=%.2fs longRate=%.2f/s",
 	      g_readyIndex,
-	      (unsigned long long)(g_frameCount   - lastN),
-	      (unsigned long long)(g_waitCount     - lastW),
-	      (unsigned long long)(g_discardCount  - lastD),
-	      (unsigned long long)(g_recycleCount  - lastR),
-	      (unsigned long long)g_frameCount);
+	      (unsigned long long)pubs, window, instRate,
+	      (unsigned long long)(g_waitCount    - lastW),
+	      (unsigned long long)(g_discardCount - lastD),
+	      (unsigned long long)(g_recycleCount - lastR),
+	      (unsigned long long)g_frameCount, runtime, longRate);
+
 	lastLog = now; lastN = g_frameCount; lastW = g_waitCount; lastD = g_discardCount; lastR = g_recycleCount;
 }
 

@@ -1,6 +1,30 @@
 #include "common.h"
 #include "crossplatform.h"
 
+#ifdef LIBRW_VISIONOS
+#include <mach/mach_time.h>
+#include <stdint.h>
+// Performance-counter shim (declared in crossplatform.h). We present a
+// nanosecond clock: frequency = 1e9, counter = monotonic nanoseconds. Timer.cpp
+// then sets _nCyclesPerMS = 1e9/1000 = 1e6 and derives sub-millisecond frame
+// times from 32-bit LowPart deltas (ns wraps every ~4.29 s; a frame is ~11 ms).
+int QueryPerformanceFrequency(LARGE_INTEGER *result) {
+	result->QuadPart = 1000000000LL; // nanosecond ticks
+	return 1;
+}
+int QueryPerformanceCounter(LARGE_INTEGER *result) {
+	static mach_timebase_info_data_t tb = { 0, 0 };
+	if (tb.denom == 0)
+		mach_timebase_info(&tb);
+	uint64_t ticks = mach_absolute_time();
+	// ns = ticks * numer / denom. 128-bit intermediate so ticks*numer can't
+	// overflow uint64 (on Apple silicon numer==denom==1, so this is just ticks).
+	unsigned __int128 ns = (unsigned __int128)ticks * tb.numer / tb.denom;
+	result->QuadPart = (long long)(uint64_t)ns;
+	return 1;
+}
+#endif
+
 // Codes compatible with Windows and Linux
 #ifndef _WIN32
 

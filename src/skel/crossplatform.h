@@ -60,6 +60,19 @@ FILE *_fcaseopen(char const *filename, char const *mode);
 #define fcaseopen _fcaseopen
 int _caserename(const char *old_filename, const char *new_filename);
 #define caserename _caserename
+
+#ifdef LIBRW_VISIONOS
+// High-resolution timer shim so reVC's performance-counter path (Timer.cpp)
+// works on visionOS instead of the quantised millisecond fallback. Backed by
+// mach_absolute_time in crossplatform.cpp. Layout mirrors Win32 LARGE_INTEGER
+// (both .LowPart and .QuadPart are read by Timer.cpp).
+typedef union {
+	struct { unsigned int LowPart; int HighPart; };
+	long long QuadPart;
+} LARGE_INTEGER;
+int QueryPerformanceFrequency(LARGE_INTEGER *result);
+int QueryPerformanceCounter(LARGE_INTEGER *result);
+#endif
 #endif
 
 #ifdef RW_GL3

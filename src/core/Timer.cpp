@@ -7,6 +7,36 @@
 #include "Timer.h"
 #include "SpecialFX.h"
 
+// visionOS gets the same high-resolution performance-counter path as Win32
+// (QueryPerformance* are shimmed over mach_absolute_time in crossplatform.cpp),
+// instead of the quantised millisecond fallback. macOS/Linux keep the fallback.
+#if defined(_WIN32) || defined(LIBRW_VISIONOS)
+#define RW_HIRES_TIMER
+#endif
+
+#ifdef LIBRW_VISIONOS
+#include <stdio.h>
+// DIAGNOSE: once per second, the smallest/largest per-frame delta in microseconds.
+// Direct proof the clock is now sub-millisecond (multiples of 1000 us before the
+// fix; ~11100 us with spread after). ns arg = raw 32-bit counter delta.
+static void vcTimerLogDelta(int deltaNs)
+{
+	static int      minNs = 0x7FFFFFFF, maxNs = 0, count = 0;
+	static double   lastLogMs = -1.0;
+	if (deltaNs < minNs) minNs = deltaNs;
+	if (deltaNs > maxNs) maxNs = deltaNs;
+	count++;
+	LARGE_INTEGER now; QueryPerformanceCounter(&now);
+	double nowMs = (double)(unsigned long long)now.QuadPart / 1.0e6;
+	if (lastLogMs < 0.0) lastLogMs = nowMs;
+	if (nowMs - lastLogMs >= 1000.0) {
+		printf("[vc-timer] frame delta min=%d us max=%d us over %d frames\n",
+		       minNs / 1000, maxNs / 1000, count);
+		minNs = 0x7FFFFFFF; maxNs = 0; count = 0; lastLogMs = nowMs;
+	}
+}
+#endif
+
 uint32 CTimer::m_snTimeInMilliseconds;
 uint32 CTimer::m_snTimeInMillisecondsPauseMode = 1;
 
@@ -25,7 +55,7 @@ uint32 CTimer::m_LogicalFramesPassed;
 
 uint32 _nCyclesPerMS = 1;
 
-#ifdef _WIN32
+#ifdef RW_HIRES_TIMER
 LARGE_INTEGER _oldPerfCounter;
 LARGE_INTEGER perfSuspendCounter;
 #define RsTimerType uint32
@@ -56,11 +86,11 @@ void CTimer::Initialise(void)
 	m_LogicalFramesPassed = 0;
 #endif
 	
-#ifdef _WIN32
+#ifdef RW_HIRES_TIMER
 	LARGE_INTEGER perfFreq;
 	if ( QueryPerformanceFrequency(&perfFreq) )
 	{
-		OutputDebugString("Performance counter available\n");
+		OutputDebugString("Performance counter available (high-resolution timer active)\n");
 		_nCyclesPerMS = uint32(perfFreq.QuadPart / 1000);
 		QueryPerformanceCounter(&_oldPerfCounter);
 	}
@@ -97,18 +127,21 @@ void CTimer::Update(void)
 
 	m_snPreviousTimeInMilliseconds = m_snTimeInMilliseconds;
 	
-#ifdef _WIN32
+#ifdef RW_HIRES_TIMER
 	if ( (double)_nCyclesPerMS != 0.0 )
 	{
 		LARGE_INTEGER pc;
 		QueryPerformanceCounter(&pc);
 		
 		int32 updInCycles = (pc.LowPart - _oldPerfCounter.LowPart); // & 0x7FFFFFFF; pointless
-		
+
 		_oldPerfCounter = pc;
-		
+#ifdef LIBRW_VISIONOS
+		vcTimerLogDelta(updInCycles); // updInCycles is nanoseconds (freq = 1e9)
+#endif
+
 		float updInCyclesScaled = GetIsPaused() ? updInCycles : updInCycles * ms_fTimeScale;
-		
+
 		frameTime = updInCyclesScaled / (double)_nCyclesPerMS;
 
 		dblUpdInMs = (double)updInCycles / (double)_nCyclesPerMS;
@@ -178,7 +211,7 @@ void CTimer::Update(void)
 {
 	m_snPreviousTimeInMilliseconds = m_snTimeInMilliseconds;
 	
-#ifdef _WIN32
+#ifdef RW_HIRES_TIMER
 	if ( (double)_nCyclesPerMS != 0.0 )
 	{
 		LARGE_INTEGER pc;
@@ -254,7 +287,7 @@ void CTimer::Suspend(void)
 	if ( ++suspendDepth > 1 )
 		return;
 	
-#ifdef _WIN32
+#ifdef RW_HIRES_TIMER
 	if ( (double)_nCyclesPerMS != 0.0 )
 		QueryPerformanceCounter(&perfSuspendCounter);
 	else
@@ -267,7 +300,7 @@ void CTimer::Resume(void)
 	if ( --suspendDepth != 0 )
 		return;
 
-#ifdef _WIN32
+#ifdef RW_HIRES_TIMER
 	if ( (double)_nCyclesPerMS != 0.0 )
 	{
 		LARGE_INTEGER pc;
@@ -282,7 +315,7 @@ void CTimer::Resume(void)
 
 uint32 CTimer::GetCyclesPerMillisecond(void)
 {
-#ifdef _WIN32
+#ifdef RW_HIRES_TIMER
 	if (_nCyclesPerMS != 0)
 		return _nCyclesPerMS;
 	else 
@@ -292,7 +325,7 @@ uint32 CTimer::GetCyclesPerMillisecond(void)
 
 uint32 CTimer::GetCurrentTimeInCycles(void)
 {
-#ifdef _WIN32
+#ifdef RW_HIRES_TIMER
 	if ( _nCyclesPerMS != 0 )
 	{
 		LARGE_INTEGER pc;
