@@ -19,10 +19,11 @@
 // DIAGNOSE: once per second, the smallest/largest per-frame delta in microseconds.
 // Direct proof the clock is now sub-millisecond (multiples of 1000 us before the
 // fix; ~11100 us with spread after). ns arg = raw 32-bit counter delta.
-static void vcTimerLogDelta(int deltaNs)
+static void vcTimerLogDelta(long long deltaNs)
 {
-	static int      minNs = 0x7FFFFFFF, maxNs = 0, count = 0;
-	static double   lastLogMs = -1.0;
+	static long long minNs = 0x7FFFFFFFFFFFFFFFLL, maxNs = 0;
+	static int       count = 0;
+	static double    lastLogMs = -1.0;
 	if (deltaNs < minNs) minNs = deltaNs;
 	if (deltaNs > maxNs) maxNs = deltaNs;
 	count++;
@@ -30,9 +31,9 @@ static void vcTimerLogDelta(int deltaNs)
 	double nowMs = (double)(unsigned long long)now.QuadPart / 1.0e6;
 	if (lastLogMs < 0.0) lastLogMs = nowMs;
 	if (nowMs - lastLogMs >= 1000.0) {
-		printf("[vc-timer] frame delta min=%d us max=%d us over %d frames\n",
+		printf("[vc-timer] frame delta min=%lld us max=%lld us over %d frames\n",
 		       minNs / 1000, maxNs / 1000, count);
-		minNs = 0x7FFFFFFF; maxNs = 0; count = 0; lastLogMs = nowMs;
+		minNs = 0x7FFFFFFFFFFFFFFFLL; maxNs = 0; count = 0; lastLogMs = nowMs;
 	}
 }
 #endif
@@ -133,7 +134,10 @@ void CTimer::Update(void)
 		LARGE_INTEGER pc;
 		QueryPerformanceCounter(&pc);
 		
-		int32 updInCycles = (pc.LowPart - _oldPerfCounter.LowPart); // & 0x7FFFFFFF; pointless
+		// Full 64-bit delta. The old 32-bit LowPart subtraction wrapped every
+		// ~4.29 s at our nanosecond QueryPerformanceCounter frequency, mangling
+		// the timestep after a stall. Stays uint64 until the divide below.
+		uint64 updInCycles = (uint64)(pc.QuadPart - _oldPerfCounter.QuadPart);
 
 		_oldPerfCounter = pc;
 #ifdef LIBRW_VISIONOS
@@ -217,7 +221,10 @@ void CTimer::Update(void)
 		LARGE_INTEGER pc;
 		QueryPerformanceCounter(&pc);
 		
-		int32 updInCycles = (pc.LowPart - _oldPerfCounter.LowPart); // & 0x7FFFFFFF; pointless
+		// Full 64-bit delta. The old 32-bit LowPart subtraction wrapped every
+		// ~4.29 s at our nanosecond QueryPerformanceCounter frequency, mangling
+		// the timestep after a stall. Stays uint64 until the divide below.
+		uint64 updInCycles = (uint64)(pc.QuadPart - _oldPerfCounter.QuadPart);
 		
 		_oldPerfCounter = pc;
 		
@@ -306,7 +313,7 @@ void CTimer::Resume(void)
 		LARGE_INTEGER pc;
 		QueryPerformanceCounter(&pc);
 
-		_oldPerfCounter.LowPart += pc.LowPart - perfSuspendCounter.LowPart;
+		_oldPerfCounter.QuadPart += pc.QuadPart - perfSuspendCounter.QuadPart;
 	}
 	else
 #endif
@@ -323,6 +330,11 @@ uint32 CTimer::GetCyclesPerMillisecond(void)
 		return 1;
 }
 
+// NOTE: the uint32 return is INTENTIONAL (reVC API), but at our nanosecond
+// QueryPerformanceCounter frequency it holds only ~4.3 s before wrapping. This
+// function is therefore valid ONLY for intra-frame differences (time since the
+// last CTimer::Update, always << one frame). Do not use it to measure spans
+// that can exceed a frame -- use a full 64-bit clock for that instead.
 uint32 CTimer::GetCurrentTimeInCycles(void)
 {
 #ifdef RW_HIRES_TIMER
@@ -330,7 +342,9 @@ uint32 CTimer::GetCurrentTimeInCycles(void)
 	{
 		LARGE_INTEGER pc;
 		QueryPerformanceCounter(&pc);
-		return (pc.LowPart - _oldPerfCounter.LowPart); // & 0x7FFFFFFF; pointless
+		// 64-bit delta (see Update). Intra-frame query, so it fits the uint32
+		// return; computing from QuadPart avoids the 4.29 s LowPart wrap.
+		return (uint32)(uint64)(pc.QuadPart - _oldPerfCounter.QuadPart);
 	}
 	else
 #endif
