@@ -279,6 +279,10 @@ enum {
 	VC_GL_NEAREST                = 0x2600,
 	VC_GL_CLAMP_TO_EDGE          = 0x812F,
 	VC_EGL_METAL_TEXTURE_ANGLE   = 0x34A7,
+	// ANGLE_metal_texture_client_buffer, added v2 (2024-02-12): selects the
+	// Metal texture-array slice to wrap. From Prototypes/angle-src eglext_angle.h.
+	VC_EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE = 0x34DD,
+	VC_GL_COLOR_BUFFER_BIT       = 0x4000,
 
 	// EGL_ANGLE_metal_shared_event_sync. Values confirmed from Klepton
 	// (shinyquagsire23/Klepton, runtime/gfx/kl_glfb.c, MIT, (c) 2026 Max Thomas).
@@ -875,6 +879,126 @@ vcrt_readback_log(void)
 	       fromRegion:MTLRegionMake2D(g_rtWidth/4, g_rtHeight/4, 1, 1) mipmapLevel:0];
 	VCLOG(@"[vc-rt] readback via Metal blit: centre RGBA=%d,%d,%d,%d  quarter RGBA=%d,%d,%d,%d",
 	      c[0], c[1], c[2], c[3], q[0], q[1], q[2], q[3]);
+}
+
+// VC_SLICE_TEST: prove (via read-back, not a return value) whether ANGLE can
+// wrap a single slice of a Metal 2D-array texture as an EGLImage that GL renders
+// into. Four cases; each slice cleared to a unique colour (slice 0 red, slice 1
+// green), then Metal-blitted back and the real pixel logged. Two identical
+// colours back for an array = both wrote slice 0 = silent failure. Test textures
+// are created on ANGLE's device and freed afterwards; the normal path is
+// untouched.
+extern "C" void
+vcrt_slice_test(void)
+{
+	if (g_mtlDevice == nil || !p_eglCreateImageKHR || !g_eglGetProcAddress) {
+		VCLOG(@"[vc-slice] SKIP: prerequisites missing"); return;
+	}
+	// Test-only entry points, resolved locally so the main table stays untouched.
+	typedef void (*PFN_glClearColor)(float,float,float,float);
+	typedef void (*PFN_glClear)(GLenumVC);
+	typedef void (*PFN_glViewport)(GLintVC,GLintVC,GLsizeiVC,GLsizeiVC);
+	typedef void (*PFN_glDeleteTextures)(GLsizeiVC, const GLuintVC*);
+	typedef void (*PFN_glDeleteFramebuffers)(GLsizeiVC, const GLuintVC*);
+	typedef unsigned int (*PFN_eglDestroyImageKHR)(EGLDisplay, void*);
+	PFN_glClearColor         glClearColor_         = (PFN_glClearColor)g_eglGetProcAddress("glClearColor");
+	PFN_glClear              glClear_              = (PFN_glClear)g_eglGetProcAddress("glClear");
+	PFN_glViewport           glViewport_           = (PFN_glViewport)g_eglGetProcAddress("glViewport");
+	PFN_glDeleteTextures     glDeleteTextures_     = (PFN_glDeleteTextures)g_eglGetProcAddress("glDeleteTextures");
+	PFN_glDeleteFramebuffers glDeleteFramebuffers_ = (PFN_glDeleteFramebuffers)g_eglGetProcAddress("glDeleteFramebuffers");
+	PFN_eglDestroyImageKHR   eglDestroyImageKHR_   = (PFN_eglDestroyImageKHR)g_eglGetProcAddress("eglDestroyImageKHR");
+	if (!glClearColor_ || !glClear_ || !glViewport_) {
+		VCLOG(@"[vc-slice] SKIP: could not resolve gl clear/viewport"); return;
+	}
+
+	const int W = 4, H = 4;
+	if (g_cmdQueue == nil) g_cmdQueue = [g_mtlDevice newCommandQueue];
+
+	struct { const char *name; MTLPixelFormat fmt; bool isArray; } cases[4] = {
+		{"a 2D      RGBA8Unorm ", MTLPixelFormatRGBA8Unorm,  false},
+		{"b 2DArray RGBA8Unorm ", MTLPixelFormatRGBA8Unorm,  true },
+		{"c 2D      RGBA16Float", MTLPixelFormatRGBA16Float, false},
+		{"d 2DArray RGBA16Float", MTLPixelFormatRGBA16Float, true },
+	};
+
+	for (int ci = 0; ci < 4; ci++) {
+		int slices = cases[ci].isArray ? 2 : 1;
+
+		MTLTextureDescriptor *td = [[MTLTextureDescriptor alloc] init];
+		td.pixelFormat = cases[ci].fmt;
+		td.width = W; td.height = H;
+		td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+		td.storageMode = MTLStorageModePrivate;
+		if (cases[ci].isArray) { td.textureType = MTLTextureType2DArray; td.arrayLength = 2; }
+		else                   { td.textureType = MTLTextureType2D; }
+		id<MTLTexture> tex = [g_mtlDevice newTextureWithDescriptor:td];
+		if (tex == nil) { VCLOG(@"[vc-slice] %s: MTLTexture alloc FAILED", cases[ci].name); continue; }
+
+		for (int s = 0; s < slices; s++) {
+			const EGLint attrsArr[] = { (EGLint)VC_EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE, (EGLint)s, (EGLint)VC_EGL_NONE };
+			const EGLint attrs2D[]  = { (EGLint)VC_EGL_NONE };
+			void *img = p_eglCreateImageKHR(g_display, (EGLContext)0, VC_EGL_METAL_TEXTURE_ANGLE,
+			                                VC_OBJ_TO_VOID(tex), cases[ci].isArray ? attrsArr : attrs2D);
+			if (img == NULL) {
+				VCLOG(@"[vc-slice] %s slice %d: eglCreateImageKHR=NULL eglErr=0x%x",
+				      cases[ci].name, s, g_eglGetError ? g_eglGetError() : 0);
+				continue;
+			}
+
+			GLuintVC gltex = 0, glfbo = 0;
+			p_glGenTextures(1, &gltex);
+			p_glBindTexture(VC_GL_TEXTURE_2D, gltex);
+			p_glEGLImageTargetTexture2DOES(VC_GL_TEXTURE_2D, img);
+			GLenumVC bindErr = p_glGetError();
+			p_glGenFramebuffers(1, &glfbo);
+			p_glBindFramebuffer(VC_GL_FRAMEBUFFER, glfbo);
+			p_glFramebufferTexture2D(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0, VC_GL_TEXTURE_2D, gltex, 0);
+			GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
+
+			// slice 0 = red, slice 1 = green
+			glViewport_(0, 0, W, H);
+			glClearColor_((s == 0) ? 1.0f : 0.0f, (s == 1) ? 1.0f : 0.0f, 0.0f, 1.0f);
+			glClear_((GLenumVC)VC_GL_COLOR_BUFFER_BIT);
+			if (p_glFinish) p_glFinish();
+
+			// Read back THIS slice via a Metal blit into a shared 2D staging tex.
+			MTLTextureDescriptor *sd = [[MTLTextureDescriptor alloc] init];
+			sd.pixelFormat = cases[ci].fmt; sd.width = W; sd.height = H;
+			sd.usage = MTLTextureUsageShaderRead; sd.storageMode = MTLStorageModeShared;
+			sd.textureType = MTLTextureType2D;
+			id<MTLTexture> staging = [g_mtlDevice newTextureWithDescriptor:sd];
+			id<MTLCommandBuffer> cb = [g_cmdQueue commandBuffer];
+			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+			[blit copyFromTexture:tex sourceSlice:s sourceLevel:0
+			         sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(W,H,1)
+			            toTexture:staging destinationSlice:0 destinationLevel:0
+			    destinationOrigin:MTLOriginMake(0,0,0)];
+			[blit endEncoding]; [cb commit]; [cb waitUntilCompleted];
+
+			char colorStr[80];
+			if (cases[ci].fmt == MTLPixelFormatRGBA8Unorm) {
+				uint8_t px[4] = {0,0,0,0};
+				[staging getBytes:px bytesPerRow:4 fromRegion:MTLRegionMake2D(W/2,H/2,1,1) mipmapLevel:0];
+				snprintf(colorStr, sizeof(colorStr), "RGBA8=%d,%d,%d,%d", px[0],px[1],px[2],px[3]);
+			} else {
+				__fp16 px[4] = {0,0,0,0};
+				[staging getBytes:px bytesPerRow:8 fromRegion:MTLRegionMake2D(W/2,H/2,1,1) mipmapLevel:0];
+				snprintf(colorStr, sizeof(colorStr), "RGBA16F=%.2f,%.2f,%.2f,%.2f",
+				         (float)px[0],(float)px[1],(float)px[2],(float)px[3]);
+			}
+
+			VCLOG(@"[vc-slice] %s slice %d: eglImage=OK fbo=%s bindErr=0x%x -> %s",
+			      cases[ci].name, s, vcrt_fbo_status_name(status), (unsigned)bindErr, colorStr);
+
+			p_glBindFramebuffer(VC_GL_FRAMEBUFFER, 0);
+			if (glDeleteFramebuffers_) glDeleteFramebuffers_(1, &glfbo);
+			if (glDeleteTextures_)     glDeleteTextures_(1, &gltex);
+			if (eglDestroyImageKHR_)   eglDestroyImageKHR_(g_display, img);
+			staging = nil;
+		}
+		tex = nil; // ARC releases the test MTLTexture
+	}
+	VCLOG(@"[vc-slice] done");
 }
 
 #endif // LIBRW_VISIONOS

@@ -1346,6 +1346,17 @@ if(gbRenderFadingInEntities)
 }
 #endif
 
+#ifdef LIBRW_VISIONOS
+// VC_DOUBLE_RENDER measurement (mode from src/skel/visionos/visionos.cpp):
+//   1 = render scene twice sharing the depth buffer
+//   2 = clear depth between the passes (vc_clear_depth, gl3device)
+//   3 = 2nd pass with GL_LESS so all equal-depth fragments fail (vc_set_force_depth_less)
+// Declared at namespace scope (extern "C" is not allowed inside a function body).
+extern "C" int  vc_double_render_mode(void);
+extern "C" void vc_clear_depth(void);
+extern "C" void vc_set_force_depth_less(int on);
+#endif
+
 void
 RenderScene(void)
 {
@@ -1622,6 +1633,26 @@ Idle(void *arg)
 		tbStartTimer(0, "RenderScene");
 		RenderScene();
 		tbEndTimer("RenderScene");
+
+#ifdef LIBRW_VISIONOS
+		// Phase-5 cost probe: draw the SAME scene a second time inside this same
+		// Begin/End (no extra buffer reserve/publish). mode 1 shares the depth
+		// buffer (measures draw-call/state overhead); mode 2 clears depth between
+		// (adds the full fragment work). Nothing else changes -- same camera, same
+		// projection, same geometry.
+		{
+			int vcDR = vc_double_render_mode();
+			if (vcDR >= 1) {
+				if (vcDR == 2)
+					vc_clear_depth();               // depth-only clear via vc seam (no RW detour)
+				if (vcDR == 3)
+					vc_set_force_depth_less(1);     // GL_LESS -> all equal-depth frags fail
+				RenderScene();
+				if (vcDR == 3)
+					vc_set_force_depth_less(0);     // restore LEQUAL for the later passes
+			}
+		}
+#endif
 
 #ifdef EXTENDED_PIPELINES
 		CustomPipes::EnvMapRender();

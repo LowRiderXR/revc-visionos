@@ -63,6 +63,104 @@ extern "C" void vc_screen_size(int *w, int *h)
 	if (h) *h = VISIONOS_SCREEN_HEIGHT;
 }
 
+// VC_DOUBLE_RENDER cost probe (read from main.cpp's RenderScene hook):
+//   0 = off
+//   1 = render scene twice sharing depth (LEQUAL: visible frags re-shade)
+//   2 = clear depth between passes (full 2x fragment work)
+//   3 = 2nd pass with GL_LESS (all equal-depth frags fail -> vertex/draw-call only)
+extern "C" int vc_double_render_mode(void)
+{
+	static int mode = -1;
+	if (mode < 0) {
+		const char *v = getenv("VC_DOUBLE_RENDER");
+		mode = (v && v[0] >= '1' && v[0] <= '3') ? (v[0] - '0') : 0;
+		printf("[vc-dr] VC_DOUBLE_RENDER mode = %d (%s)\n", mode,
+		       mode == 0 ? "off" :
+		       mode == 1 ? "double render, shared depth (LEQUAL)" :
+		       mode == 2 ? "double render, depth cleared between" :
+		                   "double render, GL_LESS (2nd pass frags rejected)");
+	}
+	return mode;
+}
+
+// Render mode seam. Mirror of vc_render_mode_t in AvpViceCity/VCPlatform.h --
+// values MUST match. Read once from VC_RENDER_MODE (default cinema). Stereo is
+// not implemented yet, so it logs a stub line and falls back to cinema; the
+// EFFECTIVE mode returned here is therefore cinema. Kept in a mutable global (no
+// compile-time bake-in) so a later runtime switch stays possible.
+enum { VC_MODE_CINEMA = 0, VC_MODE_STEREO = 1 };
+static int g_renderMode = -1;   // -1 = not yet resolved
+
+extern "C" int vc_render_mode(void)
+{
+	if (g_renderMode < 0) {
+		const char *v = getenv("VC_RENDER_MODE");
+		int requested = (v && strcasecmp(v, "stereo") == 0) ? VC_MODE_STEREO : VC_MODE_CINEMA;
+		if (requested == VC_MODE_STEREO) {
+			printf("[vc-mode] VC_RENDER_MODE = stereo (requested)\n");
+			printf("[vc-mode] stereo not implemented yet -> falling back to cinema\n");
+			g_renderMode = VC_MODE_CINEMA;   // stub fallback
+		} else {
+			g_renderMode = VC_MODE_CINEMA;
+		}
+		printf("[vc-mode] active render mode = %s\n",
+		       g_renderMode == VC_MODE_CINEMA ? "cinema" : "stereo");
+	}
+	return g_renderMode;
+}
+
+// --- Camera matrix override seam (stereo injection point) -------------------
+// gl3device beginUpdate consumes these (getters below) after computing its own
+// view/proj; when active it uploads ours instead. Buffered under a lock: the
+// setters will later be driven from the compositor (main thread) while the
+// getters run on the game thread. 16 floats each, column-major, librw convention.
+static pthread_mutex_t g_mtxMutex = PTHREAD_MUTEX_INITIALIZER;
+static float g_ovView[16];
+static float g_ovProj[16];
+static int   g_ovActive = 0;
+
+extern "C" void vc_set_view_matrix(const float m[16])
+{
+	if (!m) return;
+	pthread_mutex_lock(&g_mtxMutex); memcpy(g_ovView, m, 16 * sizeof(float)); pthread_mutex_unlock(&g_mtxMutex);
+}
+extern "C" void vc_set_projection_matrix(const float m[16])
+{
+	if (!m) return;
+	pthread_mutex_lock(&g_mtxMutex); memcpy(g_ovProj, m, 16 * sizeof(float)); pthread_mutex_unlock(&g_mtxMutex);
+}
+extern "C" void vc_set_matrix_override(int active)
+{
+	pthread_mutex_lock(&g_mtxMutex); g_ovActive = active ? 1 : 0; pthread_mutex_unlock(&g_mtxMutex);
+}
+// Consumed by gl3device (librw). Not in VCPlatform.h -- reVC-internal.
+extern "C" int vc_matrix_override_active(void)
+{
+	pthread_mutex_lock(&g_mtxMutex); int a = g_ovActive; pthread_mutex_unlock(&g_mtxMutex); return a;
+}
+extern "C" void vc_get_view_matrix(float m[16])
+{
+	pthread_mutex_lock(&g_mtxMutex); memcpy(m, g_ovView, 16 * sizeof(float)); pthread_mutex_unlock(&g_mtxMutex);
+}
+extern "C" void vc_get_projection_matrix(float m[16])
+{
+	pthread_mutex_lock(&g_mtxMutex); memcpy(m, g_ovProj, 16 * sizeof(float)); pthread_mutex_unlock(&g_mtxMutex);
+}
+
+// VC_MATRIX_TEST: 0 off, 1 "identity" (feed reVC's own matrices back -> image
+// must be unchanged), 2 "shift" (view shifted 0.5 m -> image must move).
+extern "C" int vc_matrix_test_mode(void)
+{
+	static int m = -1;
+	if (m < 0) {
+		const char *v = getenv("VC_MATRIX_TEST");
+		m = (v && strcasecmp(v, "shift") == 0)    ? 2 :
+		    (v && strcasecmp(v, "identity") == 0)  ? 1 : 0;
+		printf("[vc-mtx] VC_MATRIX_TEST = %s\n", m == 0 ? "off" : m == 1 ? "identity" : "shift");
+	}
+	return m;
+}
+
 // ANGLE bring-up lives in visionos_angle.mm (ObjC++/Metal, kept out of this
 // C++ unit to avoid Foundation vs. reVC macro clashes). Returns success and,
 // via the out-param, ANGLE's eglGetProcAddress (as void*) for librw's glad.
@@ -73,6 +171,7 @@ extern "C" void *vcgl_get_proc_address(void);            // ANGLE eglGetProcAddr
 
 // Double-buffered render target + throttle + publish, all in visionos_angle.mm.
 extern "C" bool         vcrt_create(int width, int height);
+extern "C" void         vcrt_slice_test(void);   // VC_SLICE_TEST diagnostic (visionos_angle.mm)
 extern "C" bool         vc_use_external_framebuffer(void);
 extern "C" unsigned int vc_external_framebuffer(void);
 extern "C" bool         vcrt_begin_frame(void);   // throttle: false = park this frame
@@ -759,6 +858,10 @@ run_game_loop(void)
 		return;
 	}
 
+	// Resolve + log the render mode once at startup. Cinema for now (stereo is a
+	// stub that falls back). Future mode-dependent setup would branch here.
+	vc_render_mode();
+
 	// Create the render target (MTLTexture on ANGLE's device -> EGLImage -> GL
 	// FBO). Must happen before any rendering and before Initialise3D so the
 	// external-framebuffer redirect is armed when the first camera pass runs.
@@ -767,6 +870,12 @@ run_game_loop(void)
 		printf("[vc-loop] FAIL: could not create render target\n");
 		return;
 	}
+
+	// VC_SLICE_TEST: one-shot probe of EGLImage wrapping of Metal 2D-array slices
+	// (RGBA8/RGBA16Float). Runs here (GL context current, ANGLE resolved), then
+	// the normal path continues unchanged.
+	if (getenv("VC_SLICE_TEST"))
+		vcrt_slice_test();
 
 	// Once-before-RW init (Stufe 1): CGame::InitialiseOnceBeforeRW() runs
 	// CdStreamInit(MAX_CDCHANNELS). On the glfw path this fires from the
