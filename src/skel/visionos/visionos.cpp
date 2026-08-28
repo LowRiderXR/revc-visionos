@@ -147,6 +147,18 @@ extern "C" void vc_get_projection_matrix(float m[16])
 	pthread_mutex_lock(&g_mtxMutex); memcpy(m, g_ovProj, 16 * sizeof(float)); pthread_mutex_unlock(&g_mtxMutex);
 }
 
+// View compose flag: when set, gl3device left-multiplies the override view onto
+// the game view (head-pose offset) instead of replacing it. See VCPlatform.h.
+static int g_ovCompose = 0;
+extern "C" void vc_set_view_compose(int on)
+{
+	pthread_mutex_lock(&g_mtxMutex); g_ovCompose = on ? 1 : 0; pthread_mutex_unlock(&g_mtxMutex);
+}
+extern "C" int vc_view_compose_active(void)
+{
+	pthread_mutex_lock(&g_mtxMutex); int c = g_ovCompose; pthread_mutex_unlock(&g_mtxMutex); return c;
+}
+
 // VC_MATRIX_TEST: 0 off, 1 "identity" (feed reVC's own matrices back -> image
 // must be unchanged), 2 "shift" (view shifted 0.5 m -> image must move).
 extern "C" int vc_matrix_test_mode(void)
