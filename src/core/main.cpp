@@ -1355,6 +1355,11 @@ if(gbRenderFadingInEntities)
 extern "C" int  vc_double_render_mode(void);
 extern "C" void vc_clear_depth(void);
 extern "C" void vc_set_force_depth_less(int on);
+// Phase 5.5 stereo (declared at namespace scope; extern "C" at block scope is illegal).
+extern "C" int  vc_render_mode(void);          // 1 = VC_MODE_STEREO
+extern "C" void vc_stereo_eye_pass(int eye);   // gl3device: bind slice FBO + per-eye matrices
+extern "C" void vc_stereo_restore_main(void);  // gl3device: rebind cinema FBO + mono matrices
+extern "C" void vc_stereo_readback_log(void);  // visionos_angle: one-time slice read-back proof
 #endif
 
 void
@@ -1651,6 +1656,22 @@ Idle(void *arg)
 				if (vcDR == 3)
 					vc_set_force_depth_less(0);     // restore LEQUAL for the later passes
 			}
+		}
+
+		// Phase 5.5 stereo: render the main-view geometry once per eye into the two
+		// slices of the array texture. RTT cameras (shadows/water/blur) ran outside
+		// RenderScene, so re-running RenderScene does NOT repeat them. The cinema
+		// buffer is untouched -- each eye pass binds its own slice FBO + dedicated
+		// depth, then vc_stereo_restore_main puts the cinema binding back so the
+		// rest of this frame (effects, 2D/HUD, publish) proceeds as before. The
+		// proof is read back once, off-screen; nothing here reaches the display yet.
+		if (vc_render_mode() == 1 /* VC_MODE_STEREO */) {
+			for (int eye = 0; eye < 2; eye++) {
+				vc_stereo_eye_pass(eye);
+				RenderScene();
+			}
+			vc_stereo_restore_main();
+			vc_stereo_readback_log();
 		}
 #endif
 

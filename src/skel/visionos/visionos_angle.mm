@@ -1001,4 +1001,146 @@ vcrt_slice_test(void)
 	VCLOG(@"[vc-slice] done");
 }
 
+// ===========================================================================
+// Phase 5.5 stereo target: ONE MTLTexture (2D array, arrayLength=2), a GL FBO
+// per slice, and a DEDICATED depth renderbuffer (never the cinema depth -- the
+// cinema frame renders in parallel into g_buf and must not be disturbed). The
+// two eye passes in reVC redirect explicitly to these FBOs; nothing here is
+// published yet (that's the publish-naht + Swift, next step).
+// ===========================================================================
+static id<MTLTexture> g_stereoTex        = nil;
+static GLuintVC       g_stereoGlTex[2]   = {0, 0};
+static GLuintVC       g_stereoFbo[2]     = {0, 0};
+static void          *g_stereoImg[2]     = {NULL, NULL};
+static GLuintVC       g_stereoDepthRbo   = 0;
+static bool           g_stereoReady      = false;
+static bool           g_stereoFailed     = false;
+
+// Lazily create the stereo target. Called from the game thread (GL context
+// current) on the first eye pass, so g_rtWidth/Height and the GL entry points
+// are already resolved. Idempotent; latches failure so it logs only once.
+extern "C" bool
+vcrt_stereo_ensure(void)
+{
+	if (g_stereoReady)  return true;
+	if (g_stereoFailed) return false;
+	if (g_mtlDevice == nil || !p_eglCreateImageKHR || !g_eglGetProcAddress) {
+		g_stereoFailed = true; VCLOG(@"[vc-stereo] SKIP: prerequisites missing"); return false;
+	}
+
+	// Renderbuffer entry points for the dedicated depth buffer (resolved locally;
+	// the main table doesn't carry them).
+	typedef void (*PFN_glGenRenderbuffers)(GLsizeiVC, GLuintVC *);
+	typedef void (*PFN_glBindRenderbuffer)(GLenumVC, GLuintVC);
+	typedef void (*PFN_glRenderbufferStorage)(GLenumVC, GLenumVC, GLsizeiVC, GLsizeiVC);
+	PFN_glGenRenderbuffers    glGenRenderbuffers_    = (PFN_glGenRenderbuffers)g_eglGetProcAddress("glGenRenderbuffers");
+	PFN_glBindRenderbuffer    glBindRenderbuffer_    = (PFN_glBindRenderbuffer)g_eglGetProcAddress("glBindRenderbuffer");
+	PFN_glRenderbufferStorage glRenderbufferStorage_ = (PFN_glRenderbufferStorage)g_eglGetProcAddress("glRenderbufferStorage");
+	if (!glGenRenderbuffers_ || !glBindRenderbuffer_ || !glRenderbufferStorage_) {
+		g_stereoFailed = true; VCLOG(@"[vc-stereo] SKIP: renderbuffer funcs unresolved"); return false;
+	}
+
+	const int W = g_rtWidth, H = g_rtHeight;
+
+	// Verified params (same as the cinema buffers and the slice test), plus the
+	// array type: RGBA8Unorm, ShaderRead|RenderTarget, Private, ANGLE's device.
+	MTLTextureDescriptor *td = [[MTLTextureDescriptor alloc] init];
+	td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+	td.width = W; td.height = H;
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	td.textureType = MTLTextureType2DArray;
+	td.arrayLength = 2;
+	g_stereoTex = [g_mtlDevice newTextureWithDescriptor:td];
+	if (g_stereoTex == nil) { g_stereoFailed = true; VCLOG(@"[vc-stereo] FAIL: array MTLTexture create"); return false; }
+
+	// One dedicated depth renderbuffer, shared by both eye FBOs and cleared per
+	// pass (the passes are sequential on this one GL thread).
+	glGenRenderbuffers_(1, &g_stereoDepthRbo);
+	glBindRenderbuffer_(VC_GL_RENDERBUFFER, g_stereoDepthRbo);
+	glRenderbufferStorage_(VC_GL_RENDERBUFFER, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
+
+	for (int s = 0; s < 2; s++) {
+		const EGLint attrs[] = { (EGLint)VC_EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE, (EGLint)s, (EGLint)VC_EGL_NONE };
+		g_stereoImg[s] = p_eglCreateImageKHR(g_display, (EGLContext)0, VC_EGL_METAL_TEXTURE_ANGLE,
+		                                     VC_OBJ_TO_VOID(g_stereoTex), attrs);
+		if (g_stereoImg[s] == NULL) {
+			g_stereoFailed = true;
+			VCLOG(@"[vc-stereo] slice %d FAIL eglCreateImageKHR (egl 0x%x)", s, g_eglGetError ? g_eglGetError() : 0);
+			return false;
+		}
+		p_glGenTextures(1, &g_stereoGlTex[s]);
+		p_glBindTexture(VC_GL_TEXTURE_2D, g_stereoGlTex[s]);
+		p_glEGLImageTargetTexture2DOES(VC_GL_TEXTURE_2D, g_stereoImg[s]);
+		GLenumVC bindErr = p_glGetError();
+		p_glGenFramebuffers(1, &g_stereoFbo[s]);
+		p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_stereoFbo[s]);
+		p_glFramebufferTexture2D(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0, VC_GL_TEXTURE_2D, g_stereoGlTex[s], 0);
+		p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, g_stereoDepthRbo);
+		GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
+		VCLOG(@"[vc-stereo] slice %d: %dx%d RGBA8 gltex %u fbo %u bindErr=0x%x status=%s",
+		      s, W, H, g_stereoGlTex[s], g_stereoFbo[s], (unsigned)bindErr, vcrt_fbo_status_name(status));
+	}
+	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, 0);
+	g_stereoReady = true;
+	VCLOG(@"[vc-stereo] array render target ready (2 slices, %dx%d, dedicated depth)", W, H);
+	return true;
+}
+
+extern "C" unsigned int
+vc_stereo_eye_fbo(int eye)
+{
+	return (g_stereoReady && (eye == 0 || eye == 1)) ? g_stereoFbo[eye] : 0;
+}
+
+// One-time proof that the two eye passes wrote DIFFERENT content into the two
+// slices: Metal-blit each slice into a shared 2D staging texture and log the
+// centre pixel. Identical values => both passes rendered the same => the
+// per-eye matrices did not take.
+extern "C" void
+vc_stereo_readback_log(void)
+{
+	static bool done = false;
+	if (done || !g_stereoReady) return;
+	done = true;
+
+	if (p_glFinish) p_glFinish();   // submit the eye passes to ANGLE's queue first
+	if (g_cmdQueue == nil) g_cmdQueue = [g_mtlDevice newCommandQueue];
+
+	MTLTextureDescriptor *sd =
+		[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                   width:g_rtWidth height:g_rtHeight mipmapped:NO];
+	sd.usage = MTLTextureUsageShaderRead;
+	sd.storageMode = MTLStorageModeShared;
+
+	// Sample three points (centre + two off-centre); a horizontal eye offset only
+	// changes a pixel where there's parallax, so one sky-flat point could read
+	// equal by chance. DIFFER if ANY point differs.
+	const int pts[3][2] = { { g_rtWidth/2, g_rtHeight/2 },
+	                        { g_rtWidth/4, g_rtHeight/2 },
+	                        { g_rtWidth/2, g_rtHeight/4 } };
+	uint8_t px[2][3][4];
+	memset(px, 0, sizeof(px));
+	for (int s = 0; s < 2; s++) {
+		id<MTLTexture> staging = [g_mtlDevice newTextureWithDescriptor:sd];
+		id<MTLCommandBuffer> cb = [g_cmdQueue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit copyFromTexture:g_stereoTex sourceSlice:s sourceLevel:0
+		         sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(g_rtWidth, g_rtHeight, 1)
+		            toTexture:staging destinationSlice:0 destinationLevel:0
+		    destinationOrigin:MTLOriginMake(0,0,0)];
+		[blit endEncoding]; [cb commit]; [cb waitUntilCompleted];
+		for (int p = 0; p < 3; p++)
+			[staging getBytes:px[s][p] bytesPerRow:4
+			       fromRegion:MTLRegionMake2D(pts[p][0], pts[p][1], 1, 1) mipmapLevel:0];
+	}
+	bool differ = memcmp(px[0], px[1], sizeof(px[0])) != 0;
+	VCLOG(@"[vc-stereo] readback (centre)  slice0 RGBA=%d,%d,%d,%d  slice1 RGBA=%d,%d,%d,%d  -> %s",
+	      px[0][0][0],px[0][0][1],px[0][0][2],px[0][0][3], px[1][0][0],px[1][0][1],px[1][0][2],px[1][0][3],
+	      differ ? "DIFFER (eyes rendered separately)" : "IDENTICAL (per-eye matrices did NOT take)");
+	VCLOG(@"[vc-stereo] readback (offc.)   slice0 RGBA=%d,%d,%d,%d / %d,%d,%d,%d  slice1 RGBA=%d,%d,%d,%d / %d,%d,%d,%d",
+	      px[0][1][0],px[0][1][1],px[0][1][2],px[0][1][3], px[0][2][0],px[0][2][1],px[0][2][2],px[0][2][3],
+	      px[1][1][0],px[1][1][1],px[1][1][2],px[1][1][3], px[1][2][0],px[1][2][1],px[1][2][2],px[1][2][3]);
+}
+
 #endif // LIBRW_VISIONOS

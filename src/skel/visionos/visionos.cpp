@@ -98,8 +98,11 @@ extern "C" int vc_render_mode(void)
 		int requested = (v && strcasecmp(v, "stereo") == 0) ? VC_MODE_STEREO : VC_MODE_CINEMA;
 		if (requested == VC_MODE_STEREO) {
 			printf("[vc-mode] VC_RENDER_MODE = stereo (requested)\n");
-			printf("[vc-mode] stereo not implemented yet -> falling back to cinema\n");
-			g_renderMode = VC_MODE_CINEMA;   // stub fallback
+			// Phase 5.5: stereo now renders two eye passes into a 2D-array texture
+			// (proof via read-back; publish-naht + Swift are the next step). The
+			// cinema back buffer is still what gets published, so the display stays
+			// mono for now -- the stereo slices are validated off-screen.
+			g_renderMode = VC_MODE_STEREO;
 		} else {
 			g_renderMode = VC_MODE_CINEMA;
 		}
