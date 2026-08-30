@@ -1636,10 +1636,28 @@ Idle(void *arg)
 #endif
 
 		tbStartTimer(0, "RenderScene");
+#ifdef LIBRW_VISIONOS
+		// In stereo, the two eye passes below ARE the scene render (into the array
+		// slices). Skip this mono cinema pass so the frame renders the scene twice,
+		// not three times. Cinema mode is unchanged (runs it).
+		if (vc_render_mode() != 1 /* VC_MODE_STEREO */)
+#endif
 		RenderScene();
 		tbEndTimer("RenderScene");
 
 #ifdef LIBRW_VISIONOS
+		{
+			// One-time proof of the scene-pass count per mode.
+			static bool vcLoggedPasses = false;
+			if (!vcLoggedPasses) {
+				vcLoggedPasses = true;
+				bool st = (vc_render_mode() == 1);
+				printf("[vc-stereo] scene passes/frame = %d (%s)\n",
+				       st ? 2 : 1,
+				       st ? "stereo: 2 eye passes, cinema pass skipped" : "cinema: 1 mono pass");
+			}
+		}
+
 		// Phase-5 cost probe: draw the SAME scene a second time inside this same
 		// Begin/End (no extra buffer reserve/publish). mode 1 shares the depth
 		// buffer (measures draw-call/state overhead); mode 2 clears depth between
@@ -1663,8 +1681,15 @@ Idle(void *arg)
 		// RenderScene, so re-running RenderScene does NOT repeat them. The cinema
 		// buffer is untouched -- each eye pass binds its own slice FBO + dedicated
 		// depth, then vc_stereo_restore_main puts the cinema binding back so the
-		// rest of this frame (effects, 2D/HUD, publish) proceeds as before. The
-		// proof is read back once, off-screen; nothing here reaches the display yet.
+		// rest of this frame (effects, 2D/HUD, publish) proceeds as before.
+		//
+		// TODO(visionos) 5.6: this is exactly where the mono/stereo split sits.
+		// Only RenderScene (the 3D world) is redirected into the published stereo
+		// slices. Everything drawn AFTER vc_stereo_restore_main() -- RenderEffects,
+		// RenderMenus, DoFade, Render2dStuff (HUD/menu/fade) -- goes into the cinema
+		// buffer, which is NOT shown in stereo, so those are currently invisible
+		// in-game. 5.6 must render the 2D/HUD layer into BOTH eye slices (or a
+		// shared overlay) instead of the cinema buffer.
 		if (vc_render_mode() == 1 /* VC_MODE_STEREO */) {
 			for (int eye = 0; eye < 2; eye++) {
 				vc_stereo_eye_pass(eye);
