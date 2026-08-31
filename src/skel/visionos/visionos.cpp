@@ -112,6 +112,7 @@ extern "C" int vc_render_mode(void)
 	return g_renderMode;
 }
 
+
 // --- Camera matrix override seam (stereo injection point) -------------------
 // gl3device beginUpdate consumes these (getters below) after computing its own
 // view/proj; when active it uploads ours instead. Buffered under a lock: the
