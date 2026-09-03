@@ -334,8 +334,15 @@ static PFN_eglCreateSync              p_eglCreateSync = NULL;
 static PFN_eglDestroySync             p_eglDestroySync = NULL;
 static PFN_eglQueryString             p_eglQueryString = NULL;
 
-// Double-buffered render target: two full sets of MTLTexture+EGLImage+GLtex+FBO.
-#define VC_NUM_BUFFERS 2
+// Render-target buffer pool. VC_NUM_BUFFERS is the ARRAY CAPACITY; g_numBuffers is
+// the count actually used (env VC_NUM_BUFFERS, default 3). With only 2, begin_frame
+// blocks ~1 display frame every frame (one buffer ACQUIRED, one READY, none FREE)
+// -> self-sustaining 45 Hz. A 3rd buffer gives reVC the missing lead so it doesn't
+// wait on the compositor's release. Tunable so M2 vs M5 can pick their sweet spot.
+#define VC_NUM_BUFFERS 4
+static int g_numBuffers = 3;
+static int g_frameCapHz = 0;   // >0 = fixed cap Hz; 0 = uncapped; -1 = auto (= display rate)
+static int g_displayHz = 0;    // measured compositor rate (acquire-call frequency), 0 until known
 
 // One bit ("busy") could not tell "finished but not yet fetched" from "in use by
 // the compositor" -- and the second must never be reclaimed while Metal reads it.
@@ -358,6 +365,7 @@ typedef struct {
 	GLuintVC       glFbo;
 	VCBufState     state;
 	uint64_t       waitValue;  // shared-event value to wait for (0 = no wait)
+	uint64_t       poseSetTime; // mach time the head pose of THIS slice was pushed (latency probe)
 } VCBuffer;
 
 static VCBuffer g_buf[VC_NUM_BUFFERS];
@@ -398,6 +406,10 @@ typedef struct {
 
 // Defined in visionos.cpp; lets the throttle wake up for vc_game_thread_stop().
 extern "C" bool vc_should_stop(void);
+// Defined in visionos.cpp: push time of the head pose reVC last rendered with.
+extern "C" uint64_t vc_last_consumed_pose_time(void);
+// Defined in visionos.cpp: 1 = verbose perf logs enabled (VC_PERF_LOG).
+extern "C" int vc_perf_log(void);
 
 // Stereo accessors (defined further down with the stereo target). Used by
 // vc_acquire_ready_frame to hand out the array texture + eye_count in stereo.
@@ -533,9 +545,24 @@ vcrt_create(int width, int height)
 	if (g_mtlDevice == nil) { VCLOG(@"[vc-rt] FAIL: no ANGLE MTLDevice"); return false; }
 	if (!vcrt_resolve()) return false;
 
+	// STEREO defaults (each env-overridable below): 4 buffers + newest recycle + auto
+	// frame-cap (= measured display rate) together break BOTH the 45 Hz buffer
+	// starvation AND the 145 Hz free-run beat, without a phase-lock. Cinema keeps
+	// wait + 2 buffers + no cap (half the GPU work; camera isn't head-locked there).
+	bool stereo = (vc_render_mode() == 1);
+	if (stereo) { g_numBuffers = 4; g_recycleOlderReady = true; g_frameCapHz = -1; }
+
+	// Buffer count (env VC_NUM_BUFFERS, clamped to the array capacity).
+	const char *nb = getenv("VC_NUM_BUFFERS");
+	if (nb) { int v = atoi(nb); if (v >= 2 && v <= VC_NUM_BUFFERS) g_numBuffers = v; }
+
+	// Frame-rate cap (env VC_FRAME_CAP_HZ): >0 fixed, 0 off, negative keeps auto.
+	const char *fc = getenv("VC_FRAME_CAP_HZ");
+	if (fc) { int v = atoi(fc); if (v >= 0 && v <= 240) g_frameCapHz = v; }
+
 	g_rtWidth = width;
 	g_rtHeight = height;
-	for (int i = 0; i < VC_NUM_BUFFERS; i++)
+	for (int i = 0; i < g_numBuffers; i++)
 		if (!vcrt_make_buffer(i, width, height)) return false;
 
 	// VC_NOFENCE=1 disables the wait entirely (publishes wait_value 0). A command
@@ -544,14 +571,14 @@ vcrt_create(int width, int height)
 	// invisible from the Metal side, hence an explicit A/B switch.
 	g_noFence = (getenv("VC_NOFENCE") != NULL);
 
-	// Buffer strategy. Default "wait": no recycle, exactly the display rate, ~half
-	// a frame more latency but half the GPU work -- the right default in cinema
-	// mode where the game camera isn't head-locked.
+	// Buffer strategy. Stereo defaults to "newest" (above); cinema to "wait" (no
+	// recycle, exactly the display rate, half the GPU work). VC_BUFFER_MODE overrides.
 	const char *mode = getenv("VC_BUFFER_MODE");
-	g_recycleOlderReady = (mode != NULL && strcmp(mode, "newest") == 0);
-	VCLOG(@"[vc-rt] buffer mode: %s", g_recycleOlderReady
+	if (mode) g_recycleOlderReady = (strcmp(mode, "newest") == 0);
+	VCLOG(@"[vc-rt] buffer mode: %s (%d buffers, cap %s)", g_recycleOlderReady
 	      ? "newest (recycle older READY at acquire -> game runs ahead)"
-	      : "wait (default; game paces to real releases, no recycle)");
+	      : "wait (game paces to real releases, no recycle)",
+	      g_numBuffers, g_frameCapHz < 0 ? "auto=display" : (g_frameCapHz > 0 ? "fixed" : "off"));
 
 	const char *exts = p_eglQueryString ? p_eglQueryString(g_display, VC_EGL_EXTENSIONS) : NULL;
 	bool haveExt = exts && strstr(exts, "EGL_ANGLE_metal_shared_event_sync") != NULL;
@@ -571,8 +598,8 @@ vcrt_create(int width, int height)
 	g_currentBack = 0;
 	g_readyIndex  = -1;
 	g_extActive   = true;
-	VCLOG(@"[vc-rt] double-buffered render target ready (%d buffers, %dx%d)",
-	      VC_NUM_BUFFERS, width, height);
+	VCLOG(@"[vc-rt] render target ready (%d buffers, %dx%d)",
+	      g_numBuffers, width, height);
 	return true;
 }
 
@@ -592,7 +619,7 @@ vc_attach_depth_renderbuffer(unsigned int rbo)
 	// is 0 the FBO has no depth. We query the attachment (which ANGLE supports)
 	// rather than the renderbuffer's DEPTH_SIZE (which ANGLE rejects with
 	// GL_INVALID_ENUM for packed DEPTH24_STENCIL8).
-	for (int i = 0; i < VC_NUM_BUFFERS; i++) {
+	for (int i = 0; i < g_numBuffers; i++) {
 		p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_buf[i].glFbo);
 		p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, rbo);
 		GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
@@ -620,6 +647,7 @@ vc_attach_depth_renderbuffer(unsigned int rbo)
 static void
 vcrt_log_rate(void)
 {
+	if (!vc_perf_log()) return;   // [vc-pub] is a verbose probe; gated behind VC_PERF_LOG
 	static double   startT = 0.0, lastLog = 0.0;
 	static uint64_t startN = 0, lastN = 0, lastW = 0, lastD = 0, lastR = 0;
 	double now = vc_mach_seconds();
@@ -655,7 +683,29 @@ vcrt_begin_frame(void)
 {
 	if (!g_extActive) return true;   // not set up yet; don't block
 
+	// Frame-rate cap: sleep until the next frame slot so the game thread doesn't
+	// free-run (~145 Hz) and beat against the display. capHz: fixed (>0), off (0),
+	// or auto (-1 = the measured display rate, so we never hardcode 90). This keeps
+	// reVC at 1 frame per display frame without a phase-lock (no deadlock risk).
+	int capHz = (g_frameCapHz > 0) ? g_frameCapHz
+	          : (g_frameCapHz < 0) ? (g_displayHz > 0 ? g_displayHz : 90)
+	          : 0;
+	if (capHz > 0) {
+		static double nextSlot = 0.0;
+		double period = 1.0 / (double)capHz;
+		double now = vc_now_seconds();
+		if (nextSlot == 0.0) nextSlot = now;
+		if (now < nextSlot) { usleep((useconds_t)((nextSlot - now) * 1.0e6)); now = vc_now_seconds(); }
+		nextSlot = (now > nextSlot + period) ? now + period : nextSlot + period;
+	}
+
 	vcrt_log_rate();   // once per frame ATTEMPT (park or proceed), see above
+
+	// Latency probe: how long this call BLOCKS waiting for a FREE back buffer. With
+	// 2 buffers + a compositor that shows each one twice (reVC 45 Hz vs 90 Hz), reVC
+	// stalls here for a whole display frame -- a self-sustaining 45 Hz pacing. High
+	// here == buffer starvation, not render cost. Throttled, stereo only.
+	double vcBeginT0 = vc_now_seconds();
 
 	struct timespec deadline;
 	clock_gettime(CLOCK_REALTIME, &deadline);
@@ -676,7 +726,7 @@ vcrt_begin_frame(void)
 
 	int idx = -1;
 	for (;;) {
-		for (int i = 0; i < VC_NUM_BUFFERS; i++) if (g_buf[i].state == VC_BUF_FREE) { idx = i; break; }
+		for (int i = 0; i < g_numBuffers; i++) if (g_buf[i].state == VC_BUF_FREE) { idx = i; break; }
 		if (idx >= 0) break;
 		if (vc_should_stop()) { pthread_mutex_unlock(&g_bufMutex); return false; }
 		int rc = pthread_cond_timedwait(&g_bufCond, &g_bufMutex, &deadline);
@@ -697,6 +747,15 @@ vcrt_begin_frame(void)
 	g_currentBack = idx;
 	g_haveBack = true;
 	pthread_mutex_unlock(&g_bufMutex);
+	if (vc_perf_log() && vc_render_mode() == 1) {
+		static double lastBeginLog = 0.0;
+		double nowS = vc_now_seconds();
+		if (nowS - lastBeginLog >= 1.0) {
+			lastBeginLog = nowS;
+			VCLOG(@"[vc-begin] wait for FREE buffer = %.2f ms (high = buffer starvation -> 45 Hz pacing)",
+			      (nowS - vcBeginT0) * 1000.0);
+		}
+	}
 	return true;
 }
 
@@ -756,6 +815,11 @@ vcrt_publish_frame(void)
 
 	// The frame's GL work is recorded into g_buf[back]'s FBO. Enqueue the GPU
 	// signal (or flush) BEFORE taking the lock -- EGL/GL work must not hold it.
+	// Latency probe: time the signal/flush. glFlush submits the queued GL commands;
+	// if the GPU is behind (backpressure) this BLOCKS until the driver's command
+	// queue drains -- the "finish" cost that appears only under head-look (dynamic
+	// camera => heavier/steadier GPU work). Throttled, stereo only.
+	double vcPubT0 = vc_now_seconds();
 	uint64_t value = 0;
 	void *sync = NULL;
 	if (!g_noFence) {
@@ -763,6 +827,15 @@ vcrt_publish_frame(void)
 		sync = vcrt_enqueue_signal(value);
 	} else {
 		if (p_glFlush) p_glFlush();
+	}
+	if (vc_perf_log() && vc_render_mode() == 1) {
+		static double lastPubLog = 0.0;
+		double nowS = vc_now_seconds();
+		if (nowS - lastPubLog >= 1.0) {
+			lastPubLog = nowS;
+			VCLOG(@"[vc-publish] signal/flush = %.2f ms (GPU submit; high = GPU backpressure)",
+			      (nowS - vcPubT0) * 1000.0);
+		}
 	}
 
 	pthread_mutex_lock(&g_bufMutex);
@@ -772,6 +845,7 @@ vcrt_publish_frame(void)
 
 	g_buf[back].state = VC_BUF_READY;         // IN_FLIGHT -> READY
 	g_buf[back].waitValue = value;            // 0 under VC_NOFENCE -> compositor won't wait
+	g_buf[back].poseSetTime = vc_last_consumed_pose_time();  // latency probe: pose age of this slice
 	g_readyIndex = back;
 	g_haveBack = false;                        // reservation consumed
 	uint64_t n = ++g_frameCount;
@@ -797,12 +871,48 @@ extern "C" bool
 vc_acquire_ready_frame(vc_ready_frame_t *out)
 {
 	if (!out) return false;
+
+	// Measure the DISPLAY RATE from the acquire-call frequency: the compositor calls
+	// this once per display frame, so its period is the refresh period. Feeds the
+	// auto frame-cap (g_frameCapHz == -1) so we never hardcode 90 (M2 vs M5 differ).
+	{
+		static uint64_t sNum = 0, sDen = 0;
+		if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
+		static uint64_t sLastAcq = 0;
+		uint64_t nowT = mach_absolute_time();
+		if (sLastAcq != 0) {
+			double periodMs = (double)(nowT - sLastAcq) * (double)sNum / (double)sDen / 1.0e6;
+			if (periodMs > 4.0 && periodMs < 40.0) {   // 25-250 Hz sane
+				static double ewma = 0.0;
+				double hz = 1000.0 / periodMs;
+				ewma = (ewma == 0.0) ? hz : ewma * 0.9 + hz * 0.1;
+				g_displayHz = (int)(ewma + 0.5);
+			}
+		}
+		sLastAcq = nowT;
+	}
+
 	pthread_mutex_lock(&g_bufMutex);
 	int idx = g_readyIndex;
-	// Nothing new to hand out: never published, or the latest was already
-	// acquired (and not yet republished). The compositor keeps its last texture.
+	// Nothing new to hand out: never published, or the latest was already acquired
+	// (and not yet republished). The compositor keeps its last texture -- a MISSED
+	// SLOT (the same frame is shown twice). Kept on always (throttled 10 s): first
+	// signal of a future perf regression.
+	static uint64_t sAcqTotal = 0, sAcqMiss = 0;
+	sAcqTotal++;
 	if (idx < 0 || g_buf[idx].state != VC_BUF_READY) {
+		sAcqMiss++;
 		pthread_mutex_unlock(&g_bufMutex);
+		if (vc_render_mode() == 1) {
+			static double lastMissLog = 0.0;
+			double nowS = vc_now_seconds();
+			if (nowS - lastMissLog >= 10.0) {
+				lastMissLog = nowS;
+				VCLOG(@"[vc-miss] missed display slots: %llu / %llu acquires (%.1f%%) -- compositor re-showed a frame",
+				      (unsigned long long)sAcqMiss, (unsigned long long)sAcqTotal,
+				      100.0 * (double)sAcqMiss / (double)(sAcqTotal ? sAcqTotal : 1));
+			}
+		}
 		return false;
 	}
 	// "newest" ONLY: if the OTHER buffer is still sitting in READY (a superseded
@@ -811,7 +921,7 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	// buffer back on a real vc_release_frame -> it paces to the display rate.
 	// Never touch an ACQUIRED buffer -- Metal may still be reading it.
 	if (g_recycleOlderReady)
-		for (int i = 0; i < VC_NUM_BUFFERS; i++)
+		for (int i = 0; i < g_numBuffers; i++)
 			if (i != idx && g_buf[i].state == VC_BUF_READY) {
 				g_buf[i].state = VC_BUF_FREE;
 				g_recycleCount++;
@@ -831,7 +941,24 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	out->eye_count  = stereo ? 2u : 1u;
 	void    *outTex = out->texture;
 	uint64_t outWait = out->wait_value;
+	uint64_t poseSetT = g_buf[idx].poseSetTime;
 	pthread_mutex_unlock(&g_bufMutex);
+
+	// Latency probe: full push -> acquire (~display) age of THIS slice's head pose.
+	// Push->consume is measured on the game side ([vc-pose-age]); this adds the
+	// consume->publish->acquire legs. Large here vs small there => the delay sits in
+	// the render/publish/buffering, not the pose hand-off. Throttled, stereo only.
+	if (vc_perf_log() && stereo && poseSetT != 0) {
+		static uint64_t sNum = 0, sDen = 0;
+		if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
+		static double lastLatLog = 0.0;
+		double nowS = vc_now_seconds();
+		if (nowS - lastLatLog >= 1.0) {
+			lastLatLog = nowS;
+			double ageMs = (double)(mach_absolute_time() - poseSetT) * (double)sNum / (double)sDen / 1.0e6;
+			VCLOG(@"[vc-pose-latency] push -> acquire = %.2f ms (full head-pose latency to display)", ageMs);
+		}
+	}
 
 	// Throttled handoff proof: which index / texture / wait the compositor is
 	// handed. Compare against [vc-stereo] PUBLISH -- idx and tex MUST match, and
@@ -851,7 +978,7 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 extern "C" void
 vc_release_frame(uint32_t index)
 {
-	if (index >= VC_NUM_BUFFERS) return;
+	if (index >= g_numBuffers) return;
 	pthread_mutex_lock(&g_bufMutex);
 	// Only an ACQUIRED buffer returns to the pool; ignore stray/duplicate
 	// releases so we can't accidentally free a buffer the game is rendering into.
@@ -1064,7 +1191,7 @@ static bool           g_stereoFailed   = false;
 extern "C" bool  vc_stereo_ready(void) { return g_stereoReady; }
 extern "C" void *vc_stereo_array_texture(int idx)
 {
-	if (!g_stereoReady || idx < 0 || idx >= VC_NUM_BUFFERS) return NULL;
+	if (!g_stereoReady || idx < 0 || idx >= g_numBuffers) return NULL;
 	return VC_OBJ_TO_VOID(g_stereoBuf[idx].arrayTex);
 }
 
@@ -1099,7 +1226,7 @@ vcrt_stereo_ensure(void)
 	glBindRenderbuffer_(VC_GL_RENDERBUFFER, g_stereoDepthRbo);
 	glRenderbufferStorage_(VC_GL_RENDERBUFFER, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
 
-	for (int i = 0; i < VC_NUM_BUFFERS; i++) {
+	for (int i = 0; i < g_numBuffers; i++) {
 		VCStereoBuffer *b = &g_stereoBuf[i];
 
 		// Verified params (same as the cinema buffers / slice test) + array type.
@@ -1137,8 +1264,8 @@ vcrt_stereo_ensure(void)
 	}
 	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, 0);
 	g_stereoReady = true;
-	VCLOG(@"[vc-stereo] double-buffered array render target ready (%d buffers x 2 slices, %dx%d, dedicated depth)",
-	      VC_NUM_BUFFERS, W, H);
+	VCLOG(@"[vc-stereo] array render target ready (%d buffers x 2 slices, %dx%d, dedicated depth)",
+	      g_numBuffers, W, H);
 	return true;
 }
 
@@ -1211,7 +1338,7 @@ vc_stereo_readback_log(void)
 extern "C" void
 vcrt_stereo_publish_probe(int idx)
 {
-	if (!g_stereoReady || idx < 0 || idx >= VC_NUM_BUFFERS) return;
+	if (!g_stereoReady || idx < 0 || idx >= g_numBuffers) return;
 	static double lastProbe = 0.0;
 	double now = vc_now_seconds();
 	if (now - lastProbe < 1.0) return;

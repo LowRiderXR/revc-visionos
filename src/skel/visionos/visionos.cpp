@@ -122,11 +122,17 @@ static pthread_mutex_t g_mtxMutex = PTHREAD_MUTEX_INITIALIZER;
 static float g_ovView[16];
 static float g_ovProj[16];
 static int   g_ovActive = 0;
+// Diagnostic: host time (mach_absolute_time) when the head pose was last PUSHED
+// (Swift render thread, predicted for this frame's presentationTime). The game
+// thread reads it in vc_get_view_matrix to measure how OLD the pose is when reVC
+// actually renders with it -- the decoupling latency behind the head-turn "aura".
+static uint64_t g_ovSetTime = 0;
 
 extern "C" void vc_set_view_matrix(const float m[16])
 {
 	if (!m) return;
-	pthread_mutex_lock(&g_mtxMutex); memcpy(g_ovView, m, 16 * sizeof(float)); pthread_mutex_unlock(&g_mtxMutex);
+	uint64_t now = mach_absolute_time();
+	pthread_mutex_lock(&g_mtxMutex); memcpy(g_ovView, m, 16 * sizeof(float)); g_ovSetTime = now; pthread_mutex_unlock(&g_mtxMutex);
 }
 extern "C" void vc_set_projection_matrix(const float m[16])
 {
@@ -142,13 +148,86 @@ extern "C" int vc_matrix_override_active(void)
 {
 	pthread_mutex_lock(&g_mtxMutex); int a = g_ovActive; pthread_mutex_unlock(&g_mtxMutex); return a;
 }
+// Push time of the head pose reVC LAST consumed (game-thread only: set here, read
+// in vcrt_publish_frame). Lets the publish tag the buffer so vc_acquire_ready_frame
+// can report the full push -> acquire (~display) latency of that slice.
+static uint64_t g_lastConsumedPoseSetTime = 0;
+extern "C" uint64_t vc_last_consumed_pose_time(void) { return g_lastConsumedPoseSetTime; }
+extern "C" int vc_perf_log(void);   // defined below; gates verbose perf logs
+
 extern "C" void vc_get_view_matrix(float m[16])
 {
-	pthread_mutex_lock(&g_mtxMutex); memcpy(m, g_ovView, 16 * sizeof(float)); pthread_mutex_unlock(&g_mtxMutex);
+	uint64_t now = mach_absolute_time();
+	pthread_mutex_lock(&g_mtxMutex);
+	memcpy(m, g_ovView, 16 * sizeof(float));
+	uint64_t setT = g_ovSetTime;
+	pthread_mutex_unlock(&g_mtxMutex);
+	g_lastConsumedPoseSetTime = setT;
+	if (!vc_perf_log()) return;
+	// VC_PERF_LOG: age of the pose reVC is rendering with (push -> consume leg) and
+	// the reVC consume interval (game-thread frame time) + jitter.
+	static uint64_t sNum = 0, sDen = 0;
+	if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
+	static uint64_t sLastConsume = 0;
+	double intervalMs = (sLastConsume != 0) ? (double)(now - sLastConsume) * (double)sNum / (double)sDen / 1.0e6 : 0.0;
+	sLastConsume = now;
+	static int sCtr = 0;
+	if (setT != 0 && (sCtr++ % 90) == 0) {
+		double ageMs = (double)(now - setT) * (double)sNum / (double)sDen / 1.0e6;
+		printf("[vc-pose-age] pose %.2f ms old (push->consume); reVC consume interval %.2f ms (%.1f Hz)\n",
+		       ageMs, intervalMs, intervalMs > 0 ? 1000.0 / intervalMs : 0.0);
+	}
 }
 extern "C" void vc_get_projection_matrix(float m[16])
 {
 	pthread_mutex_lock(&g_mtxMutex); memcpy(m, g_ovProj, 16 * sizeof(float)); pthread_mutex_unlock(&g_mtxMutex);
+}
+
+// Frame-phase timing probe (game thread). main.cpp calls vc_frame_mark(id) at the
+// phase boundaries; at the final mark we log the per-segment ms (throttled 1/s) so
+// we can see where reVC's ~22 ms/frame actually goes. IDs:
+//   0 start  6 ConstructRenderList done  7 PreRender done  1 setup done (StartOfFrame)
+//   2 eyes done (both eye passes)  3 readback done  4 post-3d done  5 frame done
+// Verbose perf logging (env VC_PERF_LOG). The [vc-frame]/[vc-miss] summaries stay
+// on always (throttled 10 s -- first line of defence for a future perf problem);
+// the finer probes ([vc-pose-age], [vc-pose-latency], [vc-begin], [vc-publish])
+// are gated behind this so normal runs are quiet.
+extern "C" int vc_perf_log(void)
+{
+	static int v = -1;
+	if (v < 0) v = getenv("VC_PERF_LOG") ? 1 : 0;
+	return v;
+}
+
+extern "C" void vc_frame_mark(int id)
+{
+	if (id < 0 || id >= 8) return;
+	static uint64_t t[8] = {0};
+	t[id] = mach_absolute_time();
+	if (id != 5) return;
+	if (vc_render_mode() != 1) return;   // stereo only (cinema doesn't set marks 2/3)
+	static uint64_t sNum = 0, sDen = 0;
+	if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
+	#define VC_SEG_MS(a,b) ((double)(t[b] - t[a]) * (double)sNum / (double)sDen / 1.0e6)
+	double total = VC_SEG_MS(0,5);
+	// Worst frame this interval + which phase dominated it: a single 40 ms hitch is
+	// invisible in an average but very noticeable, so keep the peak, not just the mean.
+	double segMs[5]      = { VC_SEG_MS(0,1), VC_SEG_MS(1,2), VC_SEG_MS(2,3), VC_SEG_MS(3,4), VC_SEG_MS(4,5) };
+	const char *segNm[5] = { "setup", "eyes", "readback", "post-3d", "finish" };
+	static double maxTotal = 0.0, maxSeg = 0.0;
+	static const char *maxPhase = "-";
+	if (total > maxTotal) {
+		maxTotal = total; maxSeg = 0.0; maxPhase = "-";
+		for (int i = 0; i < 5; i++) if (segMs[i] > maxSeg) { maxSeg = segMs[i]; maxPhase = segNm[i]; }
+	}
+	static double lastLog = 0.0;
+	double nowS = (double)t[5] * (double)sNum / (double)sDen / 1.0e9;
+	if (nowS - lastLog < 10.0) { (void)total; return; }
+	lastLog = nowS;
+	printf("[vc-frame] last: cnstrList=%.1f prerender=%.1f startframe=%.1f eyes=%.1f post-3d=%.1f finish=%.1f total=%.1f | PEAK total=%.1f ms (%s=%.1f)\n",
+	       VC_SEG_MS(0,6), VC_SEG_MS(6,7), VC_SEG_MS(7,1), VC_SEG_MS(1,2), VC_SEG_MS(3,4), VC_SEG_MS(4,5), total, maxTotal, maxPhase, maxSeg);
+	maxTotal = 0.0; maxSeg = 0.0; maxPhase = "-";
+	#undef VC_SEG_MS
 }
 
 // View compose flag: when set, gl3device left-multiplies the override view onto

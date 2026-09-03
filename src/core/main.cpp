@@ -1360,6 +1360,7 @@ extern "C" int  vc_render_mode(void);          // 1 = VC_MODE_STEREO
 extern "C" void vc_stereo_eye_pass(int eye);   // gl3device: bind slice FBO + per-eye matrices
 extern "C" void vc_stereo_restore_main(void);  // gl3device: rebind cinema FBO + mono matrices
 extern "C" void vc_stereo_readback_log(void);  // visionos_angle: one-time slice read-back proof
+extern "C" void vc_frame_mark(int id);         // visionos: per-frame phase timing probe
 #endif
 
 void
@@ -1604,12 +1605,21 @@ Idle(void *arg)
 			CRenderer::ClearForFrame();
 		}
 #endif
+#ifdef LIBRW_VISIONOS
+		vc_frame_mark(0);   // frame start (construct render list + prerender/RTT)
+#endif
 		CRenderer::ConstructRenderList();
 		tbEndTimer("CnstrRenderList");
+#ifdef LIBRW_VISIONOS
+		vc_frame_mark(6);   // ConstructRenderList done (camera-driven culling/render list)
+#endif
 
 		tbStartTimer(0, "PreRender");
 		CRenderer::PreRender();
 		tbEndTimer("PreRender");
+#ifdef LIBRW_VISIONOS
+		vc_frame_mark(7);   // PreRender done (model pre-load, camera-driven)
+#endif
 
 #ifdef FIX_BUGS
 		RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void *)FALSE); // TODO: temp? this fixes OpenGL render but there should be a better place for this
@@ -1635,6 +1645,9 @@ Idle(void *arg)
 		RwCameraSetFogDistance(Scene.camera, CTimeCycle::GetFogStart());
 #endif
 
+#ifdef LIBRW_VISIONOS
+		vc_frame_mark(1);   // setup done (RTT/prerender/StartOfFrame), before the scene
+#endif
 		tbStartTimer(0, "RenderScene");
 #ifdef LIBRW_VISIONOS
 		// In stereo, the two eye passes below ARE the scene render (into the array
@@ -1695,8 +1708,10 @@ Idle(void *arg)
 				vc_stereo_eye_pass(eye);
 				RenderScene();
 			}
+			vc_frame_mark(2);   // eyes done (both eye passes = 2x RenderScene)
 			vc_stereo_restore_main();
 			vc_stereo_readback_log();
+			vc_frame_mark(3);   // readback done (restore + one-time read-back/glFinish)
 		}
 #endif
 
@@ -1724,6 +1739,9 @@ Idle(void *arg)
 		tbStartTimer(0, "Render2dStuff");
 		Render2dStuff();
 		tbEndTimer("Render2dStuff");
+#ifdef LIBRW_VISIONOS
+		vc_frame_mark(4);   // post-3d done (RenderDebugShit + RenderEffects + Render2dStuff)
+#endif
 	}else{
 		CDraw::CalculateAspectRatio();
 #ifdef ASPECT_RATIO_SCALE
@@ -1762,6 +1780,9 @@ Idle(void *arg)
 		tbDisplay();
 
 	DoRWStuffEndOfFrame();
+#ifdef LIBRW_VISIONOS
+	vc_frame_mark(5);   // frame done (menus + fade + end-of-frame/publish)
+#endif
 
 	POP_MEMID();	// MEMID_RENDER
 
