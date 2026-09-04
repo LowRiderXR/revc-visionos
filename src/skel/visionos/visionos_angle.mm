@@ -421,10 +421,6 @@ extern "C" void *vc_stereo_array_texture(int idx);
 // published stereo buffer and logs the centre pixel, to tell "producer black"
 // (eye passes wrote nothing) from "handoff black" (slices fine, display broke).
 extern "C" void  vcrt_stereo_publish_probe(int idx);
-// Throttled (1/s) read-back of the HUD (cinema 2D) overlay buffer: logs RGBA at the
-// centre + radar corner, to tell whether the transparent clear held (centre alpha 0)
-// or the buffer is opaque (centre alpha != 0 -> HUD quad blacks out the world).
-extern "C" void  vcrt_hud_publish_probe(int idx);
 
 static const char *
 vcrt_fbo_status_name(GLenumVC s)
@@ -867,10 +863,8 @@ vcrt_publish_frame(void)
 	// Stereo diagnostic: read back the buffer we just published (throttled) so we
 	// see whether the eye passes actually wrote content into what the compositor
 	// will acquire.
-	if (vc_render_mode() == 1 && vc_stereo_ready()) {
+	if (vc_render_mode() == 1 && vc_stereo_ready())
 		vcrt_stereo_publish_probe(back);
-		vcrt_hud_publish_probe(back);
-	}
 }
 
 // --- C seam consumed by the compositor (next step) -------------------------
@@ -1382,128 +1376,6 @@ vcrt_stereo_publish_probe(int idx)
 	VCLOG(@"[vc-stereo] PUBLISH buf=%d tex=%p wait=%llu eye0 RGBA=%d,%d,%d,%d  eye1 RGBA=%d,%d,%d,%d (throttled 1/s)",
 	      idx, VC_OBJ_TO_VOID(arr), (unsigned long long)g_buf[idx].waitValue,
 	      px[0][0],px[0][1],px[0][2],px[0][3], px[1][0],px[1][1],px[1][2],px[1][3]);
-}
-
-// Throttled (1/s) read-back of the HUD (cinema 2D) buffer -- the transparent
-// overlay we publish as hud_texture. Logs RGBA at the CENTRE (usually empty ->
-// should be 0,0,0,0) and the BOTTOM-LEFT radar area (usually drawn). The key
-// column is ALPHA: if the centre alpha is NON-zero, the "transparent" clear did
-// not take (the HUD quad then blacks out the world under premultiplied blend).
-extern "C" void
-vcrt_hud_publish_probe(int idx)
-{
-	if (idx < 0 || idx >= g_numBuffers) return;
-	static double lastProbe = 0.0;
-	double now = vc_now_seconds();
-	if (now - lastProbe < 1.0) return;
-	lastProbe = now;
-
-	id<MTLTexture> tex = g_buf[idx].mtlTexture;
-	if (tex == nil || g_mtlDevice == nil) return;
-	if (p_glFinish) p_glFinish();
-	if (g_cmdQueue == nil) g_cmdQueue = [g_mtlDevice newCommandQueue];
-
-	MTLTextureDescriptor *sd =
-		[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-		                                                   width:g_rtWidth height:g_rtHeight mipmapped:NO];
-	sd.usage = MTLTextureUsageShaderRead;
-	sd.storageMode = MTLStorageModeShared;
-	id<MTLTexture> staging = [g_mtlDevice newTextureWithDescriptor:sd];
-	id<MTLCommandBuffer> cb = [g_cmdQueue commandBuffer];
-	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-	[blit copyFromTexture:tex sourceSlice:0 sourceLevel:0
-	         sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(g_rtWidth, g_rtHeight, 1)
-	            toTexture:staging destinationSlice:0 destinationLevel:0
-	    destinationOrigin:MTLOriginMake(0,0,0)];
-	[blit endEncoding]; [cb commit]; [cb waitUntilCompleted];
-
-	// Centre (likely empty) and bottom-left quarter (radar). Note: GL bottom-left
-	// origin, so "bottom" in game space is row ~H*3/4 in the Metal texture, but any
-	// non-centre point is enough to see whether ANYTHING was drawn.
-	uint8_t c[4] = {0,0,0,0}, bl[4] = {0,0,0,0};
-	[staging getBytes:c  bytesPerRow:4 fromRegion:MTLRegionMake2D(g_rtWidth/2, g_rtHeight/2, 1, 1) mipmapLevel:0];
-	[staging getBytes:bl bytesPerRow:4 fromRegion:MTLRegionMake2D(g_rtWidth/6, g_rtHeight*5/6, 1, 1) mipmapLevel:0];
-	VCLOG(@"[vc-hud] PUBLISH buf=%d centre RGBA=%d,%d,%d,%d  bottomL RGBA=%d,%d,%d,%d (alpha!=0 at centre => transparent clear failed)",
-	      idx, c[0],c[1],c[2],c[3], bl[0],bl[1],bl[2],bl[3]);
-}
-
-// Throttled (1/s) read-back of the CURRENT back buffer, called from
-// vc_stereo_restore_main IMMEDIATELY AFTER the transparent clear and BEFORE any 2D
-// drawing. If the centre reads 0,0,0,0 here, the clear is fine and something drawn
-// afterwards fills it opaque; if it already reads 0,0,0,255 (or non-zero), the clear
-// itself is not producing transparency.
-extern "C" void
-vcrt_hud_clear_probe(void)
-{
-	if (!g_stereoReady) return;   // stereo only; g_currentBack valid
-	int idx = g_currentBack;
-	if (idx < 0 || idx >= g_numBuffers) return;
-	static double lastProbe = 0.0;
-	double now = vc_now_seconds();
-	if (now - lastProbe < 1.0) return;
-	lastProbe = now;
-
-	id<MTLTexture> tex = g_buf[idx].mtlTexture;
-	if (tex == nil || g_mtlDevice == nil) return;
-	if (p_glFinish) p_glFinish();
-	if (g_cmdQueue == nil) g_cmdQueue = [g_mtlDevice newCommandQueue];
-
-	MTLTextureDescriptor *sd =
-		[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-		                                                   width:g_rtWidth height:g_rtHeight mipmapped:NO];
-	sd.usage = MTLTextureUsageShaderRead;
-	sd.storageMode = MTLStorageModeShared;
-	id<MTLTexture> staging = [g_mtlDevice newTextureWithDescriptor:sd];
-	id<MTLCommandBuffer> cb = [g_cmdQueue commandBuffer];
-	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-	[blit copyFromTexture:tex sourceSlice:0 sourceLevel:0
-	         sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(g_rtWidth, g_rtHeight, 1)
-	            toTexture:staging destinationSlice:0 destinationLevel:0
-	    destinationOrigin:MTLOriginMake(0,0,0)];
-	[blit endEncoding]; [cb commit]; [cb waitUntilCompleted];
-	uint8_t c[4] = {0,0,0,0};
-	[staging getBytes:c bytesPerRow:4 fromRegion:MTLRegionMake2D(g_rtWidth/2, g_rtHeight/2, 1, 1) mipmapLevel:0];
-	VCLOG(@"[vc-hud] AFTER-CLEAR buf=%d centre RGBA=%d,%d,%d,%d (0,0,0,0 => clear ok; else clear itself is the culprit)",
-	      idx, c[0],c[1],c[2],c[3]);
-}
-
-// Throttled (1/s per stage) read-back of the current back buffer's centre, called
-// from main.cpp between the post-restore render stages so we can localise WHICH pass
-// pushes the HUD buffer alpha to 255. stage 1 = after RenderMotionBlur, 2 = after
-// Render2dStuff.
-extern "C" void
-vcrt_hud_probe_stage(int stage)
-{
-	if (!g_stereoReady) return;
-	int idx = g_currentBack;
-	if (idx < 0 || idx >= g_numBuffers || stage < 0 || stage >= 6) return;
-	static double lastPerStage[6] = {0,0,0,0,0,0};
-	double now = vc_now_seconds();
-	if (now - lastPerStage[stage] < 1.0) return;
-	lastPerStage[stage] = now;
-
-	id<MTLTexture> tex = g_buf[idx].mtlTexture;
-	if (tex == nil || g_mtlDevice == nil) return;
-	if (p_glFinish) p_glFinish();
-	if (g_cmdQueue == nil) g_cmdQueue = [g_mtlDevice newCommandQueue];
-
-	MTLTextureDescriptor *sd =
-		[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-		                                                   width:g_rtWidth height:g_rtHeight mipmapped:NO];
-	sd.usage = MTLTextureUsageShaderRead;
-	sd.storageMode = MTLStorageModeShared;
-	id<MTLTexture> staging = [g_mtlDevice newTextureWithDescriptor:sd];
-	id<MTLCommandBuffer> cb = [g_cmdQueue commandBuffer];
-	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-	[blit copyFromTexture:tex sourceSlice:0 sourceLevel:0
-	         sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(g_rtWidth, g_rtHeight, 1)
-	            toTexture:staging destinationSlice:0 destinationLevel:0
-	    destinationOrigin:MTLOriginMake(0,0,0)];
-	[blit endEncoding]; [cb commit]; [cb waitUntilCompleted];
-	uint8_t c[4] = {0,0,0,0};
-	[staging getBytes:c bytesPerRow:4 fromRegion:MTLRegionMake2D(g_rtWidth/2, g_rtHeight/2, 1, 1) mipmapLevel:0];
-	const char *name = (stage == 1) ? "after-motionblur" : (stage == 2) ? "after-render2dstuff" : "stage";
-	VCLOG(@"[vc-hud] %s buf=%d centre RGBA=%d,%d,%d,%d", name, idx, c[0],c[1],c[2],c[3]);
 }
 
 #endif // LIBRW_VISIONOS

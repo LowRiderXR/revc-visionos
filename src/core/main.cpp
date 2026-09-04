@@ -343,6 +343,15 @@ DoFade(void)
 	}
 }
 
+#ifdef LIBRW_VISIONOS
+// Stereo menu layer: 1 while the in-game pause menu is up. The whole in-game render
+// block (world eye passes + HUD) is skipped when this is set (see Render(), the
+// `!m_bMenuActive` guard), so HUD and menu never share a frame -- the Swift side can
+// switch the single overlay quad between head-locked (HUD) and world-anchored (menu)
+// on this flag alone.
+extern "C" int vc_menu_active(void) { return FrontEndMenuManager.m_bMenuActive ? 1 : 0; }
+#endif
+
 bool
 RwGrabScreen(RwCamera *camera, RwChar *filename)
 {
@@ -1378,7 +1387,6 @@ extern "C" void vc_frame_mark(int id);         // visionos: per-frame phase timi
 extern "C" void vc_frame_fx_begin(void);       // visionos: time RenderEffects (2x) as the [vc-frame] fx segment
 extern "C" void vc_frame_fx_end(void);
 extern "C" void vc_fade_set_draw_only(int on);  // visionos: gate DoFade state mutation (per-eye fade)
-extern "C" void vcrt_hud_probe_stage(int stage); // visionos_angle: HUD-buffer alpha probe between stages
 #endif
 
 void
@@ -1778,15 +1786,11 @@ Idle(void *arg)
 #endif
 		TheCamera.RenderMotionBlur();
 		tbEndTimer("RenderMotionBlur");
-#ifdef LIBRW_VISIONOS
-		if (vc_render_mode() == 1) vcrt_hud_probe_stage(1);   // after motion blur (now skipped)
-#endif
 
 		tbStartTimer(0, "Render2dStuff");
 		Render2dStuff();
 		tbEndTimer("Render2dStuff");
 #ifdef LIBRW_VISIONOS
-		if (vc_render_mode() == 1) vcrt_hud_probe_stage(2);   // after Render2dStuff
 		vc_frame_mark(4);   // post-3d done (RenderDebugShit + RenderEffects + Render2dStuff)
 #endif
 	}else{
