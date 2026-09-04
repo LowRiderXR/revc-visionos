@@ -247,11 +247,22 @@ DoRWRenderHorizon(void)
 	CClouds::RenderHorizon();
 }
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_fade_draw_only(void);   // visionos: per-eye stereo fade gate (see DoFade)
+#endif
+
 void
 DoFade(void)
 {
 	if(CTimer::GetIsPaused())
 		return;
+
+#ifdef LIBRW_VISIONOS
+	// Stereo draws the fade into BOTH eye slices, so DoFade is called once per eye.
+	// Run the state-mutating fade/music transition only on the first (non-draw-only)
+	// call; the second call just re-draws the same rect into the other slice.
+	if(!vc_fade_draw_only()){
+#endif
 
 #ifdef PS2_MENU
 	if(TheMemoryCard.JustLoadedDontFadeInYet){
@@ -283,6 +294,9 @@ DoFade(void)
 			TheCamera.ProcessFade();
 		}
 	}
+#ifdef LIBRW_VISIONOS
+	}   // end !vc_fade_draw_only() state block
+#endif
 
 	if(CDraw::FadeValue != 0 || FrontEndMenuManager.m_PrefsBrightness < 256){
 		CSprite2d *splash = LoadSplash(nil);
@@ -1361,6 +1375,10 @@ extern "C" void vc_stereo_eye_pass(int eye);   // gl3device: bind slice FBO + pe
 extern "C" void vc_stereo_restore_main(void);  // gl3device: rebind cinema FBO + mono matrices
 extern "C" void vc_stereo_readback_log(void);  // visionos_angle: one-time slice read-back proof
 extern "C" void vc_frame_mark(int id);         // visionos: per-frame phase timing probe
+extern "C" void vc_frame_fx_begin(void);       // visionos: time RenderEffects (2x) as the [vc-frame] fx segment
+extern "C" void vc_frame_fx_end(void);
+extern "C" void vc_fade_set_draw_only(int on);  // visionos: gate DoFade state mutation (per-eye fade)
+extern "C" void vcrt_hud_probe_stage(int stage); // visionos_angle: HUD-buffer alpha probe between stages
 #endif
 
 void
@@ -1707,8 +1725,20 @@ Idle(void *arg)
 			for (int eye = 0; eye < 2; eye++) {
 				vc_stereo_eye_pass(eye);
 				RenderScene();
+				// World-referenced effects (particles, coronas, glass, weapon fx,
+				// shadows...) belong IN the slices, per eye, with parallax -- not in
+				// the cinema buffer (which stereo never shows). Timed as the fx segment.
+				vc_frame_fx_begin();
+				RenderEffects();
+				vc_frame_fx_end();
+				// Fade dims the WORLD, so it goes into each eye slice (not the
+				// head-locked HUD buffer). eye 0 runs the full DoFade (state + draw);
+				// eye 1 is draw-only so the state transition mutates exactly once.
+				vc_fade_set_draw_only(eye == 1);
+				DoFade();
 			}
-			vc_frame_mark(2);   // eyes done (both eye passes = 2x RenderScene)
+			vc_fade_set_draw_only(0);
+			vc_frame_mark(2);   // eyes done (2x RenderScene + 2x RenderEffects + 2x DoFade)
 			vc_stereo_restore_main();
 			vc_stereo_readback_log();
 			vc_frame_mark(3);   // readback done (restore + one-time read-back/glFinish)
@@ -1720,6 +1750,11 @@ Idle(void *arg)
 #endif
 
 		RenderDebugShit();
+#ifdef LIBRW_VISIONOS
+		// Stereo already ran RenderEffects per eye into the slices above; running it
+		// again here would draw it a third time into the (unshown) cinema buffer.
+		if (vc_render_mode() != 1)
+#endif
 		RenderEffects();
 
 		if((TheCamera.m_BlurType == MOTION_BLUR_NONE || TheCamera.m_BlurType == MOTION_BLUR_LIGHT_SCENE) &&
@@ -1733,13 +1768,25 @@ Idle(void *arg)
 #endif
 
 		tbStartTimer(0, "RenderMotionBlur");
+#ifdef LIBRW_VISIONOS
+		// Motion blur (CMBlur::OverlayRender) draws a FULLSCREEN additive quad using
+		// the previous frame (opaque) as a texture -> it fills the HUD buffer's alpha
+		// to 255 (measured: [vc-hud] after-motionblur = 0,0,0,255). It is a WORLD post-
+		// effect, not a head-locked HUD element, so skip it in stereo (like the later
+		// RenderEffects/DoFade). Reinstating it belongs with the eye-slice passes later.
+		if (vc_render_mode() != 1)
+#endif
 		TheCamera.RenderMotionBlur();
 		tbEndTimer("RenderMotionBlur");
+#ifdef LIBRW_VISIONOS
+		if (vc_render_mode() == 1) vcrt_hud_probe_stage(1);   // after motion blur (now skipped)
+#endif
 
 		tbStartTimer(0, "Render2dStuff");
 		Render2dStuff();
 		tbEndTimer("Render2dStuff");
 #ifdef LIBRW_VISIONOS
+		if (vc_render_mode() == 1) vcrt_hud_probe_stage(2);   // after Render2dStuff
 		vc_frame_mark(4);   // post-3d done (RenderDebugShit + RenderEffects + Render2dStuff)
 #endif
 	}else{
@@ -1765,6 +1812,11 @@ Idle(void *arg)
 #endif
 
 	tbStartTimer(0, "DoFade");
+#ifdef LIBRW_VISIONOS
+	// Stereo already drew the fade into both eye slices (in the eye loop); running it
+	// again here would dim the head-locked HUD buffer, which is not what we want.
+	if (vc_render_mode() != 1)
+#endif
 	DoFade();
 	tbEndTimer("DoFade");
 

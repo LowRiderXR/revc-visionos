@@ -2562,6 +2562,10 @@ CCamera::ProcessWideScreenOn(void)
 	}
 }
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_render_mode(void);   // 1 = stereo: no screen edge to crop -> skip letterbox bars
+#endif
+
 void
 CCamera::DrawBordersForWideScreen(void)
 {
@@ -2577,6 +2581,13 @@ CCamera::DrawBordersForWideScreen(void)
 
 	if(m_BlurType == MOTION_BLUR_NONE || m_BlurType == MOTION_BLUR_LIGHT_SCENE)
 		SetMotionBlurAlpha(80);
+
+#ifdef LIBRW_VISIONOS
+	// Stereo: the cinematic letterbox is meaningless (no framed screen to crop) and
+	// would sit as two opaque black bars over the world in the HUD layer. Skip them.
+	if (vc_render_mode() == 1)
+		return;
+#endif
 
 	// top border
 	CSprite2d::DrawRect(CRect(0.0f, 0.0f, SCREEN_WIDTH, top), CRGBA(0, 0, 0, 255));

@@ -199,11 +199,32 @@ extern "C" int vc_perf_log(void)
 	return v;
 }
 
+// Accumulate the time spent in RenderEffects across the two eye passes (the cost of
+// pulling the world effects into the slices), reported as the [vc-frame] "fx" segment
+// -- so we can decide whether 2x RenderEffects fits the budget before committing.
+static uint64_t g_fxStart = 0, g_fxAccum = 0;
+extern "C" void vc_frame_fx_begin(void) { g_fxStart = mach_absolute_time(); }
+extern "C" void vc_frame_fx_end(void)
+{
+	if (g_fxStart) { g_fxAccum += mach_absolute_time() - g_fxStart; g_fxStart = 0; }
+}
+
+// Stereo fade-into-slices guard. DoFade() both MUTATES fade/music state (the
+// StillToFadeOut transition) and DRAWS the fullscreen dim rect. In stereo the dim
+// belongs IN each eye slice (it dims the world, not the head-locked HUD), so DoFade
+// is called once per eye. To keep the state mutation happening exactly once per
+// frame, eye 0 runs the full DoFade and eye 1 runs "draw-only": DoFade skips its
+// mutation block when this flag is set. Cinema/macOS never set it (flag stays 0).
+static int g_fadeDrawOnly = 0;
+extern "C" void vc_fade_set_draw_only(int on) { g_fadeDrawOnly = on ? 1 : 0; }
+extern "C" int  vc_fade_draw_only(void)       { return g_fadeDrawOnly; }
+
 extern "C" void vc_frame_mark(int id)
 {
 	if (id < 0 || id >= 8) return;
 	static uint64_t t[8] = {0};
 	t[id] = mach_absolute_time();
+	if (id == 0) g_fxAccum = 0;   // reset per frame; fx accrues across the two eye passes
 	if (id != 5) return;
 	if (vc_render_mode() != 1) return;   // stereo only (cinema doesn't set marks 2/3)
 	static uint64_t sNum = 0, sDen = 0;
@@ -224,8 +245,9 @@ extern "C" void vc_frame_mark(int id)
 	double nowS = (double)t[5] * (double)sNum / (double)sDen / 1.0e9;
 	if (nowS - lastLog < 10.0) { (void)total; return; }
 	lastLog = nowS;
-	printf("[vc-frame] last: cnstrList=%.1f prerender=%.1f startframe=%.1f eyes=%.1f post-3d=%.1f finish=%.1f total=%.1f | PEAK total=%.1f ms (%s=%.1f)\n",
-	       VC_SEG_MS(0,6), VC_SEG_MS(6,7), VC_SEG_MS(7,1), VC_SEG_MS(1,2), VC_SEG_MS(3,4), VC_SEG_MS(4,5), total, maxTotal, maxPhase, maxSeg);
+	double fxMs = (double)g_fxAccum * (double)sNum / (double)sDen / 1.0e6;   // 2x RenderEffects
+	printf("[vc-frame] last: cnstrList=%.1f prerender=%.1f startframe=%.1f eyes=%.1f (fx=%.1f) post-3d=%.1f finish=%.1f total=%.1f | PEAK total=%.1f ms (%s=%.1f)\n",
+	       VC_SEG_MS(0,6), VC_SEG_MS(6,7), VC_SEG_MS(7,1), VC_SEG_MS(1,2), fxMs, VC_SEG_MS(3,4), VC_SEG_MS(4,5), total, maxTotal, maxPhase, maxSeg);
 	maxTotal = 0.0; maxSeg = 0.0; maxPhase = "-";
 	#undef VC_SEG_MS
 }
