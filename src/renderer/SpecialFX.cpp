@@ -26,6 +26,10 @@
 #include "Script.h"
 #include "DMAudio.h"
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_in_stereo_eye(void);   // 0 = mono/outside loop, 1 = eye 0, 2 = eye 1
+#endif
+
 RwIm3DVertex StreakVertices[4];
 RwImVertexIndex StreakIndexList[12];
 
@@ -790,6 +794,12 @@ C3dMarkers::Render()
 				}
 			}
 			NumActiveMarkers++;
+#ifdef LIBRW_VISIONOS
+			// Stereo: markers are placed once per frame (Radar/Script). Consuming
+			// (m_bIsUsed=false) on eye 0 hides them on eye 1. Preserve on eye 0; consume on
+			// last eye (2) + mono (0). See Shadows.cpp guard.
+			if(vc_in_stereo_eye() != 1)
+#endif
 			m_aMarkerArray[i].m_bIsUsed = false;
 		} else if (m_aMarkerArray[i].m_pAtomic != nil) {
 			m_aMarkerArray[i].DeleteMarkerObject();
@@ -1179,6 +1189,11 @@ CBrightLights::Render(void)
 
 	RenderOutGeometryBuffer();
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
+#ifdef LIBRW_VISIONOS
+	// Stereo: filled once per frame (CAutomobile/CBike::PreRender). Preserve on eye 0 so
+	// eye 1 still has the lights; reset on last eye (2) + mono (0). See Shadows.cpp guard.
+	if(vc_in_stereo_eye() != 1)
+#endif
 	NumBrightLights = 0;
 }
 
@@ -1316,6 +1331,10 @@ CShinyTexts::Render(void)
 	}
 
 	RenderOutGeometryBuffer();
+#ifdef LIBRW_VISIONOS
+	// Stereo: filled once per frame. Preserve on eye 0; reset on last eye (2) + mono (0).
+	if(vc_in_stereo_eye() != 1)
+#endif
 	NumShinyTexts = 0;
 
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);

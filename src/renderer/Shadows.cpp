@@ -27,6 +27,10 @@
 #include "Clock.h"
 #include "VarConsole.h"
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_in_stereo_eye(void);   // 0 = mono/outside loop, 1 = eye 0, 2 = eye 1
+#endif
+
 #ifdef DEBUGMENU
 //SETTWEAKPATH("Shadows");
 //TWEAKBOOL(gbPrintShite);
@@ -1237,6 +1241,15 @@ CShadows::RenderStoredShadows(void)
 	RwRenderStateSet(rwRENDERSTATEZTESTENABLE,       (void *)TRUE);
 	RwRenderStateSet(rwRENDERSTATETEXTUREADDRESS,    (void *)rwTEXTUREADDRESSWRAP);
 
+#ifdef LIBRW_VISIONOS
+	// Stereo: RenderEffects runs once per eye into each slice, but the shadow store is
+	// filled ONCE per frame (StoreShadowForPed etc. in game logic/PreRender). Clearing it
+	// on eye 0 starves eye 1 -> shadows show on ONE eye only (seen in cutscenes). Preserve
+	// on eye 0 (tag 1); clear on the last eye (2) + mono (0). The per-entry bRendered flags
+	// are reset at the top of this function each call, so eye 1 re-renders cleanly. Same
+	// preserve-on-first-eye pattern as the DoFade draw-only guard.
+	if(vc_in_stereo_eye() != 1)
+#endif
 	ShadowsStoredToBeRendered = 0;
 
 	POP_RENDERGROUP();
