@@ -343,6 +343,9 @@ static PFN_eglQueryString             p_eglQueryString = NULL;
 static int g_numBuffers = 3;
 static int g_frameCapHz = 0;   // >0 = fixed cap Hz; 0 = uncapped; -1 = auto (= display rate)
 static int g_displayHz = 0;    // measured compositor rate (acquire-call frequency), 0 until known
+static double g_lastAcqSec = 0.0;  // last compositor acquire time (CLOCK_MONOTONIC s) = the SLOT CLOCK the
+                                   // phase-locked cap (A) anchors to. Written on the acquire thread, read on
+                                   // the game thread; aligned 64-bit -> read/write is atomic enough on arm64.
 
 // One bit ("busy") could not tell "finished but not yet fetched" from "in use by
 // the compositor" -- and the second must never be reclaimed while Metal reads it.
@@ -366,6 +369,7 @@ typedef struct {
 	VCBufState     state;
 	uint64_t       waitValue;  // shared-event value to wait for (0 = no wait)
 	uint64_t       poseSetTime; // mach time the head pose of THIS slice was pushed (latency probe)
+	uint64_t       publishSeq; // global publish number of the frame in this buffer (ordering probe)
 } VCBuffer;
 
 static VCBuffer g_buf[VC_NUM_BUFFERS];
@@ -403,6 +407,7 @@ typedef struct {
 	uint32_t width, height;
 	uint32_t eye_count;   // 1 = mono 2D texture; 2 = stereo 2D-array (slice per eye)
 	void    *hud_texture; // stereo only: 2D transparent HUD/2D/menu overlay; NULL in cinema
+	uint64_t pose_set_time; // mach time of the head pose this frame was RENDERED with (reproj fix)
 } vc_ready_frame_t;
 
 // Defined in visionos.cpp; lets the throttle wake up for vc_game_thread_stop().
@@ -684,20 +689,52 @@ vcrt_begin_frame(void)
 {
 	if (!g_extActive) return true;   // not set up yet; don't block
 
-	// Frame-rate cap: sleep until the next frame slot so the game thread doesn't
-	// free-run (~145 Hz) and beat against the display. capHz: fixed (>0), off (0),
-	// or auto (-1 = the measured display rate, so we never hardcode 90). This keeps
-	// reVC at 1 frame per display frame without a phase-lock (no deadlock risk).
+	// Frame-rate cap, PHASE-LOCKED to the compositor slot grid (A). capHz: fixed (>0),
+	// off (0 = VC_FRAME_CAP_HZ=0, an A/B fallback), or auto (-1 = measured display rate,
+	// never hardcode 90). The old cap held the RATE but not the PHASE: reVC's cadence ran
+	// on its own clock, so its publish slowly drifted through the compositor slot window
+	// (measured ~103 vs 90 Hz beat) and on each beat crossing a frame sat one slot longer
+	// -> push->acquire jumped 11->22 ms = the visible judder, while misses stayed ~0. Fix:
+	// pace the frame START onto the compositor's SLOT GRID, anchored to the real acquire
+	// time g_lastAcqSec, targeting the NEXT grid point -- never "now+period" (that off-grid
+	// re-base was what scrambled the phase). Under overload (render > period) the next
+	// target lands on a LATER slot -> clean even 1/2, 1/3 rate (steady 45/30 Hz), not an
+	// irregular catch-up. Buffers stay at 4 to absorb outliers (streaming/explosions).
+	//   lead  (VC_CAP_LEAD_MS, default 4.0, down to 0): frame-start this many ms before a
+	//         slot. Publish lands ~render-time later; raise lead until publish sits just
+	//         before a slot (lowest STABLE latency, sweet spot ~= measured eyes+post ms),
+	//         lower it toward 0 to trade smoothness for latency. Trades latency<->jitter.
+	//   guard (VC_CAP_GUARD_MS, default 1.0): usleep oversleeps by a scheduling quantum, so
+	//         sleep to target-guard then SPIN the last bit to hit target precisely. Pure
+	//         sleep-precision slack, NOT a buffer and NOT part of the latency budget.
 	int capHz = (g_frameCapHz > 0) ? g_frameCapHz
 	          : (g_frameCapHz < 0) ? (g_displayHz > 0 ? g_displayHz : 90)
 	          : 0;
 	if (capHz > 0) {
-		static double nextSlot = 0.0;
+		static double leadS = -1.0, guardS = -1.0;
+		if (leadS < 0.0) {
+			const char *l = getenv("VC_CAP_LEAD_MS");  leadS  = (l ? atof(l) : 4.0) / 1000.0;
+			const char *g = getenv("VC_CAP_GUARD_MS"); guardS = (g ? atof(g) : 1.0) / 1000.0;
+			if (leadS  < 0.0) leadS  = 0.0;
+			if (guardS < 0.0) guardS = 0.0;
+			printf("[vc-cap] phase-lock: lead=%.2f ms guard=%.2f ms\n", leadS * 1e3, guardS * 1e3);
+		}
 		double period = 1.0 / (double)capHz;
+		double anchor = g_lastAcqSec;         // slot clock; 0 until the first acquire
 		double now = vc_now_seconds();
-		if (nextSlot == 0.0) nextSlot = now;
-		if (now < nextSlot) { usleep((useconds_t)((nextSlot - now) * 1.0e6)); now = vc_now_seconds(); }
-		nextSlot = (now > nextSlot + period) ? now + period : nextSlot + period;
+		if (anchor > 0.0) {
+			// next grid point (= slot - lead) at least guard in the future; snap to the
+			// grid every frame so the cadence can't drift (no incremental +period carry).
+			double base = anchor - leadS;
+			double target = base + floor((now + guardS - base) / period) * period;
+			while (target < now + guardS) target += period;
+			double wake = target - guardS;
+			double t = vc_now_seconds();
+			if (wake > t) usleep((useconds_t)((wake - t) * 1.0e6));
+			// spin-guard: poll the last <=guard+jitter to absorb usleep oversleep so the
+			// grid phase is hit precisely (bounded, sub-ms; the cost of exact pacing).
+			while (vc_now_seconds() < target) { /* busy-wait remainder */ }
+		}
 	}
 
 	vcrt_log_rate();   // once per frame ATTEMPT (park or proceed), see above
@@ -850,6 +887,7 @@ vcrt_publish_frame(void)
 	g_readyIndex = back;
 	g_haveBack = false;                        // reservation consumed
 	uint64_t n = ++g_frameCount;
+	g_buf[back].publishSeq = n;                // ordering probe: which frame this buffer holds
 	pthread_mutex_unlock(&g_bufMutex);
 
 	// First four publishes individually so the index rotation 0,1,0,1 is
@@ -891,6 +929,7 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 			}
 		}
 		sLastAcq = nowT;
+		g_lastAcqSec = vc_now_seconds();   // slot clock for the phase-locked cap (A)
 	}
 
 	pthread_mutex_lock(&g_bufMutex);
@@ -944,10 +983,39 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	// (same index, written by the same GL stream, so the one shared-event covers it).
 	// Cinema: no separate HUD layer.
 	out->hud_texture = stereo ? VC_OBJ_TO_VOID(g_buf[idx].mtlTexture) : NULL;
+	out->pose_set_time = g_buf[idx].poseSetTime;   // render pose of THIS buffer (reproj fix)
 	void    *outTex = out->texture;
 	uint64_t outWait = out->wait_value;
 	uint64_t poseSetT = g_buf[idx].poseSetTime;
+	uint64_t acqSeq   = g_buf[idx].publishSeq;   // ordering probe (logged after unlock)
 	pthread_mutex_unlock(&g_bufMutex);
+
+	// Ordering/overwrite probe: the compositor must see STRICTLY INCREASING publishSeq.
+	// A REGRESSION (older seq after a newer one) = ordering bug -> a frame "from another
+	// moment". A REPEAT (same seq on a successful acquire) = the same frame handed twice.
+	// Monotonic & no repeats here WHILE the wrong-frame flicker persists = overwrite-
+	// during-display (the fence fires at glFlush, before the GPU write truly completes).
+	if (vc_perf_log() && stereo) {
+		static uint64_t sLastSeq = 0, sRegress = 0, sRepeat = 0, sAcq = 0;
+		static double lastSeqLog = 0.0;
+		sAcq++;
+		if (acqSeq < sLastSeq) {
+			sRegress++;
+			VCLOG(@"[vc-acq-seq] REGRESSION: seq %llu after %llu (idx=%d) -- OLDER frame handed",
+			      (unsigned long long)acqSeq, (unsigned long long)sLastSeq, idx);
+		} else if (acqSeq == sLastSeq) {
+			sRepeat++;
+		}
+		sLastSeq = acqSeq;
+		double nowSeqS = vc_now_seconds();
+		if (lastSeqLog == 0.0) lastSeqLog = nowSeqS;
+		if (nowSeqS - lastSeqLog >= 2.0) {
+			lastSeqLog = nowSeqS;
+			VCLOG(@"[vc-acq-seq] last=%llu  regress=%llu repeat=%llu / %llu acquires",
+			      (unsigned long long)acqSeq, (unsigned long long)sRegress,
+			      (unsigned long long)sRepeat, (unsigned long long)sAcq);
+		}
+	}
 
 	// Latency probe: full push -> acquire (~display) age of THIS slice's head pose.
 	// Push->consume is measured on the game side ([vc-pose-age]); this adds the
@@ -956,12 +1024,34 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	if (vc_perf_log() && stereo && poseSetT != 0) {
 		static uint64_t sNum = 0, sDen = 0;
 		if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
-		static double lastLatLog = 0.0;
+		double ageMs = (double)(mach_absolute_time() - poseSetT) * (double)sNum / (double)sDen / 1.0e6;
+		// The judder is push->acquire JITTER (occasional +1 frame ~= 2x period), invisible
+		// in a mean. Bucket EVERY acquire over an interval and report the distribution:
+		// median (p50), p95, max, and the fraction of +1-frame outliers (> 1.5*period).
+		// That is the number A must drive down -- steady latency beats low-but-jittery.
+		static uint32_t hist[64];   // 1 ms buckets, 0..63 (clamped)
+		static uint64_t hn = 0, hout = 0;
+		static double hmax = 0.0, lastLatLog = 0.0;
 		double nowS = vc_now_seconds();
-		if (nowS - lastLatLog >= 1.0) {
+		int b = (int)ageMs; if (b < 0) b = 0; if (b > 63) b = 63;
+		hist[b]++; hn++;
+		if (ageMs > hmax) hmax = ageMs;
+		double periodMs = 1000.0 / (double)(g_displayHz > 0 ? g_displayHz : 90);
+		if (ageMs > 1.5 * periodMs) hout++;
+		if (lastLatLog == 0.0) lastLatLog = nowS;
+		if (nowS - lastLatLog >= 2.0 && hn > 0) {
 			lastLatLog = nowS;
-			double ageMs = (double)(mach_absolute_time() - poseSetT) * (double)sNum / (double)sDen / 1.0e6;
-			VCLOG(@"[vc-pose-latency] push -> acquire = %.2f ms (full head-pose latency to display)", ageMs);
+			uint64_t acc = 0; int p50 = 0, p95 = 0; bool g50 = false, g95 = false;
+			for (int i = 0; i < 64; i++) {
+				acc += hist[i];
+				if (!g50 && acc * 100 >= hn * 50) { p50 = i; g50 = true; }
+				if (!g95 && acc * 100 >= hn * 95) { p95 = i; g95 = true; }
+			}
+			VCLOG(@"[vc-pose-jitter] n=%llu p50=%d ms p95=%d ms max=%.1f ms  +1frame(>%.0fms)=%llu (%.1f%%)",
+			      (unsigned long long)hn, p50, p95, hmax,
+			      1.5 * periodMs, (unsigned long long)hout, 100.0 * (double)hout / (double)hn);
+			for (int i = 0; i < 64; i++) hist[i] = 0;
+			hn = 0; hout = 0; hmax = 0.0;
 		}
 	}
 

@@ -134,6 +134,13 @@ extern "C" void vc_set_view_matrix(const float m[16])
 	uint64_t now = mach_absolute_time();
 	pthread_mutex_lock(&g_mtxMutex); memcpy(g_ovView, m, 16 * sizeof(float)); g_ovSetTime = now; pthread_mutex_unlock(&g_mtxMutex);
 }
+// Host reads this right after pushing to key its DeviceAnchor ring to the exact
+// g_ovSetTime that will arrive back on a buffer as pose_set_time (reprojection fix).
+extern "C" uint64_t vc_last_pushed_pose_time(void)
+{
+	pthread_mutex_lock(&g_mtxMutex); uint64_t t = g_ovSetTime; pthread_mutex_unlock(&g_mtxMutex);
+	return t;
+}
 extern "C" void vc_set_projection_matrix(const float m[16])
 {
 	if (!m) return;
@@ -227,6 +234,10 @@ extern "C" void vc_frame_mark(int id)
 	if (id == 0) g_fxAccum = 0;   // reset per frame; fx accrues across the two eye passes
 	if (id != 5) return;
 	if (vc_render_mode() != 1) return;   // stereo only (cinema doesn't set marks 2/3)
+	// Warmup: on the first frame(s) some phase marks are still 0 (never set), so segment
+	// deltas t[b]-t[a] reference zero and print garbage (e.g. finish ~5 h). Skip the stats
+	// until every mark 0..7 has been set once; static t[] stays populated afterwards.
+	for (int i = 0; i <= 7; i++) if (t[i] == 0) return;
 	static uint64_t sNum = 0, sDen = 0;
 	if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
 	#define VC_SEG_MS(a,b) ((double)(t[b] - t[a]) * (double)sNum / (double)sDen / 1.0e6)
