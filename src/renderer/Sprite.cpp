@@ -14,6 +14,13 @@ float CSprite::m_f2DFarScreenZ;
 float CSprite::m_fRecipNearClipPlane;
 int32 CSprite::m_bFlushSpriteBufferSwitchZTest;
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_get_eye_view(float m[16]);   // eye VIEW the stereo pass uploaded (librw)
+extern "C" int vc_get_eye_proj(float m[16]);   // eye PROJECTION the GPU world used (librw clip)
+extern "C" int vc_in_stereo_eye(void);         // 0 = outside eye loop, 1 = eye0, 2 = eye1
+#endif
+
+
 float 
 CSprite::CalcHorizonCoors(void)
 {
@@ -27,12 +34,65 @@ bool
 CSprite::CalcScreenCoors(const RwV3d &in, RwV3d *out, float *outw, float *outh, bool farclip)
 {
 	CVector viewvec = TheCamera.m_viewMatrix * in;
+#ifdef LIBRW_VISIONOS
+	// Measure what m_viewMatrix ACTUALLY holds at use time vs the eye VIEW I set in the
+	// eye loop. I set m_viewMatrix.Forward = (-v[4],v[5],v[6]). If it differs here, a
+	// .Update() (RwCamera view -> CMatrix) overwrote it between set and use.
+	{
+		// Project a WORLD-FIXED reference point (frozen once) through the CURRENT
+		// m_viewMatrix every call. Its screen X MUST sweep as the head yaws (the view
+		// rotates); if it stays put, CalcScreenCoors' projection is not responding to
+		// the rotating view -> the bug is the projection math, not the matrix.
+		static bool refCaptured = false;
+		static CVector refWorld;
+		if(!refCaptured){
+			refWorld = TheCamera.GetPosition() + TheCamera.GetForward() * 500.0f;
+			refCaptured = true;
+		}
+		static int nn = 0;
+		if((nn++ % 120) == 0){
+			CVector rv = TheCamera.m_viewMatrix * refWorld;
+			float sx = (rv.z != 0.0f) ? rv.x / rv.z * SCREEN_WIDTH : 0.0f;   // CalcScreenCoors mapping
+			// Same point through the COMPOSITOR projection the GPU world used. librw
+			// view point = S*rv (negate x); clip = proj*lv; ndcx = clip.x/clip.w.
+			float projSX = 0.0f, p[16];
+			if(vc_get_eye_proj(p)){
+				float lx = -rv.x, ly = rv.y, lz = rv.z;
+				float cx = p[0]*lx + p[4]*ly + p[8]*lz + p[12];
+				float cw = p[3]*lx + p[7]*ly + p[11]*lz + p[15];
+				if(cw != 0.0f) projSX = (cx / cw) * (SCREEN_WIDTH * 0.5f);
+			}
+			printf("[vc-proj] eye=%d calcSX=%.1f projSX=%.1f  ratio=%.3f  refView=(%.1f,%.1f,%.1f)\n",
+			       vc_in_stereo_eye(), sx, projSX, sx != 0.0f ? projSX / sx : 0.0f, rv.x, rv.y, rv.z);
+		}
+	}
+#endif
 	*out = viewvec;
 	if(out->z <= CDraw::GetNearClipZ() + 1.0f) return false;
 	if(out->z >= CDraw::GetFarClipZ() && farclip) return false;
 	float recip = 1.0f/out->z;
 	out->x *= SCREEN_WIDTH * recip;
 	out->y *= SCREEN_HEIGHT * recip;
+#ifdef LIBRW_VISIONOS
+	// Stereo eye pass: the fixed x/z*W mapping above bakes in the game projection and
+	// disagrees with the compositor slice projection the world used -> sprites drift.
+	// Replace it with the FULL slice projection mapped to reVC's 0..W viewport, so the
+	// sprite lands exactly where the world renders that point. librw view = S*RW view
+	// (negate x). Eye pass only; the 2D/HUD path (eye 0) keeps the game mapping.
+	if(vc_in_stereo_eye() != 0){
+		float p[16];
+		if(vc_get_eye_proj(p)){
+			float lx = -viewvec.x, ly = viewvec.y, lz = viewvec.z;
+			float cx = p[0]*lx + p[4]*ly + p[8]*lz + p[12];
+			float cy = p[1]*lx + p[5]*ly + p[9]*lz + p[13];
+			float cw = p[3]*lx + p[7]*ly + p[11]*lz + p[15];
+			if(cw > 0.0001f){
+				out->x = (cx/cw * 0.5f + 0.5f) * SCREEN_WIDTH;
+				out->y = (0.5f - cy/cw * 0.5f) * SCREEN_HEIGHT;   // y-down screen
+			}
+		}
+	}
+#endif
 	const float fov = DefaultFOV;
 	// this is used to scale correctly if you zoom in with sniper rifle
 	float fovScale = fov / CDraw::GetFOV();

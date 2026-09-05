@@ -1387,6 +1387,75 @@ extern "C" void vc_frame_mark(int id);         // visionos: per-frame phase timi
 extern "C" void vc_frame_fx_begin(void);       // visionos: time RenderEffects (2x) as the [vc-frame] fx segment
 extern "C" void vc_frame_fx_end(void);
 extern "C" void vc_fade_set_draw_only(int on);  // visionos: gate DoFade state mutation (per-eye fade)
+extern "C" int  vc_get_eye_view(float m[16]);   // gl3device: eye VIEW (librw) the last eye pass uploaded
+
+// Phase 5 (sky/coronas/lighting fix): set TheCamera to the per-eye camera so the CPU
+// paths that read TheCamera (CalcScreenCoors -> sun/moon/clouds/coronas, CamFront ->
+// horizon, light dir) match the GPU eye view -- instead of only injecting the GPU
+// uniform. Additive + gated (VC_STEREO_CAMERA=1): the GPU world path is untouched, so
+// the world is guaranteed identical; only the CPU camera reads change. librw view =
+// S*RW_view (X-flip, beginUpdate), so RW columns = librw columns with x negated.
+static bool vcStereoCameraOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_STEREO_CAMERA"); e = s ? atoi(s) : 0; }
+	return e != 0;
+}
+// Tag which stereo phase a CalcScreenCoors call happens in: 0 = outside the eye loop
+// (game camera restored -> 2D/HUD), 1 = eye 0, 2 = eye 1. Lets the projection probe
+// prove whether the drifting (game-camera) sprite calls are inside or outside the loop.
+static int vcEyeTag = 0;
+extern "C" int vc_in_stereo_eye(void) { return vcEyeTag; }
+static bool    vcGameCamSaved = false;
+static CMatrix vcSavedCamMatrix, vcSavedViewMatrix;
+static void vcStereoSaveGameCamera(void)
+{
+	vcSavedCamMatrix  = TheCamera.GetMatrix();
+	vcSavedViewMatrix = TheCamera.m_viewMatrix;   // copies the CMatrix fields
+	vcGameCamSaved = true;
+}
+static void vcStereoRestoreGameCamera(void)
+{
+	if(!vcGameCamSaved) return;
+	TheCamera.GetMatrix() = vcSavedCamMatrix;
+	TheCamera.CalculateDerivedValues();
+	TheCamera.m_viewMatrix.GetRight()    = vcSavedViewMatrix.GetRight();
+	TheCamera.m_viewMatrix.GetForward()  = vcSavedViewMatrix.GetForward();
+	TheCamera.m_viewMatrix.GetUp()       = vcSavedViewMatrix.GetUp();
+	TheCamera.m_viewMatrix.GetPosition() = vcSavedViewMatrix.GetPosition();
+	vcGameCamSaved = false;
+}
+static void vcStereoSetGameCamera(int eye)
+{
+	float v[16];
+	if(!vc_get_eye_view(v)) return;
+	// RW view columns = librw columns with x-component negated (undo the beginUpdate X-flip).
+	CVector R(-v[0], v[1], v[2]), F(-v[4], v[5], v[6]), U(-v[8], v[9], v[10]), P(-v[12], v[13], v[14]);
+	CMatrix rwView = TheCamera.m_viewMatrix;   // copy for valid struct/padding, then overwrite
+	rwView.GetRight() = R; rwView.GetForward() = F; rwView.GetUp() = U; rwView.GetPosition() = P;
+	CMatrix world = Invert(rwView);            // camera WORLD in RW order (right, up, at) + correct pos
+	// GTA stores the LOOK in the Forward slot and UP in the Up slot; RW/Invert gives
+	// (right, up, at=look). Swap Forward<->Up so GetForward()=look (CamFront/horizon).
+	// Measured: without the swap GetForward()=(v[1],v[5],v[9]) = the up axis (z~1 in
+	// Z-up), which barely moves on yaw; the look axis is (v[2],v[6],v[10]).
+	CVector look = world.GetUp();              // RW "at" (col2) = look
+	CVector up   = world.GetForward();         // RW "up"  (col1)
+	world.GetForward() = look;
+	world.GetUp()      = up;
+	TheCamera.GetMatrix() = world;
+	TheCamera.CalculateDerivedValues();        // m_cameraMatrix, frustum, CamFront/Orientation
+	TheCamera.m_viewMatrix.GetRight() = R; TheCamera.m_viewMatrix.GetForward() = F;
+	TheCamera.m_viewMatrix.GetUp() = U; TheCamera.m_viewMatrix.GetPosition() = P;  // CalcScreenCoors source (RW order, as cinema)
+	static int n = 0;
+	if((n++ % 240) < 2){   // 240 even -> catches BOTH eye 0 and eye 1 each cycle
+		CVector fwd = TheCamera.GetForward(), up = TheCamera.GetUp(), rt = TheCamera.GetRight();
+		// Raw eye-view (librw) columns, so we can see WHICH column carries the head yaw
+		// (proves the rotation is in v and my extraction picks the wrong axis).
+		printf("[vc-eyecam] eye=%d camR=(%.2f,%.2f,%.2f) camF=(%.2f,%.2f,%.2f) camU=(%.2f,%.2f,%.2f) | vC0=(%.2f,%.2f,%.2f) vC1=(%.2f,%.2f,%.2f) vC2=(%.2f,%.2f,%.2f)\n",
+		       eye, rt.x,rt.y,rt.z, fwd.x,fwd.y,fwd.z, up.x,up.y,up.z,
+		       v[0],v[1],v[2], v[4],v[5],v[6], v[8],v[9],v[10]);
+	}
+}
 #endif
 
 void
@@ -1730,8 +1799,13 @@ Idle(void *arg)
 		// in-game. 5.6 must render the 2D/HUD layer into BOTH eye slices (or a
 		// shared overlay) instead of the cinema buffer.
 		if (vc_render_mode() == 1 /* VC_MODE_STEREO */) {
+			if (vcStereoCameraOn()) vcStereoSaveGameCamera();
 			for (int eye = 0; eye < 2; eye++) {
 				vc_stereo_eye_pass(eye);
+				// Set TheCamera to this eye (CPU sky/coronas/lighting read it). GPU world
+				// path is unchanged (eye pass already uploaded the uniform) -> world identical.
+				if (vcStereoCameraOn()) vcStereoSetGameCamera(eye);
+				vcEyeTag = eye + 1;   // mark: CalcScreenCoors calls now belong to this eye
 				RenderScene();
 				// World-referenced effects (particles, coronas, glass, weapon fx,
 				// shadows...) belong IN the slices, per eye, with parallax -- not in
@@ -1744,8 +1818,11 @@ Idle(void *arg)
 				// eye 1 is draw-only so the state transition mutates exactly once.
 				vc_fade_set_draw_only(eye == 1);
 				DoFade();
+				vcEyeTag = 0;   // end of this eye's world/effects
 			}
 			vc_fade_set_draw_only(0);
+			// Restore the game camera so gameplay + the mono/HUD path see the original.
+			if (vcStereoCameraOn()) vcStereoRestoreGameCamera();
 			vc_frame_mark(2);   // eyes done (2x RenderScene + 2x RenderEffects + 2x DoFade)
 			vc_stereo_restore_main();
 			vc_stereo_readback_log();
