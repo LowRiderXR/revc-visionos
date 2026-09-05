@@ -18,6 +18,10 @@
 #include "Clock.h"
 #include "Bridge.h"
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_render_mode(void);   // gl3device: 1 = stereo VR, 0 = cinema
+#endif
+
 struct FlareDef
 {
 	float position;
@@ -364,7 +368,17 @@ CCoronas::Render(void)
 				}
 
 				// render flares
-				if(aCoronas[i].flareType != FLARE_NONE){
+				bool renderFlares = aCoronas[i].flareType != FLARE_NONE;
+#ifdef LIBRW_VISIONOS
+				// Stereo VR decision (permanent, not a TODO): lens flares (SUN + HEADLIGHTS)
+				// are placed in SCREEN space -- each flare element is strung along the line
+				// from the corona toward the SCREEN CENTRE ((x - screenw/2)*pos + screenw/2).
+				// That centre moves with the head, so the flare slides across the scene on
+				// head-turn (headlights on moving cars are the worst) and breaks world-lock.
+				// Drop all flares in stereo; the corona disc/glow itself stays world-anchored.
+				if(vc_render_mode() == 1) renderFlares = false;
+#endif
+				if(renderFlares){
 					FlareDef *flare;
 
 					switch(aCoronas[i].flareType){

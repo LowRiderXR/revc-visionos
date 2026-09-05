@@ -15,7 +15,6 @@ float CSprite::m_fRecipNearClipPlane;
 int32 CSprite::m_bFlushSpriteBufferSwitchZTest;
 
 #ifdef LIBRW_VISIONOS
-extern "C" int vc_get_eye_view(float m[16]);   // eye VIEW the stereo pass uploaded (librw)
 extern "C" int vc_get_eye_proj(float m[16]);   // eye PROJECTION the GPU world used (librw clip)
 extern "C" int vc_in_stereo_eye(void);         // 0 = outside eye loop, 1 = eye0, 2 = eye1
 #endif
@@ -34,39 +33,6 @@ bool
 CSprite::CalcScreenCoors(const RwV3d &in, RwV3d *out, float *outw, float *outh, bool farclip)
 {
 	CVector viewvec = TheCamera.m_viewMatrix * in;
-#ifdef LIBRW_VISIONOS
-	// Measure what m_viewMatrix ACTUALLY holds at use time vs the eye VIEW I set in the
-	// eye loop. I set m_viewMatrix.Forward = (-v[4],v[5],v[6]). If it differs here, a
-	// .Update() (RwCamera view -> CMatrix) overwrote it between set and use.
-	{
-		// Project a WORLD-FIXED reference point (frozen once) through the CURRENT
-		// m_viewMatrix every call. Its screen X MUST sweep as the head yaws (the view
-		// rotates); if it stays put, CalcScreenCoors' projection is not responding to
-		// the rotating view -> the bug is the projection math, not the matrix.
-		static bool refCaptured = false;
-		static CVector refWorld;
-		if(!refCaptured){
-			refWorld = TheCamera.GetPosition() + TheCamera.GetForward() * 500.0f;
-			refCaptured = true;
-		}
-		static int nn = 0;
-		if((nn++ % 120) == 0){
-			CVector rv = TheCamera.m_viewMatrix * refWorld;
-			float sx = (rv.z != 0.0f) ? rv.x / rv.z * SCREEN_WIDTH : 0.0f;   // CalcScreenCoors mapping
-			// Same point through the COMPOSITOR projection the GPU world used. librw
-			// view point = S*rv (negate x); clip = proj*lv; ndcx = clip.x/clip.w.
-			float projSX = 0.0f, p[16];
-			if(vc_get_eye_proj(p)){
-				float lx = -rv.x, ly = rv.y, lz = rv.z;
-				float cx = p[0]*lx + p[4]*ly + p[8]*lz + p[12];
-				float cw = p[3]*lx + p[7]*ly + p[11]*lz + p[15];
-				if(cw != 0.0f) projSX = (cx / cw) * (SCREEN_WIDTH * 0.5f);
-			}
-			printf("[vc-proj] eye=%d calcSX=%.1f projSX=%.1f  ratio=%.3f  refView=(%.1f,%.1f,%.1f)\n",
-			       vc_in_stereo_eye(), sx, projSX, sx != 0.0f ? projSX / sx : 0.0f, rv.x, rv.y, rv.z);
-		}
-	}
-#endif
 	*out = viewvec;
 	if(out->z <= CDraw::GetNearClipZ() + 1.0f) return false;
 	if(out->z >= CDraw::GetFarClipZ() && farclip) return false;

@@ -1410,18 +1410,19 @@ extern "C" void vc_set_stereo_sky_clear(float r, float g, float b); // gl3device
 // Phase 5 (sky/coronas/lighting fix): set TheCamera to the per-eye camera so the CPU
 // paths that read TheCamera (CalcScreenCoors -> sun/moon/clouds/coronas, CamFront ->
 // horizon, light dir) match the GPU eye view -- instead of only injecting the GPU
-// uniform. Additive + gated (VC_STEREO_CAMERA=1): the GPU world path is untouched, so
-// the world is guaranteed identical; only the CPU camera reads change. librw view =
-// S*RW_view (X-flip, beginUpdate), so RW columns = librw columns with x negated.
+// uniform. Additive: the GPU world path is untouched, so the world is guaranteed
+// identical; only the CPU camera reads change. librw view = S*RW_view (X-flip,
+// beginUpdate), so RW columns = librw columns with x negated. Default ON in stereo;
+// set VC_STEREO_CAMERA=0 as a fallback if the CPU camera reads ever need disabling.
 static bool vcStereoCameraOn(void)
 {
 	static int e = -1;
-	if(e < 0){ const char *s = getenv("VC_STEREO_CAMERA"); e = s ? atoi(s) : 0; }
+	if(e < 0){ const char *s = getenv("VC_STEREO_CAMERA"); e = s ? atoi(s) : 1; }
 	return e != 0;
 }
 // Tag which stereo phase a CalcScreenCoors call happens in: 0 = outside the eye loop
-// (game camera restored -> 2D/HUD), 1 = eye 0, 2 = eye 1. Lets the projection probe
-// prove whether the drifting (game-camera) sprite calls are inside or outside the loop.
+// (game camera restored -> 2D/HUD), 1 = eye 0, 2 = eye 1. CalcScreenCoors (Sprite.cpp)
+// reads this to apply the per-eye slice projection to sun/moon/clouds/coronas positions.
 static int vcEyeTag = 0;
 extern "C" int vc_in_stereo_eye(void) { return vcEyeTag; }
 static bool    vcGameCamSaved = false;
@@ -1464,15 +1465,6 @@ static void vcStereoSetGameCamera(int eye)
 	TheCamera.CalculateDerivedValues();        // m_cameraMatrix, frustum, CamFront/Orientation
 	TheCamera.m_viewMatrix.GetRight() = R; TheCamera.m_viewMatrix.GetForward() = F;
 	TheCamera.m_viewMatrix.GetUp() = U; TheCamera.m_viewMatrix.GetPosition() = P;  // CalcScreenCoors source (RW order, as cinema)
-	static int n = 0;
-	if((n++ % 240) < 2){   // 240 even -> catches BOTH eye 0 and eye 1 each cycle
-		CVector fwd = TheCamera.GetForward(), up = TheCamera.GetUp(), rt = TheCamera.GetRight();
-		// Raw eye-view (librw) columns, so we can see WHICH column carries the head yaw
-		// (proves the rotation is in v and my extraction picks the wrong axis).
-		printf("[vc-eyecam] eye=%d camR=(%.2f,%.2f,%.2f) camF=(%.2f,%.2f,%.2f) camU=(%.2f,%.2f,%.2f) | vC0=(%.2f,%.2f,%.2f) vC1=(%.2f,%.2f,%.2f) vC2=(%.2f,%.2f,%.2f)\n",
-		       eye, rt.x,rt.y,rt.z, fwd.x,fwd.y,fwd.z, up.x,up.y,up.z,
-		       v[0],v[1],v[2], v[4],v[5],v[6], v[8],v[9],v[10]);
-	}
 }
 #endif
 
