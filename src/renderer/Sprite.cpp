@@ -104,6 +104,24 @@ CSprite::CalcScreenCoors(const RwV3d &in, RwV3d *out, float *outw, float *outh, 
 #endif
 	*outh = fovScale * recip * SCREEN_HEIGHT;
 
+#ifdef LIBRW_VISIONOS
+	// Stereo eye pass: outw/outh also use the fixed game-projection scale (SCREEN_WIDTH/
+	// HEIGHT), so sprites come out too big AND oval (wrong x:y ratio) under the wider,
+	// per-axis compositor slice projection. Scale each axis by its own p0/p5 (same
+	// factor as the position fix) -> correct size + round again. Eye pass only.
+	if(vc_in_stereo_eye() != 0){
+		float p[16];
+		if(vc_get_eye_proj(p)){
+			// Vertical size from the slice's vertical FOV (p5). The base outw carries an
+			// extra SCREEN_SCALE_AR (game-aspect) that outh doesn't -> residual oval.
+			// The corona/sun/moon textures are square and the slice pixels are square,
+			// so force outw = outh -> round, correct size.
+			*outh *= 0.5f * p[5];
+			*outw = *outh;
+		}
+	}
+#endif
+
 	return true;
 }
 

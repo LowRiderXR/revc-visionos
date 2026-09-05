@@ -240,10 +240,27 @@ DoRWStuffStartOfFrame_Horizon(int16 TopRed, int16 TopGreen, int16 TopBlue, int16
 	return true;
 }
 
+#ifdef LIBRW_VISIONOS
+// Stereo sky: fill the eye slice with the sky colour and skip the screen-space
+// gradient/horizon band (which head-locks in the headset). Default on in stereo,
+// VC_STEREO_SKY=0 to A/B against the old band.
+extern "C" int vc_render_mode(void);
+int vcStereoSkyOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_STEREO_SKY"); e = s ? atoi(s) : 1; }
+	return e && vc_render_mode() == 1;
+}
+#endif
+
 // This is certainly a very useful function
 void
 DoRWRenderHorizon(void)
 {
+#ifdef LIBRW_VISIONOS
+	if(vcStereoSkyOn())   // skip the head-locking 2D horizon band in stereo
+		return;
+#endif
 	CClouds::RenderHorizon();
 }
 
@@ -1388,6 +1405,7 @@ extern "C" void vc_frame_fx_begin(void);       // visionos: time RenderEffects (
 extern "C" void vc_frame_fx_end(void);
 extern "C" void vc_fade_set_draw_only(int on);  // visionos: gate DoFade state mutation (per-eye fade)
 extern "C" int  vc_get_eye_view(float m[16]);   // gl3device: eye VIEW (librw) the last eye pass uploaded
+extern "C" void vc_set_stereo_sky_clear(float r, float g, float b); // gl3device: eye-slice sky clear colour
 
 // Phase 5 (sky/coronas/lighting fix): set TheCamera to the per-eye camera so the CPU
 // paths that read TheCamera (CalcScreenCoors -> sun/moon/clouds/coronas, CamFront ->
@@ -1799,6 +1817,15 @@ Idle(void *arg)
 		// in-game. 5.6 must render the 2D/HUD layer into BOTH eye slices (or a
 		// shared overlay) instead of the cinema buffer.
 		if (vc_render_mode() == 1 /* VC_MODE_STEREO */) {
+			// Sky: fill the eye slices with the sky colour (mid of the time-cycle sky
+			// gradient) so the sky is world-anchored; the screen-space horizon band is
+			// skipped in DoRWRenderHorizon. VC_STEREO_SKY=0 disables (old band).
+			if (vcStereoSkyOn()) {
+				float r = (CTimeCycle::GetSkyTopRed()   + CTimeCycle::GetSkyBottomRed())   * 0.5f / 255.0f;
+				float g = (CTimeCycle::GetSkyTopGreen() + CTimeCycle::GetSkyBottomGreen()) * 0.5f / 255.0f;
+				float b = (CTimeCycle::GetSkyTopBlue()  + CTimeCycle::GetSkyBottomBlue())  * 0.5f / 255.0f;
+				vc_set_stereo_sky_clear(r, g, b);
+			}
 			if (vcStereoCameraOn()) vcStereoSaveGameCamera();
 			for (int eye = 0; eye < 2; eye++) {
 				vc_stereo_eye_pass(eye);
