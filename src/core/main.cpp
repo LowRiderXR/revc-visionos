@@ -251,6 +251,56 @@ int vcStereoSkyOn(void)
 	if(e < 0){ const char *s = getenv("VC_STEREO_SKY"); e = s ? atoi(s) : 1; }
 	return e && vc_render_mode() == 1;
 }
+// Splash/loading active: true while a loading screen (LoadingScreen/LoadingIslandScreen)
+// is the only thing being rendered. Those draw a 2D fullscreen splash via their own
+// DoRWStuffStartOfFrame/EndOfFrame WITHOUT the stereo eye loop, so the eye slices go stale
+// (last gameplay) -> in stereo you'd see stale gameplay + a flickering small HUD splash.
+// The host reads this LIVE (like vc_menu_active) to draw the splash overlay FULLSCREEN and
+// hide the stale world. Set by the loading screens; cleared when the real world render (the
+// eye loop) runs again. Stays true across a long streaming block that produces no new
+// splash frame -> the compositor simply holds the last splash still (acceptable).
+static int g_vcSplashActive = 0;
+// Stereo: true during the fade TO/FROM a splash screen. reVC keeps running the eye passes
+// (3D cutscene) while FadeValue ramps and DoFade crossfades the 2D splash over it -- a 2D
+// image at infinity over a 3D scene cannot fuse in VR (binocular rivalry / flicker). So we
+// suppress the world during this window and show the splash as a head-locked overlay, then
+// hard-cut when the fade clears. Self-clearing (game logic clears m_FadeTargetIsSplashScreen)
+// -> no deadlock from gating the world on it.
+static int vcStereoSplashFade(void)
+{
+	// Suppress the world for the WHOLE splash-target period, NOT gated on FadeValue:
+	// FadeValue is 0 both at the fade-IN start and the fade-OUT end, and those gaps leaked a
+	// gameplay frame. m_FadeTargetIsSplashScreen is set ONLY for the (2,2,2) splash, and the
+	// fade-in injection below clears it at the fade-out end, so this never stays stuck on.
+	return vc_render_mode() == 1 && TheCamera.m_FadeTargetIsSplashScreen;
+}
+extern "C" int vc_splash_active(void) { return g_vcSplashActive || vcStereoSplashFade(); }
+
+// Fade THROUGH BLACK: VC uses one fade for the splash and does NOT fade the game in
+// afterwards (measured: after the splash fade-out FadeValue stays 0, m_FadeTargetIsSplashScreen
+// stuck at 1) -> the cutscene would pop in hard. On the frame the splash fade-out reaches 0,
+// inject a black game fade-in via VC's own fade (rendered by the eye-loop DoFade). Once per
+// splash. Duration VC_SPLASH_FADEIN_MS (default 700; tune to match the splash fade-out).
+static void vcStereoSplashFadeInCheck(void)
+{
+	if(vc_render_mode() != 1) return;
+	static bool sawHigh = false, injected = false;
+	if(TheCamera.m_FadeTargetIsSplashScreen){
+		if(CDraw::FadeValue >= 200) sawHigh = true;     // splash was fully shown (survives the throttle/gap)
+		// Splash has been shown and its fade-out is essentially done -> inject the black game
+		// fade-in and release the splash (SetFadeColour clears m_FadeTargetIsSplashScreen).
+		if(sawHigh && !injected && CDraw::FadeValue <= 8){
+			static int durMs = -1;
+			if(durMs < 0){ const char *s = getenv("VC_SPLASH_FADEIN_MS"); durMs = s ? atoi(s) : 700; }
+			TheCamera.SetFadeColour(0, 0, 0);              // black; clears m_FadeTargetIsSplashScreen
+			TheCamera.m_fFLOATingFade = 255.0f;            // start fully black, then ramp
+			TheCamera.Fade((float)durMs / 1000.0f, FADE_IN); // Fade() timeout is in SECONDS
+			injected = true;
+		}
+	} else {
+		sawHigh = false; injected = false;   // reset for the next splash
+	}
+}
 #endif
 
 // This is certainly a very useful function
@@ -701,6 +751,10 @@ LoadingScreen(const char *str1, const char *str2, const char *splashscreen)
 
 	splash = LoadSplash(splashscreen);
 
+#ifdef LIBRW_VISIONOS
+	g_vcSplashActive = 1;   // stereo: show this splash fullscreen, hide the stale world slices
+#endif
+
 #ifndef GTA_PS2
 	if(RsGlobal.quit)
 		return;
@@ -777,6 +831,9 @@ LoadingIslandScreen(const char *levelName)
 	CSprite2d *splash;
 
 	splash = LoadSplash(nil);
+#ifdef LIBRW_VISIONOS
+	g_vcSplashActive = 1;   // stereo: show this splash fullscreen, hide the stale world slices
+#endif
 	if(!DoRWStuffStartOfFrame(0, 0, 0, 0, 0, 0, 255))
 		return;
 
@@ -1690,7 +1747,15 @@ Idle(void *arg)
 
 	PUSH_MEMID(MEMID_RENDER);
 
-	if(!FrontEndMenuManager.m_bMenuActive && TheCamera.GetScreenFadeStatus() != FADE_2)
+#ifdef LIBRW_VISIONOS
+	vcStereoSplashFadeInCheck();   // splash just ended? -> kick a black game fade-in (fade through black)
+#endif
+
+	if(!FrontEndMenuManager.m_bMenuActive && TheCamera.GetScreenFadeStatus() != FADE_2
+#ifdef LIBRW_VISIONOS
+	   && !vcStereoSplashFade()   // stereo: don't render the 3D world under a splash fade -> hard cut
+#endif
+	  )
 	{
 		// This is from SA, but it's nice for windowed mode
 #if defined(GTA_PC) && !defined(RW_GL3)
@@ -1809,6 +1874,7 @@ Idle(void *arg)
 		// in-game. 5.6 must render the 2D/HUD layer into BOTH eye slices (or a
 		// shared overlay) instead of the cinema buffer.
 		if (vc_render_mode() == 1 /* VC_MODE_STEREO */) {
+			g_vcSplashActive = 0;   // real world render resumes -> leave the splash overlay
 			// Sky: fill the eye slices with the sky colour (mid of the time-cycle sky
 			// gradient) so the sky is world-anchored; the screen-space horizon band is
 			// skipped in DoRWRenderHorizon. VC_STEREO_SKY=0 disables (old band).
@@ -1897,7 +1963,15 @@ Idle(void *arg)
 		CameraSize(Scene.camera, nil, SCREEN_VIEWWINDOW, DEFAULT_ASPECT_RATIO);
 #endif
 		CVisibilityPlugins::SetRenderWareCamera(Scene.camera);
+#ifdef LIBRW_VISIONOS
+		// During a splash fade the overlay is what the host shows; clear it to BLACK (not
+		// gColourTop) so the splash fades to true black -> seamless into the black game
+		// fade-in (vcStereoSplashFadeInCheck), no colour flash at the boundary.
+		static RwRGBA vcBlackClear = { 0, 0, 0, 255 };
+		RwCameraClear(Scene.camera, vcStereoSplashFade() ? &vcBlackClear : &gColourTop, CLEARMODE);
+#else
 		RwCameraClear(Scene.camera, &gColourTop, CLEARMODE);
+#endif
 		if(!RsCameraBeginUpdate(Scene.camera))
 			goto popret;
 	}
@@ -1914,8 +1988,10 @@ Idle(void *arg)
 	tbStartTimer(0, "DoFade");
 #ifdef LIBRW_VISIONOS
 	// Stereo already drew the fade into both eye slices (in the eye loop); running it
-	// again here would dim the head-locked HUD buffer, which is not what we want.
-	if (vc_render_mode() != 1)
+	// again here would dim the head-locked HUD buffer. EXCEPT during a splash fade, where
+	// the eye loop was skipped (world suppressed) -> DoFade here draws the splash into the
+	// cinema/overlay buffer, which the host shows as a head-locked overlay (hard cut after).
+	if (vc_render_mode() != 1 || vcStereoSplashFade())
 #endif
 	DoFade();
 	tbEndTimer("DoFade");
