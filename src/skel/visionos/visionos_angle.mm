@@ -23,6 +23,8 @@
 #include <time.h>     // clock_gettime for the wait deadline
 #include <errno.h>    // ETIMEDOUT
 #include <mach/mach_time.h> // mach_absolute_time for the rate-window measurement
+#include <mach/mach.h>      // task_info / phys_footprint (memory probe)
+#include <os/proc.h>        // os_proc_available_memory (headroom before jetsam)
 
 #if __has_feature(objc_arc)
   #define VC_OBJ_TO_VOID(o) ((__bridge void *)(o))
@@ -366,7 +368,6 @@ typedef struct {
 	VCBufState     state;
 	uint64_t       waitValue;  // shared-event value to wait for (0 = no wait)
 	uint64_t       poseSetTime; // mach time the head pose of THIS slice was pushed (latency probe)
-	uint64_t       publishSeq; // global publish number of the frame in this buffer (ordering probe)
 } VCBuffer;
 
 static VCBuffer g_buf[VC_NUM_BUFFERS];
@@ -553,7 +554,10 @@ vcrt_create(int width, int height)
 	// starvation AND the 145 Hz free-run beat, without a phase-lock. Cinema keeps
 	// wait + 2 buffers + no cap (half the GPU work; camera isn't head-locked there).
 	bool stereo = (vc_render_mode() == 1);
-	if (stereo) { g_numBuffers = 4; g_recycleOlderReady = true; g_frameCapHz = -1; }
+	// 3 buffers (was 4): the 4th was against the 145-vs-90 beat, which the phase/cap work
+	// removed; 3 keeps enough run-ahead for the newest-recycle. At high VC_RES each buffer
+	// is large (slice array + HUD), so a buffer saved is ~85 MB. VC_NUM_BUFFERS overrides.
+	if (stereo) { g_numBuffers = 3; g_recycleOlderReady = true; g_frameCapHz = -1; }
 
 	// Buffer count (env VC_NUM_BUFFERS, clamped to the array capacity).
 	const char *nb = getenv("VC_NUM_BUFFERS");
@@ -859,7 +863,6 @@ vcrt_publish_frame(void)
 	g_readyIndex = back;
 	g_haveBack = false;                        // reservation consumed
 	uint64_t n = ++g_frameCount;
-	g_buf[back].publishSeq = n;                // ordering probe: which frame this buffer holds
 	pthread_mutex_unlock(&g_bufMutex);
 
 	// First four publishes individually so the index rotation 0,1,0,1 is
@@ -872,9 +875,30 @@ vcrt_publish_frame(void)
 
 	// Stereo diagnostic: read back the buffer we just published (throttled) so we
 	// see whether the eye passes actually wrote content into what the compositor
-	// will acquire.
-	if (vc_render_mode() == 1 && vc_stereo_ready())
+	// will acquire. Gated behind VC_PERF_LOG: it allocates two render-target-sized
+	// staging textures per call, and with no draining autorelease pool on the game
+	// thread that was the render-target-sized ~2*W*H*4 B/s memory growth to jetsam.
+	if (vc_perf_log() && vc_render_mode() == 1 && vc_stereo_ready())
 		vcrt_stereo_publish_probe(back);
+}
+
+// Memory probe: phys_footprint = what this process currently uses; os_proc_available_memory
+// = headroom left before jetsam kills us ("Terminated due to memory issue"). Throttled 2 s.
+static void vc_log_memory(void)
+{
+	static double last = 0.0; double now = vc_now_seconds();
+	if (now - last < 2.0) return; last = now;
+	uint64_t foot = 0;
+	task_vm_info_data_t info; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+	if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &cnt) == KERN_SUCCESS)
+		foot = info.phys_footprint;
+	size_t avail = os_proc_available_memory();
+	// Split the growth: currentAllocatedSize = the ANGLE Metal device's live texture/buffer
+	// bytes. If THIS climbs with footprint -> a GPU resource leak (textures/FBOs/EGLImages);
+	// if it stays flat while footprint climbs -> a CPU/EGL-side leak (sync listeners etc.).
+	unsigned long long metalMB = g_mtlDevice ? (unsigned long long)(g_mtlDevice.currentAllocatedSize / 1000000u) : 0;
+	VCLOG(@"[vc-mem] footprint=%llu MB  metalAlloc=%llu MB  available-before-jetsam=%zu MB",
+	      (unsigned long long)(foot / 1000000u), metalMB, avail / 1000000u);
 }
 
 // --- C seam consumed by the compositor (next step) -------------------------
@@ -882,6 +906,7 @@ extern "C" bool
 vc_acquire_ready_frame(vc_ready_frame_t *out)
 {
 	if (!out) return false;
+	vc_log_memory();
 
 	// Measure the DISPLAY RATE from the acquire-call frequency: the compositor calls
 	// this once per display frame, so its period is the refresh period. Feeds the
@@ -958,35 +983,7 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	void    *outTex = out->texture;
 	uint64_t outWait = out->wait_value;
 	uint64_t poseSetT = g_buf[idx].poseSetTime;
-	uint64_t acqSeq   = g_buf[idx].publishSeq;   // ordering probe (logged after unlock)
 	pthread_mutex_unlock(&g_bufMutex);
-
-	// Ordering/overwrite probe: the compositor must see STRICTLY INCREASING publishSeq.
-	// A REGRESSION (older seq after a newer one) = ordering bug -> a frame "from another
-	// moment". A REPEAT (same seq on a successful acquire) = the same frame handed twice.
-	// Monotonic & no repeats here WHILE the wrong-frame flicker persists = overwrite-
-	// during-display (the fence fires at glFlush, before the GPU write truly completes).
-	if (vc_perf_log() && stereo) {
-		static uint64_t sLastSeq = 0, sRegress = 0, sRepeat = 0, sAcq = 0;
-		static double lastSeqLog = 0.0;
-		sAcq++;
-		if (acqSeq < sLastSeq) {
-			sRegress++;
-			VCLOG(@"[vc-acq-seq] REGRESSION: seq %llu after %llu (idx=%d) -- OLDER frame handed",
-			      (unsigned long long)acqSeq, (unsigned long long)sLastSeq, idx);
-		} else if (acqSeq == sLastSeq) {
-			sRepeat++;
-		}
-		sLastSeq = acqSeq;
-		double nowSeqS = vc_now_seconds();
-		if (lastSeqLog == 0.0) lastSeqLog = nowSeqS;
-		if (nowSeqS - lastSeqLog >= 2.0) {
-			lastSeqLog = nowSeqS;
-			VCLOG(@"[vc-acq-seq] last=%llu  regress=%llu repeat=%llu / %llu acquires",
-			      (unsigned long long)acqSeq, (unsigned long long)sRegress,
-			      (unsigned long long)sRepeat, (unsigned long long)sAcq);
-		}
-	}
 
 	// Latency probe: full push -> acquire (~display) age of THIS slice's head pose.
 	// Push->consume is measured on the game side ([vc-pose-age]); this adds the
@@ -1373,7 +1370,7 @@ vc_stereo_readback_log(void)
 	                        { g_rtWidth/2, g_rtHeight/4 } };
 	uint8_t px[2][3][4];
 	memset(px, 0, sizeof(px));
-	for (int s = 0; s < 2; s++) {
+	for (int s = 0; s < 2; s++) @autoreleasepool {
 		id<MTLTexture> staging = [g_mtlDevice newTextureWithDescriptor:sd];
 		id<MTLCommandBuffer> cb = [g_cmdQueue commandBuffer];
 		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -1422,7 +1419,9 @@ vcrt_stereo_publish_probe(int idx)
 	sd.storageMode = MTLStorageModeShared;
 
 	uint8_t px[2][4] = {{0,0,0,0},{0,0,0,0}};
-	for (int s = 0; s < 2; s++) {
+	// Per-iteration pool: the command buffer is autoreleased and retains its
+	// staging texture; without a draining pool on the game thread they accumulate.
+	for (int s = 0; s < 2; s++) @autoreleasepool {
 		id<MTLTexture> staging = [g_mtlDevice newTextureWithDescriptor:sd];
 		id<MTLCommandBuffer> cb = [g_cmdQueue commandBuffer];
 		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];

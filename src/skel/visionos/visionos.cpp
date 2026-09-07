@@ -54,13 +54,43 @@
 #define VISIONOS_SCREEN_WIDTH  1920
 #define VISIONOS_SCREEN_HEIGHT 1080
 
+// Render resolution PER EYE, runtime-selectable so it can be swept for the quality/cost
+// tradeoff (and M2 vs M5) without a rebuild. Drives the eye-slice + cinema texture size
+// (vcrt_create), the GL viewport (vc_screen_size), reVC's RsGlobal and the camera. The
+// stereo WORLD projection is the compositor's per-eye computeProjection (independent of
+// this), so raising it only adds pixel density -- no world distortion; but the 2D/HUD/menu
+// layout IS in these screen coords, so a non-16:9 step repositions the HUD. Native drawable
+// is 2048x1984 (~1:1). VC_RES=0..3 steps, or explicit VC_RES_W / VC_RES_H.
+static int g_vcScrW = 0, g_vcScrH = 0;
+static void vcScreenInit(void)
+{
+	if (g_vcScrW) return;
+	int w = VISIONOS_SCREEN_WIDTH, h = VISIONOS_SCREEN_HEIGHT;
+	const char *rw = getenv("VC_RES_W"), *rh = getenv("VC_RES_H");
+	if (rw && rh && atoi(rw) > 0 && atoi(rh) > 0) { w = atoi(rw); h = atoi(rh); }
+	else switch (getenv("VC_RES") ? atoi(getenv("VC_RES")) : 0) {
+		case 1:  w = 1984; h = 1344; break;   // ~1.48:1
+		case 2:  w = 2016; h = 1664; break;   // ~1.21:1
+		case 3:  w = 2048; h = 1984; break;   // native drawable, ~1.03:1
+		case 4:  w = 2720; h = 2624; break;   // = the drawable texture at maxRenderQuality=1.0
+		                                      //   (measured 2720x2624) -> 1:1 mapping in the centre,
+		                                      //   no upscale of the slice. 7.14 MP/eye (~3.4x step 0).
+		default: w = 1920; h = 1080; break;   // 16:9 (current)
+	}
+	if (w < 640) w = 640;  if (w > 4096) w = 4096;
+	if (h < 480) h = 480;  if (h > 4096) h = 4096;
+	g_vcScrW = w; g_vcScrH = h;
+	printf("[vc-res] render resolution per eye = %dx%d\n", w, h);
+}
+static int vcScreenW(void) { vcScreenInit(); return g_vcScrW; }
+static int vcScreenH(void) { vcScreenInit(); return g_vcScrH; }
+
 // Single source for the render-target size, queried by librw (gl3device) over
-// the C seam -- same pattern as vc_external_framebuffer(). No duplicated
-// constant, linker-checked; when the size becomes dynamic only this file changes.
+// the C seam -- same pattern as vc_external_framebuffer().
 extern "C" void vc_screen_size(int *w, int *h)
 {
-	if (w) *w = VISIONOS_SCREEN_WIDTH;
-	if (h) *h = VISIONOS_SCREEN_HEIGHT;
+	if (w) *w = vcScreenW();
+	if (h) *h = vcScreenH();
 }
 
 // VC_DOUBLE_RENDER cost probe (read from main.cpp's RenderScene hook):
@@ -742,10 +772,10 @@ psSelectDevice()
 	// TODO(visionos): echtes Device/Subsystem ueber ANGLE waehlen.
 	// Vorerst die feste Drawable-Aufloesung der Vision Pro melden, damit
 	// SCREEN_WIDTH/HEIGHT & Menue-Layout sinnvolle Werte haben.
-	RsGlobal.maximumWidth  = VISIONOS_SCREEN_WIDTH;
-	RsGlobal.maximumHeight = VISIONOS_SCREEN_HEIGHT;
-	RsGlobal.width         = VISIONOS_SCREEN_WIDTH;
-	RsGlobal.height        = VISIONOS_SCREEN_HEIGHT;
+	RsGlobal.maximumWidth  = vcScreenW();
+	RsGlobal.maximumHeight = vcScreenH();
+	RsGlobal.width         = vcScreenW();
+	RsGlobal.height        = vcScreenH();
 
 	PsGlobal.fullScreen = TRUE;
 	return TRUE;
@@ -994,7 +1024,7 @@ run_game_loop(void)
 	// FBO). Must happen before any rendering and before Initialise3D so the
 	// external-framebuffer redirect is armed when the first camera pass runs.
 	// TODO(visionos): resolution hardcoded; later from the CompositorServices drawable.
-	if (!vcrt_create(VISIONOS_SCREEN_WIDTH, VISIONOS_SCREEN_HEIGHT)) {
+	if (!vcrt_create(vcScreenW(), vcScreenH())) {
 		printf("[vc-loop] FAIL: could not create render target\n");
 		return;
 	}
@@ -1040,8 +1070,8 @@ run_game_loop(void)
 	// which creates Scene.camera). The param must point to a rw::EngineOpenParams
 	// whose .window carries ANGLE's eglGetProcAddress (librw loads glad from it).
 	static rw::EngineOpenParams openParams;
-	openParams.width       = VISIONOS_SCREEN_WIDTH;
-	openParams.height      = VISIONOS_SCREEN_HEIGHT;
+	openParams.width       = vcScreenW();
+	openParams.height      = vcScreenH();
 	openParams.windowtitle = "reVC";
 	openParams.window      = vcgl_get_proc_address();
 	printf("[vc-loop] rsRWINITIALIZE (Initialise3D: RwEngineOpen/Start + InitialiseRenderWare) ...\n");
@@ -1056,10 +1086,10 @@ run_game_loop(void)
 	// crashes. // TODO(visionos): rect from the drawable later.
 	RwRect camRect;
 	camRect.x = 0; camRect.y = 0;
-	camRect.w = VISIONOS_SCREEN_WIDTH;
-	camRect.h = VISIONOS_SCREEN_HEIGHT;
+	camRect.w = vcScreenW();
+	camRect.h = vcScreenH();
 	RsEventHandler(rsCAMERASIZE, &camRect);
-	printf("[vc-loop] rsCAMERASIZE %dx%d done\n", VISIONOS_SCREEN_WIDTH, VISIONOS_SCREEN_HEIGHT);
+	printf("[vc-loop] rsCAMERASIZE %dx%d done\n", vcScreenW(), vcScreenH());
 
 	printf("[vc-loop] game thread started\n");
 
