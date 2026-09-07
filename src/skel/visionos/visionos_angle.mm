@@ -1332,12 +1332,146 @@ vcrt_stereo_ensure(void)
 	return true;
 }
 
+// ===========================================================================
+// MSAA (VC_MSAA=2/4/8, default 0=off). The eye passes render into ONE shared
+// multisample FBO (colour + depth+stencil multisample renderbuffers at the slice
+// size) and are RESOLVED via glBlitFramebuffer into the per-slice single-sample
+// EGLImage FBO the compositor samples. Passes are sequential on this GL thread, so
+// we resolve the PREVIOUS eye at the start of the next eye's binding, and the LAST
+// eye from vc_stereo_restore_main. Any failure is LOUD (status name + glGetError,
+// logged once) -- ANGLE-on-Metal has silently failed on EGLImage combinations
+// before, so we never assume the blit worked; on failure we fall back to 1x but
+// SAY SO in the log.
+// ===========================================================================
+typedef void (*PFN_glGenRenderbuffers)(GLsizeiVC, GLuintVC *);
+typedef void (*PFN_glBindRenderbuffer)(GLenumVC, GLuintVC);
+typedef void (*PFN_glRenderbufferStorageMultisample)(GLenumVC, GLsizeiVC, GLenumVC, GLsizeiVC, GLsizeiVC);
+typedef void (*PFN_glBlitFramebuffer)(GLintVC, GLintVC, GLintVC, GLintVC, GLintVC, GLintVC, GLintVC, GLintVC, GLenumVC, GLenumVC);
+
+static int      g_msaaSamples  = -1;   // -1 = unread; 0 = off; 2/4/8 = on
+static GLuintVC g_msaaFbo      = 0;
+static GLuintVC g_msaaColorRbo = 0;
+static GLuintVC g_msaaDepthRbo = 0;
+static bool     g_msaaReady    = false;
+static bool     g_msaaFailed   = false;
+static int      g_msaaPending  = -1;    // eye whose content sits in g_msaaFbo awaiting resolve
+static PFN_glGenRenderbuffers               p_msGenRenderbuffers  = NULL;
+static PFN_glBindRenderbuffer               p_msBindRenderbuffer  = NULL;
+static PFN_glRenderbufferStorageMultisample p_msRenderbufferStorageMultisample = NULL;
+static PFN_glBlitFramebuffer                p_msBlitFramebuffer   = NULL;
+
+extern "C" void vc_stereo_msaa_resolve_pending(void);
+
+static int
+vcMsaaSamples(void)
+{
+	if (g_msaaSamples < 0) {
+		int s = 0;
+		const char *e = getenv("VC_MSAA");
+		if (e) s = atoi(e);
+		if (s != 2 && s != 4 && s != 8) s = 0;   // only 0/2/4/8 accepted
+		g_msaaSamples = s;
+	}
+	return g_msaaSamples;
+}
+
+// Lazily create the shared multisample FBO. Latches failure; logs LOUD once.
+static bool
+vcrt_msaa_ensure(void)
+{
+	if (g_msaaReady)  return true;
+	if (g_msaaFailed) return false;
+	int samples = vcMsaaSamples();
+	if (samples == 0) { g_msaaFailed = true; return false; }
+
+	if (!p_msGenRenderbuffers)  p_msGenRenderbuffers  = (PFN_glGenRenderbuffers)g_eglGetProcAddress("glGenRenderbuffers");
+	if (!p_msBindRenderbuffer)  p_msBindRenderbuffer  = (PFN_glBindRenderbuffer)g_eglGetProcAddress("glBindRenderbuffer");
+	if (!p_msRenderbufferStorageMultisample) p_msRenderbufferStorageMultisample = (PFN_glRenderbufferStorageMultisample)g_eglGetProcAddress("glRenderbufferStorageMultisample");
+	if (!p_msBlitFramebuffer)   p_msBlitFramebuffer   = (PFN_glBlitFramebuffer)g_eglGetProcAddress("glBlitFramebuffer");
+	if (!p_msGenRenderbuffers || !p_msBindRenderbuffer || !p_msRenderbufferStorageMultisample || !p_msBlitFramebuffer) {
+		g_msaaFailed = true;
+		VCLOG(@"[vc-msaa] ERROR: entry points unresolved (rbStorageMS=%p blit=%p) -- MSAA OFF, FALLING BACK TO 1x",
+		      (void*)p_msRenderbufferStorageMultisample, (void*)p_msBlitFramebuffer);
+		return false;
+	}
+
+	const int W = g_rtWidth, H = g_rtHeight;
+
+	p_msGenRenderbuffers(1, &g_msaaColorRbo);
+	p_msBindRenderbuffer(VC_GL_RENDERBUFFER, g_msaaColorRbo);
+	p_msRenderbufferStorageMultisample(VC_GL_RENDERBUFFER, samples, 0x8058 /* GL_RGBA8 */, W, H);
+	GLenumVC eColor = p_glGetError();
+
+	p_msGenRenderbuffers(1, &g_msaaDepthRbo);
+	p_msBindRenderbuffer(VC_GL_RENDERBUFFER, g_msaaDepthRbo);
+	p_msRenderbufferStorageMultisample(VC_GL_RENDERBUFFER, samples, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
+	GLenumVC eDepth = p_glGetError();
+
+	p_glGenFramebuffers(1, &g_msaaFbo);
+	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_msaaFbo);
+	p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0,        VC_GL_RENDERBUFFER, g_msaaColorRbo);
+	p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, g_msaaDepthRbo);
+	GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
+	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, 0);
+
+	if (status != VC_GL_FRAMEBUFFER_COMPLETE) {
+		g_msaaFailed = true;
+		VCLOG(@"[vc-msaa] ERROR: MSAA %dx FBO INCOMPLETE %dx%d status=%s (colourStorageErr=0x%x depthStorageErr=0x%x) -- MSAA OFF, FALLING BACK TO 1x",
+		      samples, W, H, vcrt_fbo_status_name(status), (unsigned)eColor, (unsigned)eDepth);
+		return false;
+	}
+
+	g_msaaReady = true;
+	VCLOG(@"[vc-msaa] MSAA %dx render target READY %dx%d (colour+depth multisample renderbuffers, resolve via glBlitFramebuffer; colourStorageErr=0x%x depthStorageErr=0x%x)",
+	      samples, W, H, (unsigned)eColor, (unsigned)eDepth);
+	return true;
+}
+
+// Resolve the pending eye's multisample content into its single-sample slice FBO.
+// Called between eyes (from vc_stereo_eye_fbo) and for the last eye (from
+// vc_stereo_restore_main). Leaves GL_FRAMEBUFFER bound to g_msaaFbo so librw's
+// currentFramebuffer cache stays coherent (the next eye binds g_msaaFbo; a cache
+// early-out is then safe because the real binding already matches).
+extern "C" void
+vc_stereo_msaa_resolve_pending(void)
+{
+	if (!g_msaaReady || g_msaaPending < 0) return;
+	int eye = g_msaaPending;
+	g_msaaPending = -1;
+
+	GLuintVC dstFbo = g_stereoBuf[g_currentBack].fbo[eye];
+	const int W = g_rtWidth, H = g_rtHeight;
+
+	p_glBindFramebuffer(0x8CA8 /* GL_READ_FRAMEBUFFER */, g_msaaFbo);
+	p_glBindFramebuffer(0x8CA9 /* GL_DRAW_FRAMEBUFFER */, dstFbo);
+	p_msBlitFramebuffer(0, 0, W, H, 0, 0, W, H, VC_GL_COLOR_BUFFER_BIT, VC_GL_NEAREST);
+	GLenumVC err = p_glGetError();
+	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_msaaFbo);   // leave both READ+DRAW = MSAA, cache-coherent
+
+	static bool loggedOnce = false;
+	if (!loggedOnce) {
+		loggedOnce = true;
+		VCLOG(@"[vc-msaa] first resolve: blit %dx%d MSAA->slice eye=%d dstFbo=%u glErr=0x%x %s",
+		      W, H, eye, dstFbo, (unsigned)err, err == 0 ? "OK" : "*** BLIT FAILED ***");
+	} else if (err != 0) {
+		VCLOG(@"[vc-msaa] ERROR: resolve blit eye=%d glErr=0x%x", eye, (unsigned)err);
+	}
+}
+
 // The eye FBO of the CURRENT back buffer (chosen by vcrt_begin_frame), so the two
-// eye passes render into the buffer that will be published this frame.
+// eye passes render into the buffer that will be published this frame. With
+// VC_MSAA>0 the eyes render into the shared multisample FBO instead, and the
+// previous eye is resolved into its slice here (its RenderScene has finished).
 extern "C" unsigned int
 vc_stereo_eye_fbo(int eye)
 {
-	return (g_stereoReady && (eye == 0 || eye == 1)) ? g_stereoBuf[g_currentBack].fbo[eye] : 0;
+	if (!(g_stereoReady && (eye == 0 || eye == 1))) return 0;
+	if (vcMsaaSamples() > 0 && vcrt_msaa_ensure()) {
+		vc_stereo_msaa_resolve_pending();   // resolve the previous eye before reusing the shared FBO
+		g_msaaPending = eye;
+		return g_msaaFbo;
+	}
+	return g_stereoBuf[g_currentBack].fbo[eye];
 }
 
 // One-time proof that the two eye passes wrote DIFFERENT content into the two
