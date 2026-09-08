@@ -68,14 +68,15 @@ static void vcScreenInit(void)
 	int w = VISIONOS_SCREEN_WIDTH, h = VISIONOS_SCREEN_HEIGHT;
 	const char *rw = getenv("VC_RES_W"), *rh = getenv("VC_RES_H");
 	if (rw && rh && atoi(rw) > 0 && atoi(rh) > 0) { w = atoi(rw); h = atoi(rh); }
-	else switch (getenv("VC_RES") ? atoi(getenv("VC_RES")) : 0) {
+	else switch (getenv("VC_RES") ? atoi(getenv("VC_RES")) : 4) {   // default 4 (native drawable, 1:1 centre)
+		case 0:  w = 1920; h = 1080; break;   // 16:9
 		case 1:  w = 1984; h = 1344; break;   // ~1.48:1
 		case 2:  w = 2016; h = 1664; break;   // ~1.21:1
 		case 3:  w = 2048; h = 1984; break;   // native drawable, ~1.03:1
 		case 4:  w = 2720; h = 2624; break;   // = the drawable texture at maxRenderQuality=1.0
 		                                      //   (measured 2720x2624) -> 1:1 mapping in the centre,
 		                                      //   no upscale of the slice. 7.14 MP/eye (~3.4x step 0).
-		default: w = 1920; h = 1080; break;   // 16:9 (current)
+		default: w = 2720; h = 2624; break;   // unknown value -> best (step 4)
 	}
 	if (w < 640) w = 640;  if (w > 4096) w = 4096;
 	if (h < 480) h = 480;  if (h > 4096) h = 4096;
@@ -125,9 +126,11 @@ extern "C" int vc_render_mode(void)
 {
 	if (g_renderMode < 0) {
 		const char *v = getenv("VC_RENDER_MODE");
-		int requested = (v && strcasecmp(v, "stereo") == 0) ? VC_MODE_STEREO : VC_MODE_CINEMA;
+		// Default is now STEREO; cinema only on explicit request (kept as the
+		// comparison/cutscene fallback). VC_RENDER_MODE=cinema -> cinema.
+		int requested = (v && strcasecmp(v, "cinema") == 0) ? VC_MODE_CINEMA : VC_MODE_STEREO;
 		if (requested == VC_MODE_STEREO) {
-			printf("[vc-mode] VC_RENDER_MODE = stereo (requested)\n");
+			printf("[vc-mode] VC_RENDER_MODE = stereo (default; set VC_RENDER_MODE=cinema for mono)\n");
 			// Phase 5.5: stereo now renders two eye passes into a 2D-array texture
 			// (proof via read-back; publish-naht + Swift are the next step). The
 			// cinema back buffer is still what gets published, so the display stays

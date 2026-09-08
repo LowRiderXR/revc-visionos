@@ -1366,10 +1366,10 @@ static int
 vcMsaaSamples(void)
 {
 	if (g_msaaSamples < 0) {
-		int s = 0;
+		int s = 2;   // default 2x (VC_MSAA=0 disables, 4/8 also accepted)
 		const char *e = getenv("VC_MSAA");
 		if (e) s = atoi(e);
-		if (s != 2 && s != 4 && s != 8) s = 0;   // only 0/2/4/8 accepted
+		if (s != 0 && s != 2 && s != 4 && s != 8) s = 2;   // clamp to 0/2/4/8
 		g_msaaSamples = s;
 	}
 	return g_msaaSamples;
