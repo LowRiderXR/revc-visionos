@@ -692,7 +692,7 @@ vcpad_log(const vc_gamepad_t &s)
 	}
 
 #define VCPAD_BTN(field, name) \
-	if (s.field != prev.field) printf("[vc-input] %s %s\n", name, s.field ? "DOWN" : "UP");
+	if (dbgAxes && s.field != prev.field) printf("[vc-input] %s %s\n", name, s.field ? "DOWN" : "UP");
 	VCPAD_BTN(south,         "Cross(A)")
 	VCPAD_BTN(east,          "Circle(B)")
 	VCPAD_BTN(west,          "Square(X)")

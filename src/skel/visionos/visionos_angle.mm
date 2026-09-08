@@ -871,7 +871,7 @@ vcrt_publish_frame(void)
 		VCLOG(@"[vc-pub] PUBLISH %llu: readyIndex=%d waitValue=%llu",
 		      (unsigned long long)n, g_readyIndex, (unsigned long long)value);
 
-	if (n == 2) vcrt_readback_log();
+	if (n == 2 && vc_perf_log()) vcrt_readback_log();   // one-time stereo self-test (GL/Metal cost) -- diagnostic only
 
 	// Stereo diagnostic: read back the buffer we just published (throttled) so we
 	// see whether the eye passes actually wrote content into what the compositor
@@ -886,6 +886,7 @@ vcrt_publish_frame(void)
 // = headroom left before jetsam kills us ("Terminated due to memory issue"). Throttled 2 s.
 static void vc_log_memory(void)
 {
+	if (!vc_perf_log()) return;   // diagnostic; off by default (leak is fixed, flip VC_PERF_LOG to watch)
 	static double last = 0.0; double now = vc_now_seconds();
 	if (now - last < 2.0) return; last = now;
 	uint64_t foot = 0;
