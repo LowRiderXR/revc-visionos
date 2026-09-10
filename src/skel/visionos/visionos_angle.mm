@@ -1404,7 +1404,7 @@ static bool
 vcFoveateOn(void)
 {
 	static int v = -1;
-	if (v < 0) { const char *e = getenv("VC_FOVEATE"); v = (e && e[0] == '1') ? 1 : 0; }
+	if (v < 0) { const char *e = getenv("VC_FOVEATE"); v = (e && e[0] == '0') ? 0 : 1; }  // default ON; VC_FOVEATE=0 disables
 	return v != 0;
 }
 
