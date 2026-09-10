@@ -1388,7 +1388,10 @@ extern "C" void *vc_stereo_array_texture(int idx)
 // quad still samples it with plain UV -> the IMAGE looks distorted until the unwarp grid
 // (Phase 6). The eye-pass GPU time (VC_EYE_GPU) is already valid -> measure the raw win.
 typedef void (*PFN_ANGLESetRateMap)(void *, void *);
-static PFN_ANGLESetRateMap        p_ANGLESetRateMap = NULL;
+typedef void (*PFN_ANGLESetRateMapForSize)(unsigned int, unsigned int, unsigned int, void *);
+static PFN_ANGLESetRateMap         p_ANGLESetRateMap = NULL;
+static PFN_ANGLESetRateMapForSize  p_ANGLESetRateMapForSize = NULL;
+static int vcMsaaSamples(void);   // forward: foveation registration depends on the MSAA path
 static id<MTLRasterizationRateMap> g_foveMap = nil;
 
 // Sampled optical curve pushed from Swift (vc_set_foveation_curve): the compositor's own
@@ -1483,12 +1486,28 @@ vcrt_foveation_apply(int W, int H)
 		p_ANGLESetRateMap = (PFN_ANGLESetRateMap)dlsym(RTLD_DEFAULT, "ANGLEMetalSetRasterizationRateMap");
 		if (!p_ANGLESetRateMap) { VCLOG(@"[vc-fove] ANGLEMetalSetRasterizationRateMap symbol missing -> unpatched ANGLE?"); return; }
 	}
-	int n = 0;
-	for (int i = 0; i < g_numBuffers; i++) {
-		id<MTLTexture> t = g_stereoBuf[i].arrayTex;
-		if (t) { p_ANGLESetRateMap(VC_OBJ_TO_VOID(t), VC_OBJ_TO_VOID(g_foveMap)); n++; }
+	if (!p_ANGLESetRateMapForSize)
+		p_ANGLESetRateMapForSize = (PFN_ANGLESetRateMapForSize)dlsym(RTLD_DEFAULT, "ANGLEMetalSetRasterizationRateMapForSize");
+
+	int samples = vcMsaaSamples();
+	if (samples > 0 && p_ANGLESetRateMapForSize) {
+		// MSAA path: the eye passes render into the shared multisample target (W x H, N
+		// samples), which ANGLE owns -> register the map BY SIZE so it attaches to that
+		// pass. The position-preserving resolve blit then carries the warped layout into
+		// the slice. Do NOT register the slice by identity here: the resolve writes into
+		// the slice and must stay a clean 1:1 copy (the by-size registry only matches the
+		// N-sample target, so the 1-sample slice/HUD are untouched either way).
+		p_ANGLESetRateMapForSize((unsigned)W, (unsigned)H, (unsigned)samples, VC_OBJ_TO_VOID(g_foveMap));
+		VCLOG(@"[vc-fove] rate map bound BY SIZE to the %dx%d %dx-MSAA target (resolve carries it to the slices)", W, H, samples);
+	} else {
+		// No MSAA: the eye passes render straight into the slices we own -> by identity.
+		int n = 0;
+		for (int i = 0; i < g_numBuffers; i++) {
+			id<MTLTexture> t = g_stereoBuf[i].arrayTex;
+			if (t) { p_ANGLESetRateMap(VC_OBJ_TO_VOID(t), VC_OBJ_TO_VOID(g_foveMap)); n++; }
+		}
+		VCLOG(@"[vc-fove] rate map bound BY IDENTITY to %d stereo slices (world eye passes only)", n);
 	}
-	VCLOG(@"[vc-fove] rate map bound BY IDENTITY to %d stereo slices (world eye passes only)", n);
 }
 
 // Game-thread poll: rebuild+register when Swift has pushed a new optical curve.
@@ -1656,15 +1675,10 @@ extern "C" void vc_stereo_msaa_resolve_pending(void);
 static int
 vcMsaaSamples(void)
 {
-	// Foveation and our MSAA path are mutually exclusive: the eye passes must render
-	// directly into the slice we own (by-identity rate map), not the ANGLE-owned
-	// multisample renderbuffer whose glBlitFramebuffer resolve is not rate-map aware.
-	if (vcFoveateOn()) {
-		static bool vcFoveMsaaLogged = false;
-		if (!vcFoveMsaaLogged) { vcFoveMsaaLogged = true;
-			VCLOG(@"[vc-fove] MSAA forced OFF in foveated path (rate map + MSAA blit-resolve incompatible) -- eye-pass gain here is foveation, NOT MSAA-off"); }
-		return 0;
-	}
+	// MSAA and foveation now COEXIST: with foveation on, the eye passes render into the
+	// shared multisample target (registered by SIZE so ANGLE attaches the rate map there);
+	// the position-preserving glBlitFramebuffer resolve carries the warped layout into the
+	// slice, which the display unwarp then reads. So no MSAA override here.
 	if (g_msaaSamples < 0) {
 		int s = 2;   // default 2x (VC_MSAA=0 disables, 4/8 also accepted)
 		const char *e = getenv("VC_MSAA");
