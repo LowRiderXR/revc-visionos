@@ -1364,6 +1364,109 @@ extern "C" void *vc_stereo_array_texture(int idx)
 	return VC_OBJ_TO_VOID(g_stereoBuf[idx].arrayTex);
 }
 
+// ---- Fixed foveation (VC_FOVEATE=1, default OFF) --------------------------
+// Render the eye passes at a variable rate: sharp centre (rate 1.0), coarse edges
+// (VC_FOVEATE_EDGE, default 0.35) over VC_FOVEATE_ZONES (default 16) zones/axis. A
+// centred, PARAMETRIC curve (not the compositor's gaze-driven map): the slice pipeline
+// is decoupled/buffered, so a gaze-following map would sit stale; and parametric lets
+// us tune the reduction to the frame budget. We build our own MTLRasterizationRateMap at
+// the SLICE size and bind it BY IDENTITY to each stereo array texture via the patched
+// ANGLE registry -- so ANGLE foveates ONLY the world eye passes, never the HUD/cinema.
+//
+// MSAA is forced OFF under foveation (see vcMsaaSamples): the eye passes then render
+// DIRECTLY into the array slice we own (by-identity works), not an ANGLE-owned
+// multisample renderbuffer whose glBlitFramebuffer resolve is not rate-map aware.
+//
+// Phase 4a: the slice is left in the rate map's WARPED physical layout and the display
+// quad still samples it with plain UV -> the IMAGE looks distorted until the unwarp grid
+// (Phase 6). The eye-pass GPU time (VC_EYE_GPU) is already valid -> measure the raw win.
+typedef void (*PFN_ANGLESetRateMap)(void *, void *);
+static PFN_ANGLESetRateMap        p_ANGLESetRateMap = NULL;
+static id<MTLRasterizationRateMap> g_foveMap = nil;
+
+static bool
+vcFoveateOn(void)
+{
+	static int v = -1;
+	if (v < 0) { const char *e = getenv("VC_FOVEATE"); v = (e && e[0] == '1') ? 1 : 0; }
+	return v != 0;
+}
+
+static id<MTLRasterizationRateMap>
+vcrt_build_fove_map(int W, int H)
+{
+	int zones = 16; { const char *e = getenv("VC_FOVEATE_ZONES"); if (e) { int z = atoi(e); if (z >= 2 && z <= 64) zones = z; } }
+	float edge = 0.2f; { const char *e = getenv("VC_FOVEATE_EDGE"); if (e) { float f = (float)atof(e); if (f > 0.05f && f <= 1.0f) edge = f; } }  // 0.2: edge rate = 1/5 res; ~36% of fragments
+	if (![g_mtlDevice supportsRasterizationRateMapWithLayerCount:1]) {
+		VCLOG(@"[vc-fove] device has no rasterization rate map support -> disabled");
+		return nil;
+	}
+	float hq[64], vq[64];
+	for (int i = 0; i < zones; i++) {
+		float f = ((float)i + 0.5f) / (float)zones;                      // 0..1 across the axis
+		float w = 0.5f * (1.0f + cosf((float)M_PI * (2.0f * f - 1.0f)));  // 1 at centre, 0 at edges
+		float r = edge + (1.0f - edge) * w;
+		hq[i] = vq[i] = (r < 0.01f) ? 0.01f : r;
+	}
+	// Any bad ObjC selector / Metal exception here must DISABLE foveation, not abort the
+	// whole process. Step logs so the last one printed pinpoints the failing call.
+	id<MTLRasterizationRateMap> map = nil;
+	@try {
+		VCLOG(@"[vc-fove] build step 1: layer descriptor (zones=%d)", zones);
+		MTLRasterizationRateLayerDescriptor *layer =
+			[[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(zones, zones, 1)
+			                                                     horizontal:hq
+			                                                       vertical:vq];
+		VCLOG(@"[vc-fove] build step 2: map descriptor (screen=%dx%d)", W, H);
+		MTLRasterizationRateMapDescriptor *desc = [[MTLRasterizationRateMapDescriptor alloc] init];
+		desc.screenSize = MTLSizeMake(W, H, 0);
+		[desc setLayer:layer atIndex:0];
+		VCLOG(@"[vc-fove] build step 3: newRasterizationRateMapWithDescriptor");
+		map = [g_mtlDevice newRasterizationRateMapWithDescriptor:desc];
+	} @catch (NSException *ex) {
+		VCLOG(@"[vc-fove] EXCEPTION building rate map: %@ (%@) -> foveation DISABLED",
+		      ex.name, ex.reason);
+		return nil;
+	}
+	if (map) {
+		MTLSize ph = [map physicalSizeForLayer:0];
+		VCLOG(@"[vc-fove] rate map built: screen=%dx%d physical=%dx%d zones=%d edge=%.2f (~%.0f%% of fragments)",
+		      W, H, (int)ph.width, (int)ph.height, zones, edge,
+		      100.0 * (double)ph.width * (double)ph.height / ((double)W * (double)H));
+	} else {
+		VCLOG(@"[vc-fove] newRasterizationRateMapWithDescriptor returned nil -> foveation off");
+	}
+	return map;
+}
+
+// Build once, then bind by identity to every stereo array texture. Called at the end of
+// vcrt_stereo_ensure (textures exist). No-op unless VC_FOVEATE=1.
+static void
+vcrt_foveation_apply(int W, int H)
+{
+	if (!vcFoveateOn()) return;
+	VCLOG(@"[vc-fove] apply: entering (VC_FOVEATE=1, %dx%d)", W, H);
+	if (g_foveMap == nil) g_foveMap = vcrt_build_fove_map(W, H);
+	if (g_foveMap == nil) return;
+	if (!p_ANGLESetRateMap) {
+		p_ANGLESetRateMap = (PFN_ANGLESetRateMap)dlsym(RTLD_DEFAULT, "ANGLEMetalSetRasterizationRateMap");
+		if (!p_ANGLESetRateMap) { VCLOG(@"[vc-fove] ANGLEMetalSetRasterizationRateMap symbol missing -> unpatched ANGLE?"); return; }
+	}
+	int n = 0;
+	for (int i = 0; i < g_numBuffers; i++) {
+		id<MTLTexture> t = g_stereoBuf[i].arrayTex;
+		if (t) { p_ANGLESetRateMap(VC_OBJ_TO_VOID(t), VC_OBJ_TO_VOID(g_foveMap)); n++; }
+	}
+	VCLOG(@"[vc-fove] rate map bound BY IDENTITY to %d stereo slices (world eye passes only)", n);
+}
+
+// The rate map the slices were rendered with (for the display quad's unwarp), or NULL.
+extern "C" void *
+vc_foveation_rate_map(void)
+{
+	return (vcFoveateOn() && g_foveMap != nil) ? VC_OBJ_TO_VOID(g_foveMap) : NULL;
+}
+
 // Lazily create BOTH stereo back buffers. Called from the game thread (GL context
 // current) on the first eye pass, so g_rtWidth/Height and the GL entry points are
 // resolved and g_buf already exists. Idempotent; latches failure, logs once.
@@ -1435,6 +1538,7 @@ vcrt_stereo_ensure(void)
 	g_stereoReady = true;
 	VCLOG(@"[vc-stereo] array render target ready (%d buffers x 2 slices, %dx%d, dedicated depth)",
 	      g_numBuffers, W, H);
+	vcrt_foveation_apply(W, H);   // bind the rate map to the slices when VC_FOVEATE=1
 	// Render-target VRAM per resolution step, and the bytes WRITTEN per frame (both eye
 	// slices; that is the fragment/bandwidth cost the eye passes pay). Answers area-vs-
 	// bandwidth: eyes-ms should track slice bytes-written if bandwidth-bound, pixels if
@@ -1490,6 +1594,15 @@ extern "C" void vc_stereo_msaa_resolve_pending(void);
 static int
 vcMsaaSamples(void)
 {
+	// Foveation and our MSAA path are mutually exclusive: the eye passes must render
+	// directly into the slice we own (by-identity rate map), not the ANGLE-owned
+	// multisample renderbuffer whose glBlitFramebuffer resolve is not rate-map aware.
+	if (vcFoveateOn()) {
+		static bool vcFoveMsaaLogged = false;
+		if (!vcFoveMsaaLogged) { vcFoveMsaaLogged = true;
+			VCLOG(@"[vc-fove] MSAA forced OFF in foveated path (rate map + MSAA blit-resolve incompatible) -- eye-pass gain here is foveation, NOT MSAA-off"); }
+		return 0;
+	}
 	if (g_msaaSamples < 0) {
 		int s = 2;   // default 2x (VC_MSAA=0 disables, 4/8 also accepted)
 		const char *e = getenv("VC_MSAA");
