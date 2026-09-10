@@ -685,6 +685,107 @@ vcrt_log_rate(void)
 	lastLog = now; lastN = g_frameCount; lastW = g_waitCount; lastD = g_discardCount; lastR = g_recycleCount;
 }
 
+// ---- Eye-pass GPU timer (VC_EYE_GPU=1, default OFF) ------------------------
+// The scene's GL work (both eye passes into the slices, ~2720x2624 x2 + MSAA) is
+// submitted through ANGLE's own Metal command buffer, so we have no MTLCommandBuffer
+// handle to time it -- and `eyes` only measures CPU submit, never the GPU fragment
+// cost. ANGLE's Metal backend DOES implement GL_TIME_ELAPSED (QueryMtl), so we wrap
+// the frame's GL draws (begin_frame proceed -> publish_frame) in a time-elapsed query.
+// A small ring reads results a few frames later (async, no glFinish stall). This is
+// the pre-foveation baseline the foveation win is measured against.
+typedef unsigned long long GLuint64VC;
+typedef void (*PFN_glGenQueries)(GLsizeiVC, GLuintVC *);
+typedef void (*PFN_glBeginQuery)(GLenumVC, GLuintVC);
+typedef void (*PFN_glEndQuery)(GLenumVC);
+typedef void (*PFN_glGetQueryObjectuiv)(GLuintVC, GLenumVC, GLuintVC *);
+typedef void (*PFN_glGetQueryObjectui64v)(GLuintVC, GLenumVC, GLuint64VC *);
+static PFN_glGenQueries         p_glGenQueries = NULL;
+static PFN_glBeginQuery         p_glBeginQuery = NULL;
+static PFN_glEndQuery           p_glEndQuery = NULL;
+static PFN_glGetQueryObjectuiv  p_glGetQueryObjectuiv = NULL;
+static PFN_glGetQueryObjectui64v p_glGetQueryObjectui64v = NULL;
+enum { VC_GL_TIME_ELAPSED = 0x88BF, VC_GL_QUERY_RESULT = 0x8866, VC_GL_QUERY_RESULT_AVAILABLE = 0x8867 };
+#define VC_TQ_RING 4
+static GLuintVC g_tq[VC_TQ_RING];
+static bool     g_tqPending[VC_TQ_RING] = { false };
+static int      g_tqWrite = 0, g_tqRead = 0, g_tqActiveSlot = -1;
+static bool     g_tqOpen = false;
+static bool     g_eyeGpuOn = false, g_eyeGpuReady = false, g_eyeGpuChecked = false;
+static double   g_egSum = 0, g_egMin = 0, g_egMax = 0, g_egLast = 0, g_egLogT = 0;
+static int      g_egN = 0;
+
+static void
+vcrt_eyegpu_ensure(void)
+{
+	if (g_eyeGpuChecked) return;
+	g_eyeGpuChecked = true;
+	const char *e = getenv("VC_EYE_GPU");
+	g_eyeGpuOn = (e && e[0] == '1');
+	if (!g_eyeGpuOn || !g_eglGetProcAddress) return;
+	p_glGenQueries          = (PFN_glGenQueries)g_eglGetProcAddress("glGenQueries");
+	p_glBeginQuery          = (PFN_glBeginQuery)g_eglGetProcAddress("glBeginQuery");
+	p_glEndQuery            = (PFN_glEndQuery)g_eglGetProcAddress("glEndQuery");
+	p_glGetQueryObjectuiv   = (PFN_glGetQueryObjectuiv)g_eglGetProcAddress("glGetQueryObjectuiv");
+	p_glGetQueryObjectui64v = (PFN_glGetQueryObjectui64v)g_eglGetProcAddress("glGetQueryObjectui64vEXT");
+	if (!p_glGetQueryObjectui64v)
+		p_glGetQueryObjectui64v = (PFN_glGetQueryObjectui64v)g_eglGetProcAddress("glGetQueryObjectui64v");
+	if (p_glGenQueries && p_glBeginQuery && p_glEndQuery && p_glGetQueryObjectuiv && p_glGetQueryObjectui64v) {
+		p_glGenQueries(VC_TQ_RING, g_tq);
+		g_eyeGpuReady = true;
+		VCLOG(@"[vc-eyegpu] GL_TIME_ELAPSED timer armed (%d-deep ring)", VC_TQ_RING);
+	} else {
+		VCLOG(@"[vc-eyegpu] timer-query entry points unavailable -> disabled");
+	}
+}
+
+static void
+vcrt_eyegpu_poll(void)
+{
+	if (!g_eyeGpuReady) return;
+	while (g_tqPending[g_tqRead]) {
+		GLuintVC avail = 0;
+		p_glGetQueryObjectuiv(g_tq[g_tqRead], VC_GL_QUERY_RESULT_AVAILABLE, &avail);
+		if (!avail) break;
+		GLuint64VC ns = 0;
+		p_glGetQueryObjectui64v(g_tq[g_tqRead], VC_GL_QUERY_RESULT, &ns);
+		g_tqPending[g_tqRead] = false;
+		g_tqRead = (g_tqRead + 1) % VC_TQ_RING;
+		double ms = (double)ns / 1.0e6;
+		g_egSum += ms; g_egN++; g_egLast = ms;
+		if (g_egN == 1 || ms < g_egMin) g_egMin = ms;
+		if (ms > g_egMax) g_egMax = ms;
+	}
+	double now = vc_now_seconds();
+	if (g_egN > 0 && now - g_egLogT >= 1.0) {
+		g_egLogT = now;
+		VCLOG(@"[vc-eyegpu] eye-pass GPU: avg=%.1f min=%.1f max=%.1f ms last=%.1f (n=%d)",
+		      g_egSum / g_egN, g_egMin, g_egMax, g_egLast, g_egN);
+		g_egSum = 0; g_egN = 0; g_egMin = 0; g_egMax = 0;
+	}
+}
+
+static void
+vcrt_eyegpu_close(void)  // end the open query, mark its slot for async readback
+{
+	if (!g_tqOpen) return;
+	p_glEndQuery(VC_GL_TIME_ELAPSED);
+	g_tqOpen = false;
+	g_tqPending[g_tqActiveSlot] = true;
+	g_tqWrite = (g_tqWrite + 1) % VC_TQ_RING;
+}
+
+static void
+vcrt_eyegpu_begin(void)  // called on the proceed path, before any of the frame's draws
+{
+	vcrt_eyegpu_ensure();
+	if (!g_eyeGpuReady) return;
+	if (g_tqOpen) vcrt_eyegpu_close();   // stale (a reserved frame never published): balance it
+	vcrt_eyegpu_poll();
+	if (g_tqPending[g_tqWrite]) return;  // ring saturated -> skip timing this frame
+	p_glBeginQuery(VC_GL_TIME_ELAPSED, g_tq[g_tqWrite]);
+	g_tqOpen = true; g_tqActiveSlot = g_tqWrite;
+}
+
 extern "C" bool
 vcrt_begin_frame(void)
 {
@@ -770,6 +871,7 @@ vcrt_begin_frame(void)
 			      (nowS - vcBeginT0) * 1000.0);
 		}
 	}
+	vcrt_eyegpu_begin();   // time this frame's GL (eye) passes (VC_EYE_GPU=1)
 	return true;
 }
 
@@ -826,6 +928,9 @@ vcrt_publish_frame(void)
 		return;
 	}
 	pthread_mutex_unlock(&g_bufMutex);
+
+	vcrt_eyegpu_close();   // end the eye-pass timer opened in vcrt_begin_frame
+	vcrt_eyegpu_poll();
 
 	// The frame's GL work is recorded into g_buf[back]'s FBO. Enqueue the GPU
 	// signal (or flush) BEFORE taking the lock -- EGL/GL work must not hold it.
@@ -1330,6 +1435,25 @@ vcrt_stereo_ensure(void)
 	g_stereoReady = true;
 	VCLOG(@"[vc-stereo] array render target ready (%d buffers x 2 slices, %dx%d, dedicated depth)",
 	      g_numBuffers, W, H);
+	// Render-target VRAM per resolution step, and the bytes WRITTEN per frame (both eye
+	// slices; that is the fragment/bandwidth cost the eye passes pay). Answers area-vs-
+	// bandwidth: eyes-ms should track slice bytes-written if bandwidth-bound, pixels if
+	// fragment-bound. RGBA8=4B/px colour, D24S8=4B/px depth (shared, written once/frame).
+	{
+		double mp        = (double)W * (double)H / 1.0e6;
+		uint64_t sliceBuf = (uint64_t)W * H * 4ull * 2ull;              // 2 slices RGBA8, per buffer
+		uint64_t sliceAll = sliceBuf * (uint64_t)g_numBuffers;         // x N buffers (resident)
+		uint64_t cinema   = (uint64_t)W * H * 4ull * (uint64_t)g_numBuffers; // HUD/cinema 2D tex x N
+		uint64_t depth    = (uint64_t)W * H * 4ull;                    // one shared D24S8 renderbuffer
+		uint64_t resident = sliceAll + cinema + depth;
+		uint64_t writtenPerFrame = (uint64_t)W * H * 4ull * 2ull       // 2 eye slice colours
+		                         + (uint64_t)W * H * 4ull;             // + shared depth
+		VCLOG(@"[vc-vram] %dx%d (%.2f MP/eye)  resident: slices=%llu MB cinema=%llu MB depth=%llu MB total=%llu MB  |  written/frame(2 slices+depth)=%llu MB",
+		      W, H, mp,
+		      (unsigned long long)(sliceAll / 1000000ull), (unsigned long long)(cinema / 1000000ull),
+		      (unsigned long long)(depth / 1000000ull),   (unsigned long long)(resident / 1000000ull),
+		      (unsigned long long)(writtenPerFrame / 1000000ull));
+	}
 	return true;
 }
 

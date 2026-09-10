@@ -69,13 +69,13 @@ static void vcScreenInit(void)
 	const char *rw = getenv("VC_RES_W"), *rh = getenv("VC_RES_H");
 	if (rw && rh && atoi(rw) > 0 && atoi(rh) > 0) { w = atoi(rw); h = atoi(rh); }
 	else switch (getenv("VC_RES") ? atoi(getenv("VC_RES")) : 4) {   // default 4 (native drawable, 1:1 centre)
-		case 0:  w = 1920; h = 1080; break;   // 16:9
-		case 1:  w = 1984; h = 1344; break;   // ~1.48:1
-		case 2:  w = 2016; h = 1664; break;   // ~1.21:1
-		case 3:  w = 2048; h = 1984; break;   // native drawable, ~1.03:1
-		case 4:  w = 2720; h = 2624; break;   // = the drawable texture at maxRenderQuality=1.0
-		                                      //   (measured 2720x2624) -> 1:1 mapping in the centre,
-		                                      //   no upscale of the slice. 7.14 MP/eye (~3.4x step 0).
+		// Ladder to plot the perf curve vs area (megapixels/eye) and bytes:
+		case 0:  w = 1920; h = 1080; break;   // 2.07 MP
+		case 1:  w = 2200; h = 2100; break;   // 4.62 MP
+		case 2:  w = 2450; h = 2350; break;   // 5.76 MP
+		case 3:  w = 2600; h = 2500; break;   // 6.50 MP
+		case 4:  w = 2720; h = 2624; break;   // 7.14 MP = the drawable texture at maxRenderQuality=1.0
+		                                      //   (measured 2720x2624) -> 1:1 in the centre, no upscale.
 		default: w = 2720; h = 2624; break;   // unknown value -> best (step 4)
 	}
 	if (w < 640) w = 640;  if (w > 4096) w = 4096;
@@ -261,38 +261,58 @@ extern "C" int  vc_fade_draw_only(void)       { return g_fadeDrawOnly; }
 
 extern "C" void vc_frame_mark(int id)
 {
-	if (id < 0 || id >= 8) return;
-	static uint64_t t[8] = {0};
+	if (id < 0 || id >= 10) return;
+	static uint64_t t[10] = {0};
 	t[id] = mach_absolute_time();
-	if (id == 0) g_fxAccum = 0;   // reset per frame; fx accrues across the two eye passes
+	// Thread CPU time (only advances while this thread actually RUNS). If a frame's
+	// wall time (mach_absolute_time) is huge but its CPU time is ~0, the thread was
+	// SUSPENDED (OS paused the app -- e.g. a system dialog / head-anchored-content
+	// throttle), not doing work. cpuWall gap = external stall, not a reVC/render bug.
+	static uint64_t cpu0 = 0;
+	if (id == 0) {
+		struct timespec cts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cts);
+		cpu0 = (uint64_t)cts.tv_sec * 1000000000ull + (uint64_t)cts.tv_nsec;
+		g_fxAccum = 0;                       // reset per frame; fx accrues across the two eye passes
+		for (int i = 1; i < 10; i++) t[i] = 0;  // marks 2/3/4 are set ONLY in the in-game block; zero
+		                                        // every frame so menu/splash/fade/loading frames (which
+		                                        // skip that block) are detected as INCOMPLETE below and
+		                                        // don't emit a bogus [vc-frame] (stale t[4] -> finish=seconds).
+	}
 	if (id != 5) return;
 	if (vc_render_mode() != 1) return;   // stereo only (cinema doesn't set marks 2/3)
-	// Warmup: on the first frame(s) some phase marks are still 0 (never set), so segment
-	// deltas t[b]-t[a] reference zero and print garbage (e.g. finish ~5 h). Skip the stats
-	// until every mark 0..7 has been set once; static t[] stays populated afterwards.
-	for (int i = 0; i <= 7; i++) if (t[i] == 0) return;
+	// Completeness gate (also covers warmup): marks are zeroed at id==0, so this frame
+	// must have set ALL of 0..7 to be a real in-game frame. Menu/splash/fade/loading frames
+	// skip marks 2/3/4 -> incomplete -> skip (no bogus segment deltas / finish=seconds).
+	for (int i = 0; i <= 9; i++) if (t[i] == 0) return;
 	static uint64_t sNum = 0, sDen = 0;
 	if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
 	#define VC_SEG_MS(a,b) ((double)(t[b] - t[a]) * (double)sNum / (double)sDen / 1.0e6)
 	double total = VC_SEG_MS(0,5);
 	// Worst frame this interval + which phase dominated it: a single 40 ms hitch is
 	// invisible in an average but very noticeable, so keep the peak, not just the mean.
-	double segMs[5]      = { VC_SEG_MS(0,1), VC_SEG_MS(1,2), VC_SEG_MS(2,3), VC_SEG_MS(3,4), VC_SEG_MS(4,5) };
-	const char *segNm[5] = { "setup", "eyes", "readback", "post-3d", "finish" };
-	static double maxTotal = 0.0, maxSeg = 0.0;
+	// finish (mark 4->5) split: menus (4->8 RenderMenus), afterfade (8->9 DoFade+
+	// Render2dStuffAfterFade), present (9->5 DoRWStuffEndOfFrame/ShowRaster/publish).
+	double segMs[7]      = { VC_SEG_MS(0,1), VC_SEG_MS(1,2), VC_SEG_MS(2,3), VC_SEG_MS(3,4),
+	                         VC_SEG_MS(4,8), VC_SEG_MS(8,9), VC_SEG_MS(9,5) };
+	const char *segNm[7] = { "setup", "eyes", "readback", "post-3d", "menus", "afterfade", "present" };
+	// CPU time actually spent this frame (see cpu0 above). Compare to total (wall).
+	uint64_t cpuNow; { struct timespec cts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cts);
+	                   cpuNow = (uint64_t)cts.tv_sec * 1000000000ull + (uint64_t)cts.tv_nsec; }
+	double cpuMs = (cpu0 && cpuNow >= cpu0) ? (double)(cpuNow - cpu0) / 1.0e6 : 0.0;
+	static double maxTotal = 0.0, maxSeg = 0.0, maxCpu = 0.0;
 	static const char *maxPhase = "-";
 	if (total > maxTotal) {
-		maxTotal = total; maxSeg = 0.0; maxPhase = "-";
-		for (int i = 0; i < 5; i++) if (segMs[i] > maxSeg) { maxSeg = segMs[i]; maxPhase = segNm[i]; }
+		maxTotal = total; maxSeg = 0.0; maxPhase = "-"; maxCpu = cpuMs;
+		for (int i = 0; i < 7; i++) if (segMs[i] > maxSeg) { maxSeg = segMs[i]; maxPhase = segNm[i]; }
 	}
 	static double lastLog = 0.0;
 	double nowS = (double)t[5] * (double)sNum / (double)sDen / 1.0e9;
 	if (nowS - lastLog < 10.0) { (void)total; return; }
 	lastLog = nowS;
 	double fxMs = (double)g_fxAccum * (double)sNum / (double)sDen / 1.0e6;   // 2x RenderEffects
-	printf("[vc-frame] last: cnstrList=%.1f prerender=%.1f startframe=%.1f eyes=%.1f (fx=%.1f) post-3d=%.1f finish=%.1f total=%.1f | PEAK total=%.1f ms (%s=%.1f)\n",
-	       VC_SEG_MS(0,6), VC_SEG_MS(6,7), VC_SEG_MS(7,1), VC_SEG_MS(1,2), fxMs, VC_SEG_MS(3,4), VC_SEG_MS(4,5), total, maxTotal, maxPhase, maxSeg);
-	maxTotal = 0.0; maxSeg = 0.0; maxPhase = "-";
+	printf("[vc-frame] last: cnstrList=%.1f prerender=%.1f startframe=%.1f eyes=%.1f (fx=%.1f) post-3d=%.1f menus=%.1f afterfade=%.1f present=%.1f total=%.1f | PEAK total=%.1f ms (%s=%.1f) cpu=%.1f ms [cpu<<total => OS suspended, not work]\n",
+	       VC_SEG_MS(0,6), VC_SEG_MS(6,7), VC_SEG_MS(7,1), VC_SEG_MS(1,2), fxMs, VC_SEG_MS(3,4), VC_SEG_MS(4,8), VC_SEG_MS(8,9), VC_SEG_MS(9,5), total, maxTotal, maxPhase, maxSeg, maxCpu);
+	maxTotal = 0.0; maxSeg = 0.0; maxPhase = "-"; maxCpu = 0.0;
 	#undef VC_SEG_MS
 }
 

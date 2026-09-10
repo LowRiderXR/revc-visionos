@@ -2272,9 +2272,33 @@ CMenuManager::DrawControllerSetupScreen()
 	CFont::PrintString(MENU_X_RIGHT_ALIGNED(CONTSETUP_BACK_RIGHT - 2.0f), SCREEN_SCALE_FROM_BOTTOM(CONTSETUP_BACK_BOTTOM - 4.0f), TheText.Get("FEDS_TB"));
 }
 
+#ifdef LIBRW_VISIONOS
+#include <mach/mach_time.h>
+#include <time.h>
+#include <stdlib.h>
+// Localises the seconds-spikes in RenderMenus/DrawFrontEnd: an RAII timer that logs
+// [vc-load] name wall/cpu ms when a scope exceeds 20 ms AND VC_PERF_LOG is set.
+struct VcScopeTimer {
+	const char *name; uint64_t w0, c0;
+	static uint64_t cpuNs(){ struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID,&ts); return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec; }
+	VcScopeTimer(const char *n): name(n), w0(mach_absolute_time()), c0(cpuNs()) {}
+	~VcScopeTimer(){
+		static int on=-1; if(on<0) on=getenv("VC_PERF_LOG")?1:0; if(!on) return;
+		static mach_timebase_info_data_t tb; if(tb.denom==0) mach_timebase_info(&tb);
+		double wall=(double)(mach_absolute_time()-w0)*tb.numer/tb.denom/1.0e6;
+		if(wall < 20.0) return;
+		printf("[vc-load] %s wall=%.1f ms cpu=%.1f ms\n", name, wall, (double)(cpuNs()-c0)/1.0e6);
+	}
+};
+#define VC_SCOPE(n) VcScopeTimer _vcst(n)
+#else
+#define VC_SCOPE(n)
+#endif
+
 void
 CMenuManager::DrawFrontEnd()
 {
+	VC_SCOPE("DrawFrontEnd");
 	CFont::SetAlphaFade(255.0f);
 	CSprite2d::InitPerFrame();
 	CFont::InitPerFrame();
@@ -3019,6 +3043,7 @@ CMenuManager::InitialiseChangedLanguageSettings()
 void
 CMenuManager::LoadAllTextures()
 {
+	VC_SCOPE("LoadAllTextures");
 	if (m_bSpritesLoaded)
 		return;
 
@@ -5569,6 +5594,7 @@ CMenuManager::ProcessFileActions()
 void
 CMenuManager::SwitchMenuOnAndOff()
 {
+	VC_SCOPE("SwitchMenuOnAndOff");
 	if (!TheCamera.m_WideScreenOn) {
 
 		// Reminder: You need REGISTER_START_BUTTON defined to make it work.

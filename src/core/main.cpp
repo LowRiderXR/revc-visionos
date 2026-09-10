@@ -1454,10 +1454,12 @@ extern "C" void vc_clear_depth(void);
 extern "C" void vc_set_force_depth_less(int on);
 // Phase 5.5 stereo (declared at namespace scope; extern "C" at block scope is illegal).
 extern "C" int  vc_render_mode(void);          // 1 = VC_MODE_STEREO
+#include <mach/mach_time.h>                     // [vc-rm] RenderMenus own-wall-time probe
 extern "C" void vc_stereo_eye_pass(int eye);   // gl3device: bind slice FBO + per-eye matrices
 extern "C" void vc_stereo_restore_main(void);  // gl3device: rebind cinema FBO + mono matrices
 extern "C" void vc_stereo_readback_log(void);  // visionos_angle: one-time slice read-back proof
 extern "C" void vc_frame_mark(int id);         // visionos: per-frame phase timing probe
+extern "C" int  vc_perf_log(void);             // visionos: VC_PERF_LOG gate
 extern "C" void vc_frame_fx_begin(void);       // visionos: time RenderEffects (2x) as the [vc-frame] fx segment
 extern "C" void vc_frame_fx_end(void);
 extern "C" void vc_fade_set_draw_only(int on);  // visionos: gate DoFade state mutation (per-eye fade)
@@ -1977,8 +1979,28 @@ Idle(void *arg)
 	}
 
 	tbStartTimer(0, "RenderMenus");
+#ifdef LIBRW_VISIONOS
+	// Discriminator: RenderMenus' OWN wall time. If the menus segment (mark4->8) shows
+	// seconds but this is ~0, the seconds are NOT in RenderMenus -> stale marks (mark 0
+	// didn't zero this iteration). If this shows seconds, it IS RenderMenus (VarConsole.
+	// Check on !MASTER, or menu draw). VC_PERF_LOG, >20 ms. Own block so vcRmT0 doesn't
+	// cross the function's goto popret (jump-over-init).
+	{
+		uint64_t vcRmT0 = mach_absolute_time();
+		RenderMenus();
+		if (vc_perf_log()) {
+			static mach_timebase_info_data_t vcTb; if (vcTb.denom == 0) mach_timebase_info(&vcTb);
+			double vcRmMs = (double)(mach_absolute_time() - vcRmT0) * vcTb.numer / vcTb.denom / 1.0e6;
+			if (vcRmMs > 20.0) printf("[vc-rm] RenderMenus own wall=%.1f ms\n", vcRmMs);
+		}
+	}
+#else
 	RenderMenus();
+#endif
 	tbEndTimer("RenderMenus");
+#ifdef LIBRW_VISIONOS
+	vc_frame_mark(8);   // RenderMenus done (finish split: menus)
+#endif
 
 #ifdef PS2_MENU
 	if ( TheMemoryCard.m_bWantToLoad )
@@ -1999,6 +2021,9 @@ Idle(void *arg)
 	tbStartTimer(0, "Render2dStuff-Fade");
 	Render2dStuffAfterFade();
 	tbEndTimer("Render2dStuff-Fade");
+#ifdef LIBRW_VISIONOS
+	vc_frame_mark(9);   // DoFade + Render2dStuffAfterFade done (finish split: afterfade); 9->5 = DoRWStuffEndOfFrame/present
+#endif
 	// CCredits::Render(); // They added it to function above and also forgot it here
 #ifdef XBOX_MESSAGE_SCREEN
 	FrontEndMenuManager.DrawOverlays();
