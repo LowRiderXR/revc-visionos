@@ -786,6 +786,8 @@ vcrt_eyegpu_begin(void)  // called on the proceed path, before any of the frame'
 	g_tqOpen = true; g_tqActiveSlot = g_tqWrite;
 }
 
+static void vcrt_foveation_poll_dirty(void);   // defined with the stereo target below
+
 extern "C" bool
 vcrt_begin_frame(void)
 {
@@ -871,6 +873,11 @@ vcrt_begin_frame(void)
 			      (nowS - vcBeginT0) * 1000.0);
 		}
 	}
+	// Apply a freshly pushed optical curve (from Swift) on THIS game thread, so the map
+	// build + slice registration never race the render thread. Normally the curve arrives
+	// long before stereo_ensure, which already built from it; this covers a late push.
+	vcrt_foveation_poll_dirty();
+
 	vcrt_eyegpu_begin();   // time this frame's GL (eye) passes (VC_EYE_GPU=1)
 	return true;
 }
@@ -1384,6 +1391,15 @@ typedef void (*PFN_ANGLESetRateMap)(void *, void *);
 static PFN_ANGLESetRateMap        p_ANGLESetRateMap = NULL;
 static id<MTLRasterizationRateMap> g_foveMap = nil;
 
+// Sampled optical curve pushed from Swift (vc_set_foveation_curve): the compositor's own
+// per-eye rate profile resampled to our slice. Preferred over the parametric bell -- it
+// puts the dense zone on the true (off-centre) optical axis and removes only fragments the
+// compositor discards anyway. Guarded by g_bufMutex; built into g_foveMap on the game
+// thread. NX/NY 0 => none yet (parametric fallback).
+static float g_foveCurveH[64], g_foveCurveV[64];
+static int   g_foveCurveNX = 0, g_foveCurveNY = 0;
+static bool  g_foveCurveSet = false, g_foveCurveDirty = false;
+
 static bool
 vcFoveateOn(void)
 {
@@ -1395,26 +1411,40 @@ vcFoveateOn(void)
 static id<MTLRasterizationRateMap>
 vcrt_build_fove_map(int W, int H)
 {
-	int zones = 16; { const char *e = getenv("VC_FOVEATE_ZONES"); if (e) { int z = atoi(e); if (z >= 2 && z <= 64) zones = z; } }
-	float edge = 0.2f; { const char *e = getenv("VC_FOVEATE_EDGE"); if (e) { float f = (float)atof(e); if (f > 0.05f && f <= 1.0f) edge = f; } }  // 0.2: edge rate = 1/5 res; ~36% of fragments
 	if (![g_mtlDevice supportsRasterizationRateMapWithLayerCount:1]) {
 		VCLOG(@"[vc-fove] device has no rasterization rate map support -> disabled");
 		return nil;
 	}
 	float hq[64], vq[64];
-	for (int i = 0; i < zones; i++) {
-		float f = ((float)i + 0.5f) / (float)zones;                      // 0..1 across the axis
-		float w = 0.5f * (1.0f + cosf((float)M_PI * (2.0f * f - 1.0f)));  // 1 at centre, 0 at edges
-		float r = edge + (1.0f - edge) * w;
-		hq[i] = vq[i] = (r < 0.01f) ? 0.01f : r;
+	int nx, ny;
+	// Prefer the sampled optical curve from Swift; else the parametric bell.
+	pthread_mutex_lock(&g_bufMutex);
+	bool haveCurve = g_foveCurveSet;
+	if (haveCurve) {
+		nx = g_foveCurveNX; ny = g_foveCurveNY;
+		memcpy(hq, g_foveCurveH, (size_t)nx * sizeof(float));
+		memcpy(vq, g_foveCurveV, (size_t)ny * sizeof(float));
 	}
+	pthread_mutex_unlock(&g_bufMutex);
+	if (!haveCurve) {
+		int zones = 16; { const char *e = getenv("VC_FOVEATE_ZONES"); if (e) { int z = atoi(e); if (z >= 2 && z <= 64) zones = z; } }
+		float edge = 0.2f; { const char *e = getenv("VC_FOVEATE_EDGE"); if (e) { float f = (float)atof(e); if (f > 0.05f && f <= 1.0f) edge = f; } }
+		for (int i = 0; i < zones; i++) {
+			float f = ((float)i + 0.5f) / (float)zones;
+			float w = 0.5f * (1.0f + cosf((float)M_PI * (2.0f * f - 1.0f)));
+			float r = edge + (1.0f - edge) * w;
+			hq[i] = vq[i] = (r < 0.01f) ? 0.01f : r;
+		}
+		nx = ny = zones;
+	}
+	VCLOG(@"[vc-fove] build: source=%s nx=%d ny=%d", haveCurve ? "compositor-curve(Swift)" : "parametric-bell", nx, ny);
 	// Any bad ObjC selector / Metal exception here must DISABLE foveation, not abort the
 	// whole process. Step logs so the last one printed pinpoints the failing call.
 	id<MTLRasterizationRateMap> map = nil;
 	@try {
-		VCLOG(@"[vc-fove] build step 1: layer descriptor (zones=%d)", zones);
+		VCLOG(@"[vc-fove] build step 1: layer descriptor (nx=%d ny=%d)", nx, ny);
 		MTLRasterizationRateLayerDescriptor *layer =
-			[[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(zones, zones, 1)
+			[[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(nx, ny, 1)
 			                                                     horizontal:hq
 			                                                       vertical:vq];
 		VCLOG(@"[vc-fove] build step 2: map descriptor (screen=%dx%d)", W, H);
@@ -1430,8 +1460,8 @@ vcrt_build_fove_map(int W, int H)
 	}
 	if (map) {
 		MTLSize ph = [map physicalSizeForLayer:0];
-		VCLOG(@"[vc-fove] rate map built: screen=%dx%d physical=%dx%d zones=%d edge=%.2f (~%.0f%% of fragments)",
-		      W, H, (int)ph.width, (int)ph.height, zones, edge,
+		VCLOG(@"[vc-fove] rate map built: screen=%dx%d physical=%dx%d (~%.0f%% of fragments)",
+		      W, H, (int)ph.width, (int)ph.height,
 		      100.0 * (double)ph.width * (double)ph.height / ((double)W * (double)H));
 	} else {
 		VCLOG(@"[vc-fove] newRasterizationRateMapWithDescriptor returned nil -> foveation off");
@@ -1446,7 +1476,8 @@ vcrt_foveation_apply(int W, int H)
 {
 	if (!vcFoveateOn()) return;
 	VCLOG(@"[vc-fove] apply: entering (VC_FOVEATE=1, %dx%d)", W, H);
-	if (g_foveMap == nil) g_foveMap = vcrt_build_fove_map(W, H);
+	g_foveCurveDirty = false;                      // consume any pending curve
+	g_foveMap = vcrt_build_fove_map(W, H);         // always (re)build; ARC releases the old map
 	if (g_foveMap == nil) return;
 	if (!p_ANGLESetRateMap) {
 		p_ANGLESetRateMap = (PFN_ANGLESetRateMap)dlsym(RTLD_DEFAULT, "ANGLEMetalSetRasterizationRateMap");
@@ -1460,11 +1491,42 @@ vcrt_foveation_apply(int W, int H)
 	VCLOG(@"[vc-fove] rate map bound BY IDENTITY to %d stereo slices (world eye passes only)", n);
 }
 
+// Game-thread poll: rebuild+register when Swift has pushed a new optical curve.
+static void
+vcrt_foveation_poll_dirty(void)
+{
+	if (g_stereoReady && vcFoveateOn() && g_foveCurveDirty)
+		vcrt_foveation_apply(g_rtWidth, g_rtHeight);
+}
+
 // The rate map the slices were rendered with (for the display quad's unwarp), or NULL.
 extern "C" void *
 vc_foveation_rate_map(void)
 {
 	return (vcFoveateOn() && g_foveMap != nil) ? VC_OBJ_TO_VOID(g_foveMap) : NULL;
+}
+
+// Is foveation requested? (Swift gate for sampling + pushing the optical curve.)
+extern "C" int
+vc_foveation_wanted(void)
+{
+	return vcFoveateOn() ? 1 : 0;
+}
+
+// Swift pushes the sampled compositor rate curve (per-axis rates, enveloped over both
+// eyes, peak-normalized, floored). Stored; the game thread rebuilds g_foveMap from it and
+// re-registers on the slices (see the dirty check in vcrt_begin_frame + vcrt_stereo_ensure).
+extern "C" void
+vc_set_foveation_curve(const float *h, int nx, const float *v, int ny)
+{
+	if (!h || !v || nx < 2 || ny < 2 || nx > 64 || ny > 64) return;
+	pthread_mutex_lock(&g_bufMutex);
+	memcpy(g_foveCurveH, h, (size_t)nx * sizeof(float));
+	memcpy(g_foveCurveV, v, (size_t)ny * sizeof(float));
+	g_foveCurveNX = nx; g_foveCurveNY = ny;
+	g_foveCurveSet = true; g_foveCurveDirty = true;
+	pthread_mutex_unlock(&g_bufMutex);
+	VCLOG(@"[vc-fove] curve received from Swift: %d x %d zones", nx, ny);
 }
 
 // Lazily create BOTH stereo back buffers. Called from the game thread (GL context
