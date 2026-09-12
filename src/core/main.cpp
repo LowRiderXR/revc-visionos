@@ -260,6 +260,12 @@ int vcStereoSkyOn(void)
 // eye loop) runs again. Stays true across a long streaming block that produces no new
 // splash frame -> the compositor simply holds the last splash still (acceptable).
 static int g_vcSplashActive = 0;
+// Load-in-progress: set when a save load is confirmed (m_bWantToLoad), cleared when the
+// world render resumes. While set, the host shows a stable BLACK instead of the flickering
+// frontend/loading screens (confirm dialog + "please wait" + splash cycling in the buffer
+// ring). Deliberately NOT gated on splash so the interactive start menu is unaffected.
+int g_vcLoadingActive = 0;
+extern "C" int vc_loading_active(void) { return g_vcLoadingActive; }
 // Stereo: true during the fade TO/FROM a splash screen. reVC keeps running the eye passes
 // (3D cutscene) while FadeValue ramps and DoFade crossfades the 2D splash over it -- a 2D
 // image at infinity over a 3D scene cannot fuse in VR (binocular rivalry / flicker). So we
@@ -417,6 +423,11 @@ DoFade(void)
 // switch the single overlay quad between head-locked (HUD) and world-anchored (menu)
 // on this flag alone.
 extern "C" int vc_menu_active(void) { return FrontEndMenuManager.m_bMenuActive ? 1 : 0; }
+
+// Quit request: 1 once the game asked to exit (menu Quit -> rsQUITAPP -> RsGlobal.quit).
+// The game thread's loop leaves on this, but nothing on visionOS closes the app/immersive
+// space by itself, so the Swift render loop polls this and dismisses the immersive space.
+extern "C" int vc_wants_quit(void) { return RsGlobal.quit ? 1 : 0; }
 #endif
 
 bool
@@ -1457,6 +1468,7 @@ extern "C" int  vc_render_mode(void);          // 1 = VC_MODE_STEREO
 #include <mach/mach_time.h>                     // [vc-rm] RenderMenus own-wall-time probe
 extern "C" void vc_stereo_eye_pass(int eye);   // gl3device: bind slice FBO + per-eye matrices
 extern "C" void vc_stereo_restore_main(void);  // gl3device: rebind cinema FBO + mono matrices
+extern "C" void vc_hud_clear_transparent(void); // visionos_angle: wipe stale opaque HUD-buffer colour
 extern "C" void vc_stereo_readback_log(void);  // visionos_angle: one-time slice read-back proof
 extern "C" void vc_frame_mark(int id);         // visionos: per-frame phase timing probe
 extern "C" int  vc_perf_log(void);             // visionos: VC_PERF_LOG gate
@@ -1727,6 +1739,26 @@ Idle(void *arg)
 	tbEndTimer("CGame::Process");
 	POP_MEMID();
 
+#ifdef LIBRW_VISIONOS
+	// Load-black release (runs every frame; FadeValue is fresh after CGame::Process).
+	// The host shows a stable black from load-confirm through the whole post-load
+	// transition. Release it only after the post-load fade has FULLY cycled: seen fully
+	// faded out (>=200), then back to 0. Requiring the fade-out FIRST is essential --
+	// right after the load FadeValue is still 0 (before the fade-out starts), so a plain
+	// "FadeValue==0 -> release" fires immediately and lets the dialog/scene frames leak
+	// through (the flicker). This mirrors the splash-hold idea, but state-driven over the
+	// whole variable-length load instead of a fixed frame count.
+	if (g_vcLoadingActive) {
+		static bool vcLoadSawFadeOut = false;
+		if (CDraw::FadeValue >= 200) vcLoadSawFadeOut = true;
+		if (vcLoadSawFadeOut && CDraw::FadeValue == 0) {
+			g_vcLoadingActive = 0;
+			vcLoadSawFadeOut = false;
+			printf("[vc-load] host-black RELEASED (fade cycled, faded in)\n");
+		}
+	}
+#endif
+
 	tbStartTimer(0, "DMAudio.Service");
 	DMAudio.Service();
 	tbEndTimer("DMAudio.Service");
@@ -1912,6 +1944,10 @@ Idle(void *arg)
 			if (vcStereoCameraOn()) vcStereoRestoreGameCamera();
 			vc_frame_mark(2);   // eyes done (2x RenderScene + 2x RenderEffects + 2x DoFade)
 			vc_stereo_restore_main();
+			// Wipe any stale OPAQUE content baked into this ring buffer's cinema/HUD
+			// colour (e.g. the load "please wait" MessageScreen) before the 2D/HUD pass
+			// draws the fresh, transparent HUD. Without this it flickers back in.
+			vc_hud_clear_transparent();
 			vc_stereo_readback_log();
 			vc_frame_mark(3);   // readback done (restore + one-time read-back/glFinish)
 		}
@@ -2010,10 +2046,15 @@ Idle(void *arg)
 	tbStartTimer(0, "DoFade");
 #ifdef LIBRW_VISIONOS
 	// Stereo already drew the fade into both eye slices (in the eye loop); running it
-	// again here would dim the head-locked HUD buffer. EXCEPT during a splash fade, where
-	// the eye loop was skipped (world suppressed) -> DoFade here draws the splash into the
-	// cinema/overlay buffer, which the host shows as a head-locked overlay (hard cut after).
-	if (vc_render_mode() != 1 || vcStereoSplashFade())
+	// again here would dim the head-locked HUD buffer. EXCEPT when the eye loop was
+	// SKIPPED this frame (world suppressed), because then nothing else advances the fade
+	// STATE. Two such cases: (a) a splash fade; (b) the screen is fully faded out
+	// (FADE_2) and no menu is up -- e.g. right after loading a save, where the load sets
+	// StillToFadeOut and DoFade must run to eventually kick Fade(FADE_IN). Without this the
+	// gate at the top of the frame (`GetScreenFadeStatus() != FADE_2`) keeps skipping the
+	// world+fade forever -> stuck black, controls locked (self-holding deadlock).
+	if (vc_render_mode() != 1 || vcStereoSplashFade()
+	    || (TheCamera.GetScreenFadeStatus() == FADE_2 && !FrontEndMenuManager.m_bMenuActive))
 #endif
 	DoFade();
 	tbEndTimer("DoFade");

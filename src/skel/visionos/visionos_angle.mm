@@ -318,6 +318,11 @@ typedef void *   (*PFN_eglCreateSync)(EGLDisplay, EGLenum, const EGLAttrib *);
 typedef unsigned int (*PFN_eglDestroySync)(EGLDisplay, void *);
 typedef const char * (*PFN_eglQueryString)(EGLDisplay, EGLint);
 
+typedef void (*PFN_glClearColorVC)(float, float, float, float);
+typedef void (*PFN_glClearVC)(GLenumVC);
+
+static PFN_glClearColorVC             p_glClearColor = NULL;
+static PFN_glClearVC                  p_glClear = NULL;
 static PFN_glGenTextures              p_glGenTextures = NULL;
 static PFN_glBindTexture              p_glBindTexture = NULL;
 static PFN_glTexParameteri            p_glTexParameteri = NULL;
@@ -444,6 +449,8 @@ vcrt_resolve(void)
 {
 	if (!g_eglGetProcAddress) { VCLOG(@"[vc-rt] FAIL: no eglGetProcAddress"); return false; }
 	#define VC_GL(v, T, n) v = (T)g_eglGetProcAddress(n); if (!v) { VCLOG(@"[vc-rt] FAIL resolve %s", n); return false; }
+	VC_GL(p_glClearColor,             PFN_glClearColorVC,           "glClearColor");
+	VC_GL(p_glClear,                  PFN_glClearVC,                "glClear");
 	VC_GL(p_glGenTextures,            PFN_glGenTextures,            "glGenTextures");
 	VC_GL(p_glBindTexture,            PFN_glBindTexture,            "glBindTexture");
 	VC_GL(p_glTexParameteri,          PFN_glTexParameteri,          "glTexParameteri");
@@ -880,6 +887,25 @@ vcrt_begin_frame(void)
 
 	vcrt_eyegpu_begin();   // time this frame's GL (eye) passes (VC_EYE_GPU=1)
 	return true;
+}
+
+// Clear the current back buffer's cinema/HUD colour to fully transparent. Stereo only.
+// In stereo the world lives in the eye slices; this g_buf texture is published as the
+// transparent HUD/2D overlay (hud_texture). librw's CLEARMODE clears only Z/stencil, so
+// the colour is never wiped -- normally fine (gameplay only draws small HUD sprites, the
+// rest stays transparent from allocation). But a load draws MessageScreen("FELD_WR") with
+// an OPAQUE full-screen black background into one ring buffer; with no colour clear it
+// stays baked there forever and flickers back in as the ring cycles. Clearing to (0,0,0,0)
+// once per frame, right after vc_stereo_restore_main() and before the 2D/HUD pass, wipes
+// any such stale content while leaving the freshly-drawn HUD intact.
+extern "C" void
+vc_hud_clear_transparent(void)
+{
+	if (!g_extActive || vc_render_mode() != 1) return;
+	if (!p_glBindFramebuffer || !p_glClearColor || !p_glClear) return;
+	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_buf[g_currentBack].glFbo);
+	p_glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+	p_glClear((GLenumVC)VC_GL_COLOR_BUFFER_BIT);
 }
 
 // Enqueue a GPU signal of the shared event to `value` after the frame's GL work.
@@ -1371,9 +1397,9 @@ extern "C" void *vc_stereo_array_texture(int idx)
 	return VC_OBJ_TO_VOID(g_stereoBuf[idx].arrayTex);
 }
 
-// ---- Fixed foveation (VC_FOVEATE=1, default OFF) --------------------------
+// ---- Fixed foveation (default ON; VC_FOVEATE=0 disables) ------------------
 // Render the eye passes at a variable rate: sharp centre (rate 1.0), coarse edges
-// (VC_FOVEATE_EDGE, default 0.35) over VC_FOVEATE_ZONES (default 16) zones/axis. A
+// (VC_FOVEATE_EDGE, default 0.2) over VC_FOVEATE_ZONES (default 16) zones/axis. A
 // centred, PARAMETRIC curve (not the compositor's gaze-driven map): the slice pipeline
 // is decoupled/buffered, so a gaze-following map would sit stale; and parametric lets
 // us tune the reduction to the frame budget. We build our own MTLRasterizationRateMap at

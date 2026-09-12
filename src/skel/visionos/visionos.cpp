@@ -43,6 +43,9 @@
 #include "main.h"     // LoadingScreen, InitialiseGame
 #include "Timer.h"    // CTimer
 #include "Pad.h"      // CPad, CControllerState (gamepad input)
+#include "DMAudio.h"  // DMAudio (music mode on restart/load)
+#include "Camera.h"   // TheCamera (fade status diag)
+#include "Draw.h"     // CDraw::FadeValue (fade diag)
 
 // Game render-target size. THE single source: feeds the two vcrt MTLTextures,
 // rsCAMERASIZE, RsGlobal and the librw open params. This is the OFFSCREEN size
@@ -1137,6 +1140,22 @@ run_game_loop(void)
 				lastState = gGameState;
 			}
 
+			// [vc-fe] which menu screen / flags we're on, logged on change. Pins down
+			// what the stuck "flickering menu" phase (menu=1 splash=1) actually is.
+			{
+				static int feScr = -999, feMenu = -1, feGs = -1;
+				if (FrontEndMenuManager.m_nCurrScreen != feScr ||
+				    (int)FrontEndMenuManager.m_bMenuActive != feMenu || (int)gGameState != feGs) {
+					feScr = FrontEndMenuManager.m_nCurrScreen;
+					feMenu = (int)FrontEndMenuManager.m_bMenuActive;
+					feGs = (int)gGameState;
+					printf("[vc-fe] gs=%s screen=%d menuActive=%d wantLoad=%d wantRestart=%d\n",
+					       gGameStateName(gGameState), feScr, feMenu,
+					       (int)FrontEndMenuManager.m_bWantToLoad,
+					       (int)FrontEndMenuManager.m_bWantToRestart);
+				}
+			}
+
 			if (ForegroundApp) {  // always TRUE on visionOS
 				switch (gGameState) {
 					case GS_START_UP:
@@ -1176,6 +1195,20 @@ run_game_loop(void)
 						break;
 
 					case GS_PLAYING_GAME: {
+						// [vc-pg] is game time actually advancing after a load, or frozen?
+						{
+							static int pgFrames = 0; static unsigned lastMs = 0;
+							if (++pgFrames >= 90) {
+								unsigned nowMs = CTimer::GetTimeInMilliseconds();
+								printf("[vc-pg] timeMs=%u dMs=%d paused=%d menu=%d fadeVal=%d fadeStatus=%d splashFade=%d userPaused=%d\n",
+								       nowMs, (int)(nowMs - lastMs), (int)CTimer::GetIsPaused(),
+								       (int)FrontEndMenuManager.m_bMenuActive,
+								       (int)CDraw::FadeValue, (int)TheCamera.GetScreenFadeStatus(),
+								       (int)TheCamera.m_FadeTargetIsSplashScreen,
+								       (int)CTimer::GetIsUserPaused());
+								lastMs = nowMs; pgFrames = 0;
+							}
+						}
 						float ms = (float)CTimer::GetCurrentTimeInCycles() /
 						           (float)CTimer::GetCyclesPerMillisecond();
 						if (RwInitialised) {
@@ -1197,8 +1230,50 @@ run_game_loop(void)
 		RwInitialised = FALSE;
 		FrontEndMenuManager.UnloadTextures();
 
+		// Quit (RsGlobal.quit) or hard stop -> leave the outer loop; the app/immersive
+		// space teardown happens Swift-side (see vc_wants_quit / vc_game_thread_stop).
 		if (!FrontEndMenuManager.m_bWantToRestart)
 			break;
+
+		// Restart path, mirroring glfw.cpp's non-PS2 cleanup. Loading a save sets BOTH
+		// m_bWantToRestart AND m_bWantToLoad (DoSettingsBeforeStartingAGame); a plain
+		// restart (e.g. quit-to-menu / new game) sets only m_bWantToRestart. The old
+		// stub dropped all of this, so the load never actually happened -- the world
+		// stayed frozen with m_bWantToLoad stuck true.
+		printf("[vc-load] restart cleanup ENTER: wantToLoad=%d firstTime=%d menuActive=%d gameNotLoaded=%d gGameState=%s\n",
+		       (int)FrontEndMenuManager.m_bWantToLoad, (int)FrontEndMenuManager.m_bFirstTime,
+		       (int)FrontEndMenuManager.m_bMenuActive, (int)FrontEndMenuManager.m_bGameNotLoaded,
+		       gGameStateName(gGameState));
+
+		CPad::ResetCheats();
+		CPad::StopPadsShaking();
+
+		DMAudio.ChangeMusicMode(MUSICMODE_DISABLE);
+
+		CTimer::Stop();
+
+		if (FrontEndMenuManager.m_bWantToLoad) {
+			CGame::ShutDownForRestart();
+			CGame::InitialiseWhenRestarting();
+			DMAudio.ChangeMusicMode(MUSICMODE_GAME);
+			LoadSplash(GetLevelSplashScreen(CGame::currLevel));
+			FrontEndMenuManager.m_bWantToLoad = false;
+			printf("[vc-load] after InitialiseWhenRestarting: wantToLoad=%d menuActive=%d gGameState=%s\n",
+			       (int)FrontEndMenuManager.m_bWantToLoad, (int)FrontEndMenuManager.m_bMenuActive,
+			       gGameStateName(gGameState));
+		} else {
+			if (gGameState == GS_PLAYING_GAME)
+				CGame::ShutDown();
+
+			CTimer::Stop();
+
+			if (FrontEndMenuManager.m_bFirstTime == true)
+				gGameState = GS_INIT_FRONTEND;
+			else
+				gGameState = GS_INIT_PLAYING_GAME;
+		}
+
+		FrontEndMenuManager.m_bFirstTime = false;
 		FrontEndMenuManager.m_bWantToRestart = false;
 	}
 

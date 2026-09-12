@@ -5505,6 +5505,12 @@ CMenuManager::ProcessFileActions()
 #endif
 				DoSettingsBeforeStartingAGame();
 				m_bWantToLoad = true;
+#ifdef LIBRW_VISIONOS
+				// Load confirmed -> tell the host to show a stable black through the load
+				// screens (they otherwise flicker in stereo). Cleared when the fade cycles.
+				{ extern int g_vcLoadingActive; g_vcLoadingActive = 1;
+				  printf("[vc-load] host-black ARMED (load confirmed)\n"); }
+#endif
 			} else
 				SwitchToNewScreen(MENUPAGE_NEW_GAME);
 
