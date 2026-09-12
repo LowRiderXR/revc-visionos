@@ -1476,6 +1476,7 @@ extern "C" void vc_frame_fx_begin(void);       // visionos: time RenderEffects (
 extern "C" void vc_frame_fx_end(void);
 extern "C" void vc_fade_set_draw_only(int on);  // visionos: gate DoFade state mutation (per-eye fade)
 extern "C" int  vc_get_eye_view(float m[16]);   // gl3device: eye VIEW (librw) the last eye pass uploaded
+extern "C" int  vc_get_eye_proj(float m[16]);   // gl3device: eye PROJECTION (librw clip) the GPU world used
 extern "C" void vc_set_stereo_sky_clear(float r, float g, float b); // gl3device: eye-slice sky clear colour
 
 // Phase 5 (sky/coronas/lighting fix): set TheCamera to the per-eye camera so the CPU
@@ -1496,6 +1497,7 @@ static bool vcStereoCameraOn(void)
 // reads this to apply the per-eye slice projection to sun/moon/clouds/coronas positions.
 static int vcEyeTag = 0;
 extern "C" int vc_in_stereo_eye(void) { return vcEyeTag; }
+
 static bool    vcGameCamSaved = false;
 static CMatrix vcSavedCamMatrix, vcSavedViewMatrix;
 static void vcStereoSaveGameCamera(void)
@@ -1537,6 +1539,141 @@ static void vcStereoSetGameCamera(int eye)
 	TheCamera.m_viewMatrix.GetRight() = R; TheCamera.m_viewMatrix.GetForward() = F;
 	TheCamera.m_viewMatrix.GetUp() = U; TheCamera.m_viewMatrix.GetPosition() = P;  // CalcScreenCoors source (RW order, as cinema)
 }
+
+// --- Cull with the head pose (VC_CULL_HEADPOSE, default ON) ---------------------------
+// ConstructRenderList/ScanWorld cull against TheCamera's RwCamera-FRAME matrix + view
+// window BEFORE the per-eye loop, i.e. with the plain game camera (no head rotation). So
+// geometry the head turns into view is culled out of the render list -- only its coronas
+// (drawn per-eye) survive. Fix: for the cull ONLY, set TheCamera AND the RwCamera frame to
+// the (1-frame-old) head view and widen the view window a few percent (covers the 1-frame
+// latency + eye separation, NOT the head turn -- that is applied), then restore the game
+// camera exactly. Streaming/LOD already ran in CGame::Process with the game camera (before
+// this point), so they are untouched. Default ON in stereo; VC_CULL_HEADPOSE=0 disables
+// (falls back to the stock game-camera cull) as an escape hatch.
+static bool vcCullHeadPoseOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_CULL_HEADPOSE"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0;
+}
+static float vcCullMargin(void)
+{
+	static float m = -1.0f;
+	if(m < 0.0f){ const char *s = getenv("VC_CULL_MARGIN"); m = s ? (float)atof(s) : 1.1f;
+	              if(m < 1.0f) m = 1.0f; if(m > 2.0f) m = 2.0f; }
+	return m;
+}
+static bool     vcCullApplied = false;
+static CMatrix  vcCullSavedCam, vcCullSavedView;
+static RwMatrix vcCullSavedFrame;
+static RwV2d    vcCullSavedVW;
+
+static void vcCullApplyHeadPose(void)
+{
+	vcCullApplied = false;
+	if(!vcCullHeadPoseOn() || vc_render_mode() != 1) return;
+	float v[16];
+	if(!vc_get_eye_view(v)) return;   // no eye view yet (very first frame) -> cull with game cam
+
+	RwFrame *frame = RwCameraGetFrame(TheCamera.m_pRwCamera);
+	// SAVE everything the cull reads, so the restore is exact.
+	vcCullSavedCam   = TheCamera.GetMatrix();
+	vcCullSavedView  = TheCamera.m_viewMatrix;
+	vcCullSavedFrame = *RwFrameGetMatrix(frame);
+	vcCullSavedVW    = *RwCameraGetViewWindow(TheCamera.m_pRwCamera);
+
+	// Set TheCamera from the head view -- SAME math as vcStereoSetGameCamera (RW columns =
+	// librw columns with x negated; Invert; swap Forward<->Up so GetForward()=look).
+	CVector R(-v[0], v[1], v[2]), F(-v[4], v[5], v[6]), U(-v[8], v[9], v[10]), P(-v[12], v[13], v[14]);
+	CMatrix rwView = TheCamera.m_viewMatrix;
+	rwView.GetRight() = R; rwView.GetForward() = F; rwView.GetUp() = U; rwView.GetPosition() = P;
+	CMatrix world = Invert(rwView);
+	CVector look = world.GetUp(); CVector up = world.GetForward();
+	world.GetForward() = look; world.GetUp() = up;
+	TheCamera.GetMatrix() = world;
+	TheCamera.CalculateDerivedValues();
+	TheCamera.m_viewMatrix.GetRight() = R; TheCamera.m_viewMatrix.GetForward() = F;
+	TheCamera.m_viewMatrix.GetUp() = U; TheCamera.m_viewMatrix.GetPosition() = P;
+
+	// Push to the RwCamera FRAME -- what ScanWorld actually reads. vcStereoSetGameCamera
+	// omits this (the eye passes use GPU matrices); the cull does NOT, so this is the
+	// essential extra step (Camera.cpp:601-609 pattern).
+	*RwMatrixGetPos(RwFrameGetMatrix(frame))   = TheCamera.GetPosition();
+	*RwMatrixGetAt(RwFrameGetMatrix(frame))    = TheCamera.GetForward();
+	*RwMatrixGetUp(RwFrameGetMatrix(frame))    = TheCamera.GetUp();
+	*RwMatrixGetRight(RwFrameGetMatrix(frame)) = TheCamera.GetRight();
+	RwMatrixUpdate(RwFrameGetMatrix(frame));
+	RwFrameUpdateObjects(frame);
+	RwFrameOrthoNormalize(frame);
+
+	// Widen BOTH cull gates to the COMPOSITOR eye FOV -- the render frustum is ~2x wider (in
+	// tangent) than the game FOV, so anything in the eye view but outside the game FOV was
+	// culled (the "wandering gap"). Two gates, both must be widened (set-one-forget-the-other):
+	//   (a) sector scan  -> RwCamera view window (ScanWorld reads RwCameraGetViewWindow)
+	//   (b) per-entity    -> TheCamera.m_vecFrustumNormals (GetIsOnScreen -> IsSphereVisible),
+	//       normally built by CalculateDerivedValues from CDraw::GetScaledFOV()/SCREEN_ASPECT_
+	//       RATIO -- wrong FOV AND wrong aspect for our near-square slice, so we overwrite it.
+	// Tangents from the eye projection: 1/p0 horizontal, 1/p5 vertical (+ small margin for the
+	// eye separation / 1-frame latency). Per-axis, so the aspect is handled exactly.
+	float p[16];
+	if(vc_get_eye_proj(p) && p[0] > 0.0001f && p[5] > 0.0001f){
+		float m  = vcCullMargin();
+		float tx = m / p[0];   // horizontal half-tangent (compositor eye FOV)
+		float ty = m / p[5];   // vertical   half-tangent
+		RwV2d vw; vw.x = tx; vw.y = ty;
+		RwCameraSetViewWindow(TheCamera.m_pRwCamera, &vw);
+		// Overwrite the per-entity frustum planes AFTER CalculateDerivedValues (which set them
+		// from the game FOV). Unit normals from the compositor tangents; VC convention:
+		// x=right, y=forward, z=up. Right/left in x-y, top/bottom in y-z.
+		float hh = Atan(tx), vh = Atan(ty);
+		float ch = Cos(hh), sh = Sin(hh), cv = Cos(vh), sv = Sin(vh);
+		TheCamera.m_vecFrustumNormals[0] = CVector( ch, -sh, 0.0f);   // right
+		TheCamera.m_vecFrustumNormals[1] = CVector(-ch, -sh, 0.0f);   // left
+		TheCamera.m_vecFrustumNormals[2] = CVector(0.0f, -sv, -cv);   // bottom
+		TheCamera.m_vecFrustumNormals[3] = CVector(0.0f, -sv,  cv);   // top
+	}else{
+		// Fallback (no eye projection yet): scale the game view window (gate a only).
+		RwV2d vw = vcCullSavedVW; vw.x *= vcCullMargin(); vw.y *= vcCullMargin();
+		RwCameraSetViewWindow(TheCamera.m_pRwCamera, &vw);
+	}
+
+	vcCullApplied = true;
+}
+
+static void vcCullRestoreGameCamera(void)
+{
+	if(!vcCullApplied) return;
+	RwFrame *frame = RwCameraGetFrame(TheCamera.m_pRwCamera);
+	TheCamera.GetMatrix() = vcCullSavedCam;
+	TheCamera.CalculateDerivedValues();
+	TheCamera.m_viewMatrix.GetRight()    = vcCullSavedView.GetRight();
+	TheCamera.m_viewMatrix.GetForward()  = vcCullSavedView.GetForward();
+	TheCamera.m_viewMatrix.GetUp()       = vcCullSavedView.GetUp();
+	TheCamera.m_viewMatrix.GetPosition() = vcCullSavedView.GetPosition();
+	*RwFrameGetMatrix(frame) = vcCullSavedFrame;
+	RwMatrixUpdate(RwFrameGetMatrix(frame));
+	RwFrameUpdateObjects(frame);
+	RwCameraSetViewWindow(TheCamera.m_pRwCamera, &vcCullSavedVW);
+	vcCullApplied = false;
+
+	// Self-test: TheCamera and its RwCamera frame must AGREE after the restore. A mismatch
+	// means the bracket set one but not the other (our recurring bug class) -- that would
+	// drift the camera. Log ONCE if the two disagree.
+	static bool vcCullDriftLogged = false;
+	if(!vcCullDriftLogged){
+		CVector camPos = TheCamera.GetPosition();
+		const RwV3d *fp = RwMatrixGetPos(RwFrameGetMatrix(frame));
+		CVector d = camPos - CVector(fp->x, fp->y, fp->z);
+		if(d.Magnitude() > 0.001f){
+			vcCullDriftLogged = true;
+			printf("[vc-cull] WARN camera/frame disagree after restore: |d|=%.4f\n", d.Magnitude());
+		}
+	}
+}
+// Whether the head-pose override was actually applied THIS cull (1) or fell back to the game
+// camera because no eye view was available yet (0). ConstructRenderList reads this to drop
+// occlusion for the wide-FOV cull.
+extern "C" int vc_cull_applied(void) { return vcCullApplied ? 1 : 0; }
 #endif
 
 void
@@ -1754,7 +1891,6 @@ Idle(void *arg)
 		if (vcLoadSawFadeOut && CDraw::FadeValue == 0) {
 			g_vcLoadingActive = 0;
 			vcLoadSawFadeOut = false;
-			printf("[vc-load] host-black RELEASED (fade cycled, faded in)\n");
 		}
 	}
 #endif
@@ -1811,6 +1947,9 @@ Idle(void *arg)
 #endif
 #ifdef LIBRW_VISIONOS
 		vc_frame_mark(0);   // frame start (construct render list + prerender/RTT)
+		// Cull with the head pose (VC_CULL_HEADPOSE): bracket ONLY the render-list build so
+		// head-rotated geometry survives culling. Restored immediately after PreRender.
+		vcCullApplyHeadPose();
 #endif
 		CRenderer::ConstructRenderList();
 		tbEndTimer("CnstrRenderList");
@@ -1822,6 +1961,7 @@ Idle(void *arg)
 		CRenderer::PreRender();
 		tbEndTimer("PreRender");
 #ifdef LIBRW_VISIONOS
+		vcCullRestoreGameCamera();   // exact restore of the game camera (self-tested)
 		vc_frame_mark(7);   // PreRender done (model pre-load, camera-driven)
 #endif
 

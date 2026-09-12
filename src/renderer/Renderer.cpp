@@ -952,10 +952,24 @@ CRenderer::SetupBigBuildingVisibility(CEntity *ent)
 	return VIS_INVISIBLE;
 }
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_cull_applied(void);   // main.cpp: head-pose override applied this cull?
+#endif
+
 void
 CRenderer::ConstructRenderList(void)
 {
 	COcclusion::ProcessBeforeRendering();
+#ifdef LIBRW_VISIONOS
+	// Occluders are screen-space quads built for the game's narrow FOV. In the wide-FOV
+	// head-pose cull, a single occluder wrongly reports whole distant big-building rows as
+	// hidden even though they are visible off to the side (measured: sharp yaw-locked vis
+	// collapse with the occluder COUNT unchanged -> it's the per-entity IsEntityOccluded
+	// test, not the occluder count). Disabling occlusion when the head-pose cull is active
+	// removes the false culls; the modest extra draw cost is the correct trade for VR
+	// peripheral vision. VC_CULL_HEADPOSE=0 (default) keeps stock occlusion behaviour.
+	if(vc_cull_applied()) COcclusion::NumActiveOccluders = 0;
+#endif
 #ifdef NEW_RENDERER
 	if(!gbNewRenderer)
 #endif
