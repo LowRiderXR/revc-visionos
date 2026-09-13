@@ -1540,6 +1540,17 @@ static void vcStereoSetGameCamera(int eye)
 	TheCamera.m_viewMatrix.GetUp() = U; TheCamera.m_viewMatrix.GetPosition() = P;  // CalcScreenCoors source (RW order, as cinema)
 }
 
+// World-anchored free-aim crosshair (stereo). A head-locked reticle can't agree with a
+// game-camera aim once the head turns, so we mark the world point Tommy aims at instead.
+// Default ON in stereo; VC_WORLD_XHAIR=0 disables (escape hatch).
+static bool vcWorldCrosshairOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_WORLD_XHAIR"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0;
+}
+extern "C" int vc_world_crosshair_on(void) { return vcWorldCrosshairOn() ? 1 : 0; }
+
 // --- Cull with the head pose (VC_CULL_HEADPOSE, default ON) ---------------------------
 // ConstructRenderList/ScanWorld cull against TheCamera's RwCamera-FRAME matrix + view
 // window BEFORE the per-eye loop, i.e. with the plain game camera (no head rotation). So

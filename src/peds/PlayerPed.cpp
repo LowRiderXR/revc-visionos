@@ -1229,6 +1229,11 @@ CPlayerPed::ProcessAnimGroups(void)
 	}
 }
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_render_mode(void);
+extern "C" int vc_world_crosshair_on(void);   // VC_WORLD_XHAIR: world-anchored free-aim crosshair
+#endif
+
 void
 CPlayerPed::ProcessPlayerWeapon(CPad *padUsed)
 {
@@ -1478,6 +1483,38 @@ CPlayerPed::ProcessPlayerWeapon(CPad *padUsed)
 			CWeaponEffects::MarkTarget(markPos, 64, 32, 0, 255, 0.8f);
 		}
 	}
+#ifdef LIBRW_VISIONOS
+	// Stereo free-aim crosshair: with no lock-on target, a head-locked reticle would lie about
+	// where the gun (game-camera aim) points once the head turns. Instead mark the WORLD point
+	// Tommy actually aims at -- the same ray the shot uses (fire source GetMatrix()*(0,0,0.6),
+	// Find3rdPersonCamTargetVector) -- traced to the first solid hit, else the range endpoint.
+	// The marker is drawn per-eye in RenderEffects (like coronas), so it stays in the world on
+	// head turn and coincides with the bullet by construction. VC_WORLD_XHAIR=0 disables.
+	if (vc_render_mode() == 1 && vc_world_crosshair_on() && !m_pPointGunAt) {
+		bool freeAimGun = false;
+		if (TheCamera.Cams[TheCamera.ActiveCam].Using3rdPersonMouseCam()
+			&& (!CPad::GetPad(0)->GetLookBehindForPed() || TheCamera.m_bPlayerIsInGarage)
+			&& m_nPedState != PED_ENTER_CAR && m_nPedState != PED_CARJACK) {
+			eWeaponType wt = GetWeapon()->m_eWeaponType;
+			freeAimGun = (wt >= WEAPONTYPE_COLT45 && wt <= WEAPONTYPE_RUGER)
+				|| wt == WEAPONTYPE_M60 || wt == WEAPONTYPE_MINIGUN || wt == WEAPONTYPE_FLAMETHROWER;
+		}
+		if (freeAimGun) {
+			CVector firePos(0.0f, 0.0f, 0.6f);
+			firePos = GetMatrix() * firePos;
+			CVector src, tgt;
+			TheCamera.Find3rdPersonCamTargetVector(weaponInfo->m_fRange, firePos, src, tgt);
+			CColPoint cp;
+			CEntity *hitEnt = nil;
+			CVector mark = tgt;   // range endpoint if nothing is hit
+			if (CWorld::ProcessLineOfSight(src, tgt, cp, hitEnt, true, true, true, true, false, true))
+				mark = cp.point;
+			CWeaponEffects::MarkTarget(mark, 64, 0, 0, 255, 0.8f);
+		} else {
+			CWeaponEffects::ClearCrossHair();
+		}
+	}
+#endif
 	m_bHasLockOnTarget = m_pPointGunAt != nil;
 }
 

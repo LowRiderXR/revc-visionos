@@ -26,6 +26,11 @@
 #include "General.h"
 #include "VarConsole.h"
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_render_mode(void);
+extern "C" int vc_world_crosshair_on(void);   // VC_WORLD_XHAIR: world-anchored free-aim crosshair replaces the head-locked reticle
+#endif
+
 #if defined(FIX_BUGS)
 	#define SCREEN_SCALE_X_FIX(a) SCREEN_SCALE_X(a)
 	#define SCREEN_SCALE_Y_FIX(a) SCREEN_SCALE_Y(a)
@@ -254,12 +259,33 @@ void CHud::Draw()
 						|| WeaponType == WEAPONTYPE_M60 || WeaponType == WEAPONTYPE_MINIGUN
 						|| WeaponType == WEAPONTYPE_FLAMETHROWER) {
 						DrawCrossHairPC = 1;
+#ifdef LIBRW_VISIONOS
+						// Stereo: the on-foot 3rd-person reticle is head-locked and can't agree
+						// with a game-camera aim -> replaced entirely by the world-anchored
+						// crosshair (CWeaponEffects, per-eye). Don't set it here, so the whole
+						// crosshair block is skipped (no fall-through to the centred site sprite).
+						// The 1st-person-runabout drive-by reticle (Using3rdPersonMouseCam()==false)
+						// is unaffected. VC_WORLD_XHAIR=0 restores the head-locked reticle.
+						if (vc_render_mode() == 1 && vc_world_crosshair_on()
+							&& TheCamera.Cams[TheCamera.ActiveCam].Using3rdPersonMouseCam())
+							DrawCrossHairPC = 0;
+#endif
 					}
 				}
 			}
 		}
 
 		if (DrawCrossHair || DrawCrossHairPC) {
+#ifdef LIBRW_VISIONOS
+			// One-shot diagnostic: which head-locked crosshair path runs in stereo (should be
+			// NONE for on-foot free aim; only sniper/rocket/1st-person modes are expected here).
+			if (vc_render_mode() == 1) {
+				static bool logged = false;
+				if (!logged) { logged = true;
+					printf("[vc-xhair] Hud head-locked path RAN in stereo: DrawCrossHair=%d DrawCrossHairPC=%d Mode=%d Weapon=%d\n",
+					       DrawCrossHair, DrawCrossHairPC, Mode, (int)WeaponType); }
+			}
+#endif
 			RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void *)rwFILTERLINEAR);
 
 			SpriteBrightness = Min(SpriteBrightness+1, 30);

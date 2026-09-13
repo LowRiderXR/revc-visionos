@@ -1337,6 +1337,18 @@ float fAngleDist = 2.0f;
 float fFalloff = 3.0f;
 float fStickSens = 0.01f;
 float fTweakFOV = 1.1f;
+
+#ifdef LIBRW_VISIONOS
+// Right-stick aim/look sensitivity multiplier for the on-foot free-aim camera. The stock
+// scaling (fStickSens * 1/14) is very twitchy in VR; VC_AIM_SENSITIVITY lets the user dial
+// it down (e.g. 0.5) or up. Default 1.0 = stock. Read once.
+static float vcAimStickScale(void)
+{
+	static float s = -1.0f;
+	if(s < 0.0f){ const char *e = getenv("VC_AIM_SENSITIVITY"); s = e ? (float)atof(e) : 1.0f; if(s < 0.0f) s = 0.0f; }
+	return s;
+}
+#endif
 float fTranslateCamUp = 0.8f;
 int16 nFadeControlThreshhold = 45;
 float fDefaultAlphaOrient = -0.22f;
@@ -1398,6 +1410,10 @@ CCam::Process_FollowPedWithMouse(const CVector &CameraTarget, float TargetOrient
 		}else{
 			BetaOffset = LookLeftRight * fStickSens * (1.0f/14.0f) * FOV/80.0f * CTimer::GetTimeStep();
 			AlphaOffset = LookUpDown * fStickSens * (0.6f/14.0f) * FOV/80.0f * CTimer::GetTimeStep();
+#ifdef LIBRW_VISIONOS
+			BetaOffset  *= vcAimStickScale();   // VC_AIM_SENSITIVITY (default 1.0)
+			AlphaOffset *= vcAimStickScale();
+#endif
 		}
 	}
 
