@@ -1232,6 +1232,7 @@ CPlayerPed::ProcessAnimGroups(void)
 #ifdef LIBRW_VISIONOS
 extern "C" int vc_render_mode(void);
 extern "C" int vc_world_crosshair_on(void);   // VC_WORLD_XHAIR: world-anchored free-aim crosshair
+extern "C" int vc_get_head_forward(float dir[3]);   // rendered straight-ahead (head) direction
 #endif
 
 void
@@ -1507,8 +1508,13 @@ CPlayerPed::ProcessPlayerWeapon(CPad *padUsed)
 			CColPoint cp;
 			CEntity *hitEnt = nil;
 			CVector mark = tgt;   // range endpoint if nothing is hit
+			// Ignore the shooter so a level/downward ray can't hit Tommy's own collision
+			// (unnoticed here because the follow cam sits behind him, but correct to guard).
+			CEntity *savedIgnore = CWorld::pIgnoreEntity;
+			CWorld::pIgnoreEntity = this;
 			if (CWorld::ProcessLineOfSight(src, tgt, cp, hitEnt, true, true, true, true, false, true))
 				mark = cp.point;
+			CWorld::pIgnoreEntity = savedIgnore;
 			CWeaponEffects::MarkTarget(mark, 64, 0, 0, 255, 0.8f);
 		} else {
 			CWeaponEffects::ClearCrossHair();
@@ -1889,6 +1895,35 @@ CPlayerPed::ProcessControl(void)
 			}
 			break;
 		case PED_SNIPER_MODE:
+#ifdef LIBRW_VISIONOS
+			// Stereo: world-anchored crosshair for the 1st-person weapon zoom (rifle / sniper /
+			// laserscope). Trace the SAME head-forward ray the shot uses to the first solid hit;
+			// the marker then sits at the impact and coincides with the bullet. Ignore the shooter
+			// so the ray doesn't hit Tommy's own collision the moment it points level or down.
+			// The head-locked HUD reticle is suppressed in Hud.cpp for these modes. (This state
+			// does not run ProcessPlayerWeapon, so we set/clear the marker here.)
+			if (vc_render_mode() == 1 && vc_world_crosshair_on()) {
+				int mode = TheCamera.Cams[TheCamera.ActiveCam].Mode;
+				float hf[3];
+				if ((mode == CCam::MODE_M16_1STPERSON || mode == CCam::MODE_SNIPER) && vc_get_head_forward(hf)) {
+					CVector src = TheCamera.Cams[TheCamera.ActiveCam].Source;
+					CVector dir(hf[0], hf[1], hf[2]);
+					float range = GetWeapon()->GetInfo()->m_fRange;
+					CVector tgt = src + dir * range;
+					CColPoint cp;
+					CEntity *hitEnt = nil;
+					CVector mark = tgt;
+					CEntity *savedIgnore = CWorld::pIgnoreEntity;
+					CWorld::pIgnoreEntity = this;
+					if (CWorld::ProcessLineOfSight(src, tgt, cp, hitEnt, true, true, true, true, false, true))
+						mark = cp.point;
+					CWorld::pIgnoreEntity = savedIgnore;
+					CWeaponEffects::MarkTarget(mark, 64, 0, 0, 255, 0.8f);
+				} else {
+					CWeaponEffects::ClearCrossHair();   // sniper scope etc. keep their own overlay
+				}
+			}
+#endif
 			if (GetWeapon()->m_eWeaponType == WEAPONTYPE_SNIPERRIFLE || GetWeapon()->m_eWeaponType == WEAPONTYPE_LASERSCOPE) {
 				if (padUsed)
 					PlayerControlSniper(padUsed);

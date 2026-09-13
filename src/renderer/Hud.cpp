@@ -275,6 +275,19 @@ void CHud::Draw()
 			}
 		}
 
+#ifdef LIBRW_VISIONOS
+		// Stereo: the on-foot 1st-person weapon zoom (rifle M16 / sniper / laserscope) uses the
+		// world-anchored crosshair (PlayerPed PED_SNIPER_MODE), which follows the head and
+		// coincides with the shot. The head-locked HUD reticle/scope here is vertically offset
+		// (does not match the shot), so suppress it entirely for these modes. Runabout drive-by,
+		// rocket, helicannon and camera keep their overlays. VC_WORLD_XHAIR=0 restores them.
+		if (vc_render_mode() == 1 && vc_world_crosshair_on()
+			&& (Mode == CCam::MODE_M16_1STPERSON || Mode == CCam::MODE_SNIPER)) {
+			DrawCrossHair = false;
+			DrawCrossHairPC = false;
+		}
+#endif
+
 		if (DrawCrossHair || DrawCrossHairPC) {
 			RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void *)rwFILTERLINEAR);
 

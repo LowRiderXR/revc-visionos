@@ -37,6 +37,11 @@
 #include "Pickups.h"
 #include "SaveBuf.h"
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_render_mode(void);
+extern "C" int vc_get_head_forward(float dir[3]);     // rendered straight-ahead (head) dir; shot follows it in 1st-person
+#endif
+
 float fReloadAnimSampleFraction[5] = {  0.5f,  0.7f,  0.75f,  0.75f,  0.7f };
 float fSeaSparrowAimingAngle = 10.0f;
 float fHunterAimingAngle = 30.0f;
@@ -2300,6 +2305,16 @@ CWeapon::FireSniper(CEntity *shooter)
 	CVector source = cam->Source;
 	CVector dir    = cam->Front;
 
+#ifdef LIBRW_VISIONOS
+	// Stereo: couple the shot to the HEAD (rendered straight-ahead / centred head-locked
+	// scope), not the game camera. See FireM16_1stPerson.
+	if (vc_render_mode() == 1 && shooter == FindPlayerPed()) {
+		float hf[3];
+		if (vc_get_head_forward(hf))
+			dir = CVector(hf[0], hf[1], hf[2]);
+	}
+#endif
+
 	if ( DotProduct(dir, CVector(0.0f, -0.9894f, 0.145f)) > 0.997f )
 		CCoronas::MoonSize = (CCoronas::MoonSize+1) & 7;
 
@@ -2420,7 +2435,18 @@ CWeapon::FireM16_1stPerson(CEntity *shooter)
 	ASSERT(cam!=nil);
 
 	CVector source = cam->Source;
-	CVector target = cam->Front*info->m_fRange + source;
+	CVector fdir   = cam->Front;   // shot direction
+#ifdef LIBRW_VISIONOS
+	// Stereo: the eye renders head-composed, and the crosshair is the CENTRED head-locked
+	// reticle, so the shot must follow the HEAD (rendered straight-ahead), not the game
+	// camera. Couple it to vc_get_head_forward so the bullet hits the crosshair.
+	if (vc_render_mode() == 1 && shooter == FindPlayerPed()) {
+		float hf[3];
+		if (vc_get_head_forward(hf))
+			fdir = CVector(hf[0], hf[1], hf[2]);
+	}
+#endif
+	CVector target = fdir*info->m_fRange + source;
 
 	if (ProcessLineOfSight(source, target, point, victim, m_eWeaponType, shooter, true, true, true, true, true, true, false)) {
 		CheckForShootingVehicleOccupant(&victim, &point, m_eWeaponType, source, target);
@@ -2430,7 +2456,7 @@ CWeapon::FireM16_1stPerson(CEntity *shooter)
 	CWorld::bIncludeBikers = false;
 	CWorld::bIncludeCarTyres = false;
 
-	CVector2D front(cam->Front.x, cam->Front.y);
+	CVector2D front(fdir.x, fdir.y);
 	front.Normalise();
 
 	DoBulletImpact(shooter, victim, &source, &target, &point, front);

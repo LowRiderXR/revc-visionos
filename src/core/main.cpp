@@ -1551,6 +1551,24 @@ static bool vcWorldCrosshairOn(void)
 }
 extern "C" int vc_world_crosshair_on(void) { return vcWorldCrosshairOn() ? 1 : 0; }
 
+// Center head forward in game-world space, decoded from the last eye pass's view EXACTLY
+// like vcStereoSetGameCamera (orientation only -> centre, no eye offset). This is the
+// direction the eye renders straight ahead. The 1st-person weapon shot AND its world-anchored
+// crosshair both aim along this, so they coincide. 0 if no eye view yet.
+extern "C" int vc_get_head_forward(float dir[3])
+{
+	float v[16];
+	if(!vc_get_eye_view(v)) return 0;
+	CVector R(-v[0], v[1], v[2]), F(-v[4], v[5], v[6]), U(-v[8], v[9], v[10]), P(-v[12], v[13], v[14]);
+	CMatrix rwView = TheCamera.m_viewMatrix;
+	rwView.GetRight() = R; rwView.GetForward() = F; rwView.GetUp() = U; rwView.GetPosition() = P;
+	CMatrix world = Invert(rwView);
+	CVector look  = world.GetUp();     // RW "at" (col2) = look, per vcStereoSetGameCamera
+	look.Normalise();
+	dir[0] = look.x; dir[1] = look.y; dir[2] = look.z;
+	return 1;
+}
+
 // --- Cull with the head pose (VC_CULL_HEADPOSE, default ON) ---------------------------
 // ConstructRenderList/ScanWorld cull against TheCamera's RwCamera-FRAME matrix + view
 // window BEFORE the per-eye loop, i.e. with the plain game camera (no head rotation). So
