@@ -776,6 +776,32 @@ void cSampleManager::ReacquireDigitalHandle(void)
 	// TODO? alcProcessContext
 }
 
+#ifdef LIBRW_VISIONOS
+// visionOS: taking the headset off suspends the app and fires an AVAudioSession
+// interruption that STOPS openal-soft's output AudioUnit. Reactivating the session
+// (Swift side) is NOT enough -- the backend unit stays stopped, so audio is silent
+// after re-donning (measured: session stays .playback/[Speaker], yet no sound). The
+// host calls this from its interruption handler: pause the device on begin, and on end
+// resume + reset the backend, which recreates the RemoteIO unit while keeping the
+// context/sources/buffers intact so playback resumes. Extensions resolved via
+// alcGetProcAddress (robust vs. static-link visibility). openal-soft locks the device
+// internally, so calling this from the notification thread is safe against the mixer.
+extern "C" void vc_audio_interruption(int began)
+{
+	if ( ALDevice == NULL )
+		return;
+	static LPALCDEVICEPAUSESOFT  pPause  = (LPALCDEVICEPAUSESOFT) alcGetProcAddress(ALDevice, "alcDevicePauseSOFT");
+	static LPALCDEVICERESUMESOFT pResume = (LPALCDEVICERESUMESOFT)alcGetProcAddress(ALDevice, "alcDeviceResumeSOFT");
+	static LPALCRESETDEVICESOFT  pReset  = (LPALCRESETDEVICESOFT) alcGetProcAddress(ALDevice, "alcResetDeviceSOFT");
+	if ( began ) {
+		if ( pPause ) pPause(ALDevice);
+	} else {
+		if ( pResume ) pResume(ALDevice);
+		if ( pReset ) pReset(ALDevice, NULL);
+	}
+}
+#endif
+
 bool8
 cSampleManager::Initialise(void)
 {
