@@ -116,10 +116,10 @@ extern "C" int vc_double_render_mode(void)
 }
 
 // Render mode seam. Mirror of vc_render_mode_t in AvpViceCity/VCPlatform.h --
-// values MUST match. Read once from VC_RENDER_MODE (default cinema). Stereo is
-// not implemented yet, so it logs a stub line and falls back to cinema; the
-// EFFECTIVE mode returned here is therefore cinema. Kept in a mutable global (no
-// compile-time bake-in) so a later runtime switch stays possible.
+// values MUST match. Read once from VC_RENDER_MODE: default STEREO; only
+// VC_RENDER_MODE=cinema selects the single flat cinema screen (comparison/cutscene
+// fallback). Kept in a mutable global (no compile-time bake-in) so a later runtime
+// switch stays possible.
 enum { VC_MODE_CINEMA = 0, VC_MODE_STEREO = 1 };
 static int g_renderMode = -1;   // -1 = not yet resolved
 

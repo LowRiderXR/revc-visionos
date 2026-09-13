@@ -8,10 +8,6 @@
 #include "World.h"
 #include "WeaponType.h"
 
-#ifdef LIBRW_VISIONOS
-extern "C" int vc_render_mode(void);
-#endif
-
 RwTexture *gpCrossHairTex;
 
 CWeaponEffects gCrossHair;
@@ -91,14 +87,6 @@ CWeaponEffects::Render(void)
 
 	if ( gCrossHair.m_bActive )
 	{
-#ifdef LIBRW_VISIONOS
-		// One-shot diagnostic: confirm the world-anchored crosshair (this path) runs in stereo.
-		if (vc_render_mode() == 1) {
-			static bool logged = false;
-			if (!logged) { logged = true;
-				printf("[vc-xhair] world crosshair (CWeaponEffects::MarkTarget) RAN in stereo\n"); }
-		}
-#endif
 		float size = aCrossHairSize[FindPlayerPed()->GetWeapon()->m_eWeaponType];
 		
 		RwRenderStateSet(rwRENDERSTATEZWRITEENABLE,      (void *)FALSE);

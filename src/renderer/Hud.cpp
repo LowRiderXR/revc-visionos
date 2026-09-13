@@ -276,16 +276,6 @@ void CHud::Draw()
 		}
 
 		if (DrawCrossHair || DrawCrossHairPC) {
-#ifdef LIBRW_VISIONOS
-			// One-shot diagnostic: which head-locked crosshair path runs in stereo (should be
-			// NONE for on-foot free aim; only sniper/rocket/1st-person modes are expected here).
-			if (vc_render_mode() == 1) {
-				static bool logged = false;
-				if (!logged) { logged = true;
-					printf("[vc-xhair] Hud head-locked path RAN in stereo: DrawCrossHair=%d DrawCrossHairPC=%d Mode=%d Weapon=%d\n",
-					       DrawCrossHair, DrawCrossHairPC, Mode, (int)WeaponType); }
-			}
-#endif
 			RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void *)rwFILTERLINEAR);
 
 			SpriteBrightness = Min(SpriteBrightness+1, 30);
