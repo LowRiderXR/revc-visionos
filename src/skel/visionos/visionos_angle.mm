@@ -1387,19 +1387,7 @@ typedef struct {
 
 static VCStereoBuffer g_stereoBuf[VC_NUM_BUFFERS];
 static GLuintVC       g_stereoDepthRbo = 0;
-static GLuintVC       g_stereoDepthRbo1 = 0;   // VC_EYE_DEPTH_SPLIT: dedicated depth for eye 1
 static bool           g_stereoReady    = false;
-
-// VC_EYE_DEPTH_SPLIT (default off): give each eye its OWN depth renderbuffer instead of one
-// shared by both eye FBOs. Tests/fixes the "eye 1 inherits eye 0's depth" hypothesis (a
-// per-eye glClear on a SHARED depth attachment can be coalesced away by ANGLE/Metal, so the
-// second eye finds the first eye's Z -> geometry shows through walls in the right eye only).
-static bool vcEyeDepthSplit(void)
-{
-	static int e = -1;
-	if (e < 0) { const char *s = getenv("VC_EYE_DEPTH_SPLIT"); e = (s && s[0] == '1') ? 1 : 0; }
-	return e != 0;
-}
 static bool           g_stereoFailed   = false;
 
 extern "C" bool  vc_stereo_ready(void) { return g_stereoReady; }
@@ -1612,27 +1600,10 @@ vcrt_stereo_ensure(void)
 
 	const int W = g_rtWidth, H = g_rtHeight;
 
-	// Depth renderbuffer(s). Default: ONE, shared by all eye FBOs, cleared per pass.
-	// VC_EYE_DEPTH_SPLIT: a SECOND one so eye 1 gets its own depth (see vcEyeDepthSplit()).
+	// Depth renderbuffer: ONE, shared by all eye FBOs, cleared per pass.
 	glGenRenderbuffers_(1, &g_stereoDepthRbo);
 	glBindRenderbuffer_(VC_GL_RENDERBUFFER, g_stereoDepthRbo);
 	glRenderbufferStorage_(VC_GL_RENDERBUFFER, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
-	if (vcEyeDepthSplit()) {
-		glGenRenderbuffers_(1, &g_stereoDepthRbo1);
-		glBindRenderbuffer_(VC_GL_RENDERBUFFER, g_stereoDepthRbo1);
-		glRenderbufferStorage_(VC_GL_RENDERBUFFER, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
-	}
-	// Unconditional status: whether the per-eye depth split is REQUESTED, and whether it is
-	// actually EFFECTIVE. The split only affects the non-MSAA slice FBOs (see the depth attach
-	// below); with MSAA on, both eyes render into the shared g_msaaFbo with ONE shared depth,
-	// so the split does nothing. MSAA defaults to 2x -> a depth-split test needs VC_MSAA=0.
-	{
-		int msaa = vcMsaaSamples();
-		bool requested = vcEyeDepthSplit();
-		bool effective = requested && msaa == 0;
-		VCLOG(@"[vc-depth] VC_EYE_DEPTH_SPLIT requested=%d  VC_MSAA=%d  split_effective=%d  (split needs MSAA=0)",
-		      requested ? 1 : 0, msaa, effective ? 1 : 0);
-	}
 
 	for (int i = 0; i < g_numBuffers; i++) {
 		VCStereoBuffer *b = &g_stereoBuf[i];
@@ -1664,8 +1635,7 @@ vcrt_stereo_ensure(void)
 			p_glGenFramebuffers(1, &b->fbo[s]);
 			p_glBindFramebuffer(VC_GL_FRAMEBUFFER, b->fbo[s]);
 			p_glFramebufferTexture2D(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0, VC_GL_TEXTURE_2D, b->glTex[s], 0);
-			GLuintVC depthRbo = (vcEyeDepthSplit() && s == 1) ? g_stereoDepthRbo1 : g_stereoDepthRbo;
-			p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, depthRbo);
+			p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, g_stereoDepthRbo);
 			GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
 			VCLOG(@"[vc-stereo] buffer %d slice %d: %dx%d RGBA8 gltex %u fbo %u bindErr=0x%x status=%s",
 			      i, s, W, H, b->glTex[s], b->fbo[s], (unsigned)bindErr, vcrt_fbo_status_name(status));
@@ -1832,25 +1802,14 @@ vc_stereo_msaa_resolve_pending(void)
 // eye passes render into the buffer that will be published this frame. With
 // VC_MSAA>0 the eyes render into the shared multisample FBO instead, and the
 // previous eye is resolved into its slice here (its RenderScene has finished).
-// VC_EYE_SLICE_SWAP (diag): swap which SLICE each eye pass writes into (eye 0 -> slice 1,
-// eye 1 -> slice 0), keeping the pass order and per-eye view/projection. Separates a
-// "slice/target" cause from a "pass-order/eye-index" cause for the right-eye through-wall:
-// if the problem MOVES to the left eye -> it follows the eye/pass; if it STAYS right -> it
-// follows the slice target.
-static bool vcEyeSliceSwap(void)
-{
-	static int e = -1;
-	if (e < 0) { const char *s = getenv("VC_EYE_SLICE_SWAP"); e = (s && s[0] == '1') ? 1 : 0; }
-	return e != 0;
-}
 extern "C" unsigned int
 vc_stereo_eye_fbo(int eye)
 {
 	if (!(g_stereoReady && (eye == 0 || eye == 1))) return 0;
-	int slot = vcEyeSliceSwap() ? (1 - eye) : eye;
+	int slot = eye;
 	if (vcMsaaSamples() > 0 && vcrt_msaa_ensure()) {
 		vc_stereo_msaa_resolve_pending();   // resolve the previous eye before reusing the shared FBO
-		g_msaaPending = slot;               // resolve target = (possibly swapped) slice
+		g_msaaPending = slot;               // resolve target = slice
 		return g_msaaFbo;
 	}
 	return g_stereoBuf[g_currentBack].fbo[slot];

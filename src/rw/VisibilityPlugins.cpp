@@ -118,6 +118,51 @@ CVisibilityPlugins::InitAlphaAtomicList(void)
 	m_alphaList.Clear();
 }
 
+#ifdef LIBRW_VISIONOS
+// Baseline snapshot storage for the stereo alpha-list restore (see the header). Sized to
+// each list's capacity. AlphaObjectInfo is a small POD (pointer + sort key).
+static CVisibilityPlugins::AlphaObjectInfo s_entitySave[NUMALPHAENTITYLIST];
+static CVisibilityPlugins::AlphaObjectInfo s_underwaterSave[NUMALPHAUNTERWATERENTITYLIST];
+static CVisibilityPlugins::AlphaObjectInfo s_boatSave[NUMBOATALPHALIST];
+static int s_nEntitySave = 0, s_nUnderwaterSave = 0, s_nBoatSave = 0;
+
+static int
+vcSaveList(CLinkList<CVisibilityPlugins::AlphaObjectInfo> &list,
+           CVisibilityPlugins::AlphaObjectInfo *out, int cap)
+{
+	int n = 0;
+	for(CLink<CVisibilityPlugins::AlphaObjectInfo> *l = list.head.next;
+	    l != &list.tail && n < cap; l = l->next)
+		out[n++] = l->item;
+	return n;
+}
+
+static void
+vcRestoreList(CLinkList<CVisibilityPlugins::AlphaObjectInfo> &list,
+              const CVisibilityPlugins::AlphaObjectInfo *in, int n)
+{
+	list.Clear();
+	for(int i = 0; i < n; i++)
+		list.InsertSorted(in[i]);
+}
+
+void
+CVisibilityPlugins::SaveAlphaBaseline(void)
+{
+	s_nEntitySave     = vcSaveList(m_alphaEntityList,           s_entitySave,     NUMALPHAENTITYLIST);
+	s_nUnderwaterSave = vcSaveList(m_alphaUnderwaterEntityList, s_underwaterSave, NUMALPHAUNTERWATERENTITYLIST);
+	s_nBoatSave       = vcSaveList(m_alphaBoatAtomicList,       s_boatSave,       NUMBOATALPHALIST);
+}
+
+void
+CVisibilityPlugins::RestoreAlphaBaseline(void)
+{
+	vcRestoreList(m_alphaEntityList,           s_entitySave,     s_nEntitySave);
+	vcRestoreList(m_alphaUnderwaterEntityList, s_underwaterSave, s_nUnderwaterSave);
+	vcRestoreList(m_alphaBoatAtomicList,       s_boatSave,       s_nBoatSave);
+}
+#endif
+
 bool
 CVisibilityPlugins::InsertAtomicIntoSortedList(RpAtomic *a, float dist)
 {

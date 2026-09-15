@@ -1526,26 +1526,30 @@ static bool vcStereoLogOn(void)   // VC_STEREO_LOG: per-frame stereo-state probe
 	if(e < 0){ const char *s = getenv("VC_STEREO_LOG"); e = (s && s[0] == '1') ? 1 : 0; }
 	return e != 0;
 }
-// VC_DRAW_LOG: per-eye count of entities dispatched to draw (buildings / non-road /
-// roads), measured at the end of each eye pass, throttled. eye 1 > eye 0 means extra
-// geometry is drawn in the second pass; equal counts mean the wall is overwritten.
-static bool vcDrawLogOn(void)
-{
-	static int e = -1;
-	if(e < 0){ const char *s = getenv("VC_DRAW_LOG"); e = (s && s[0] == '1') ? 1 : 0; }
-	return e != 0;
-}
-// VC_STEREO_ZFIX (default OFF): render-state-leak test. Hypothesis: eye 0 ends with
-// RenderEffects/DoFade leaving ZWRITE/ZTEST disabled; eye 1's pass inherits that (the eye
-// pass does not reset RW render state), so eye 1's walls write no depth -> everything
-// behind them (only visible in the police station, where the exterior sits behind the
-// walls) shows through. When on: log the ZWRITE/ZTEST state as each eye pass BEGINS (that
-// per-eye BEFORE state is the proof, regardless of whether the fix helps), then force both
-// back ON. Off = stock behavior.
+// VC_STEREO_ZFIX (default ON): reset ZWRITE/ZTEST at the start of each stereo eye pass.
+// The game normalizes render state at frame end, not start, so the second eye pass would
+// otherwise inherit eye 0's disabled depth state (see the eye loop). VC_STEREO_ZFIX=0
+// restores the old (broken) behavior for comparison.
 static bool vcStereoZFixOn(void)
 {
 	static int e = -1;
-	if(e < 0){ const char *s = getenv("VC_STEREO_ZFIX"); e = (s && s[0] == '1') ? 1 : 0; }
+	if(e < 0){ const char *s = getenv("VC_STEREO_ZFIX"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0;
+}
+// VC_STEREO_ALPHAFIX (default ON): restore the CVisibilityPlugins alpha collection lists
+// to their per-frame scan baseline before each eye pass, so the second eye does not inherit
+// the first eye's per-pass entries (double-drawn transparency / list overflow). =0 disables.
+static bool vcStereoAlphaFixOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_STEREO_ALPHAFIX"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0;
+}
+// VC_ALPHA_LOG (default OFF): per-eye alpha-list fill counts at end of each pass, throttled.
+static bool vcAlphaLogOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_ALPHA_LOG"); e = (s && s[0] == '1') ? 1 : 0; }
 	return e != 0;
 }
 #endif
@@ -2121,6 +2125,11 @@ Idle(void *arg)
 				vc_set_stereo_sky_clear(r, g, b);
 			}
 			if (vcStereoCameraOn()) vcStereoSaveGameCamera();
+#ifdef LIBRW_VISIONOS
+				// Snapshot the per-frame (scan-built) baseline of the alpha collection lists
+				// before rendering any eye, so each pass can be restored to it (see below).
+				if (vcStereoAlphaFixOn()) CVisibilityPlugins::SaveAlphaBaseline();
+#endif
 			for (int eye = 0; eye < 2; eye++) {
 				vc_stereo_eye_pass(eye);
 				// Set TheCamera to this eye (CPU sky/coronas/lighting read it). GPU world
@@ -2140,35 +2149,33 @@ Idle(void *arg)
 #endif
 				vcEyeTag = eye + 1;   // mark: CalcScreenCoors calls now belong to this eye
 #ifdef LIBRW_VISIONOS
-				// Q2 test: count entities actually dispatched to draw in this eye's pass.
-				// eye 1 > eye 0 -> extra (outside) geometry is drawn; eye 1 == eye 0 -> same
-				// set drawn, so the wall is overwritten rather than missing.
-				extern int vc_pass_nBuildings, vc_pass_nNonRoad, vc_pass_nRoads;
-				vc_pass_nBuildings = vc_pass_nNonRoad = vc_pass_nRoads = 0;
-				// State-leak test: read ZWRITE/ZTEST as this eye's pass BEGINS (the proof),
-				// then optionally force them back on.
+				// The game normalizes render state at frame END (DefinedState / effect
+				// teardown), not at frame start. In stereo we render the world TWICE per
+				// frame, so the second eye pass inherits eye 0's leftover state: eye 0's
+				// RenderEffects/DoFade leave ZWRITE/ZTEST disabled, so eye 1's opaque walls
+				// write no depth and whatever is behind them shows through. This is only
+				// visible in the police station, the one interior with exterior geometry
+				// sitting behind its walls (and appears ~1s in, once that exterior streams).
+				// Reset depth state at the start of every eye pass. VC_STEREO_ZFIX=0 disables.
 				if (vcStereoZFixOn()) {
-					static bool zfixAnnounced = false;
-					if (!zfixAnnounced) { zfixAnnounced = true;
-						printf("[vc-zfix] ACTIVE: forcing ZWRITE+ZTEST on at each eye-pass start\n"); }
-					RwUInt32 zwBefore = 0, ztBefore = 0;
-					RwRenderStateGet(rwRENDERSTATEZWRITEENABLE, &zwBefore);
-					RwRenderStateGet(rwRENDERSTATEZTESTENABLE, &ztBefore);
-					if ((CTimer::GetFrameCounter() % 120u) == 0)
-						printf("[vc-zfix] fc=%u eye=%d area=%d before: ZWRITE=%u ZTEST=%u\n",
-						       (unsigned)CTimer::GetFrameCounter(), eye, CGame::currArea,
-						       (unsigned)zwBefore, (unsigned)ztBefore);
 					RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
 					RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
 				}
+				// Restore the alpha collection lists to the per-frame scan baseline so this
+				// eye does not inherit the previous eye's per-pass entries (which would
+				// double-draw transparency -> brighter glass/fences in eye 1, and risk
+				// overflowing the fixed-capacity lists). VC_STEREO_ALPHAFIX=0 disables.
+				if (vcStereoAlphaFixOn()) CVisibilityPlugins::RestoreAlphaBaseline();
 #endif
 				RenderScene();
 #ifdef LIBRW_VISIONOS
-				if (vcDrawLogOn() && (CTimer::GetFrameCounter() % 120u) == 0) {
-					printf("[vc-draw] fc=%u eye=%d area=%d bld=%d nonroad=%d road=%d\n",
+				// A/B verification: with the fix on, eye 0 and eye 1 ent counts should match.
+				if (vcAlphaLogOn() && (CTimer::GetFrameCounter() % 120u) == 0)
+					printf("[vc-alpha] fc=%u eye=%d area=%d ent=%d uw=%d boat=%d\n",
 					       (unsigned)CTimer::GetFrameCounter(), eye, CGame::currArea,
-					       vc_pass_nBuildings, vc_pass_nNonRoad, vc_pass_nRoads);
-				}
+					       CVisibilityPlugins::m_alphaEntityList.Count(),
+					       CVisibilityPlugins::m_alphaUnderwaterEntityList.Count(),
+					       CVisibilityPlugins::m_alphaBoatAtomicList.Count());
 #endif
 				// World-referenced effects (particles, coronas, glass, weapon fx,
 				// shadows...) belong IN the slices, per eye, with parallax -- not in

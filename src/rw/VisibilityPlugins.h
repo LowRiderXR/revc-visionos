@@ -46,6 +46,15 @@ public:
 	static void InitAlphaAtomicList(void);
 	static bool InsertAtomicIntoSortedList(RpAtomic *a, float dist);
 	static bool InsertAtomicIntoBoatSortedList(RpAtomic *a, float dist);
+#ifdef LIBRW_VISIONOS
+	// Stereo baseline-restore: the alpha collection lists are cleared once per frame
+	// (InitAlphaEntityList in ScanWorld) but appended per pass. SaveAlphaBaseline()
+	// snapshots the scan-built baseline before the eye loop; RestoreAlphaBaseline()
+	// puts each list back to that baseline before every eye pass, so no pass inherits
+	// another eye's per-pass entries (which would double-draw transparency / overflow).
+	static void SaveAlphaBaseline(void);
+	static void RestoreAlphaBaseline(void);
+#endif
 
 	static void SetRenderWareCamera(RwCamera *camera);
 	static void SetupVehicleVariables(RpClump *vehicle);

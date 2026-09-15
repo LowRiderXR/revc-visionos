@@ -52,13 +52,6 @@ struct EntityInfo
 
 CLinkList<EntityInfo> gSortedVehiclesAndPeds;
 
-#ifdef LIBRW_VISIONOS
-// Per-pass draw counters (Q2 stereo diagnostic): reset before each eye's RenderScene in
-// the eye loop, read after. Incremented at the dispatch point of the old-renderer draw
-// functions below.
-int vc_pass_nBuildings = 0, vc_pass_nNonRoad = 0, vc_pass_nRoads = 0;
-#endif
-
 int32 CRenderer::ms_nNoOfVisibleEntities;
 CEntity *CRenderer::ms_aVisibleEntityPtrs[NUMVISIBLEENTITIES];
 CEntity *CRenderer::ms_aInVisibleEntityPtrs[NUMINVISIBLEENTITIES];
@@ -135,9 +128,6 @@ CRenderer::PreRender(void)
 void
 CRenderer::RenderOneRoad(CEntity *e)
 {
-#ifdef LIBRW_VISIONOS
-	vc_pass_nRoads++;
-#endif
 #ifndef FINAL
 	if(gbDontRenderBuildings)
 		return;
@@ -163,10 +153,6 @@ CRenderer::RenderOneNonRoad(CEntity *e)
 	CVehicle *veh;
 	int i;
 	bool resetLights;
-
-#ifdef LIBRW_VISIONOS
-	if(e->IsBuilding()) vc_pass_nBuildings++; else vc_pass_nNonRoad++;
-#endif
 
 #ifndef MASTER
 	if(gbShowCollisionPolys || gbShowCollisionPolysReflections || gbShowCollisionPolysNoShadows){
