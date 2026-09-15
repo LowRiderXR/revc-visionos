@@ -196,6 +196,21 @@ static uint64_t g_lastConsumedPoseSetTime = 0;
 extern "C" uint64_t vc_last_consumed_pose_time(void) { return g_lastConsumedPoseSetTime; }
 extern "C" int vc_perf_log(void);   // defined below; gates verbose perf logs
 
+// [vc-stereo] diagnostic: how old (ms) is the most recently PUSHED head pose right now
+// (push->now), and how long (ms) since this was last called (game-thread frame spacing --
+// balloons if a synchronous interior load blocks the game thread). Uses the mach timebase.
+extern "C" void vc_stereo_probe(double *poseAgeMs, double *frameDtMs)
+{
+	static uint64_t sNum = 0, sDen = 0;
+	if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
+	uint64_t now = mach_absolute_time();
+	pthread_mutex_lock(&g_mtxMutex); uint64_t setT = g_ovSetTime; pthread_mutex_unlock(&g_mtxMutex);
+	if (poseAgeMs) *poseAgeMs = (setT != 0) ? (double)(now - setT) * (double)sNum / (double)sDen / 1.0e6 : -1.0;
+	static uint64_t sLast = 0;
+	if (frameDtMs) *frameDtMs = (sLast != 0) ? (double)(now - sLast) * (double)sNum / (double)sDen / 1.0e6 : 0.0;
+	sLast = now;
+}
+
 extern "C" void vc_get_view_matrix(float m[16])
 {
 	uint64_t now = mach_absolute_time();

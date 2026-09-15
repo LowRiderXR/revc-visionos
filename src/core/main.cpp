@@ -1517,10 +1517,43 @@ static void vcStereoRestoreGameCamera(void)
 	TheCamera.m_viewMatrix.GetPosition() = vcSavedViewMatrix.GetPosition();
 	vcGameCamSaved = false;
 }
+static int g_vcStereoApplied = 0;   // [vc-stereo] did vcStereoSetGameCamera get an eye view this call?
+#ifdef LIBRW_VISIONOS
+extern "C" void vc_stereo_probe(double *poseAgeMs, double *frameDtMs);
+static bool vcStereoLogOn(void)   // VC_STEREO_LOG: per-frame stereo-state probe (door-transition diag)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_STEREO_LOG"); e = (s && s[0] == '1') ? 1 : 0; }
+	return e != 0;
+}
+// VC_DRAW_LOG: per-eye count of entities dispatched to draw (buildings / non-road /
+// roads), measured at the end of each eye pass, throttled. eye 1 > eye 0 means extra
+// geometry is drawn in the second pass; equal counts mean the wall is overwritten.
+static bool vcDrawLogOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_DRAW_LOG"); e = (s && s[0] == '1') ? 1 : 0; }
+	return e != 0;
+}
+// VC_STEREO_ZFIX (default OFF): render-state-leak test. Hypothesis: eye 0 ends with
+// RenderEffects/DoFade leaving ZWRITE/ZTEST disabled; eye 1's pass inherits that (the eye
+// pass does not reset RW render state), so eye 1's walls write no depth -> everything
+// behind them (only visible in the police station, where the exterior sits behind the
+// walls) shows through. When on: log the ZWRITE/ZTEST state as each eye pass BEGINS (that
+// per-eye BEFORE state is the proof, regardless of whether the fix helps), then force both
+// back ON. Off = stock behavior.
+static bool vcStereoZFixOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_STEREO_ZFIX"); e = (s && s[0] == '1') ? 1 : 0; }
+	return e != 0;
+}
+#endif
 static void vcStereoSetGameCamera(int eye)
 {
 	float v[16];
-	if(!vc_get_eye_view(v)) return;
+	if(!vc_get_eye_view(v)){ g_vcStereoApplied = 0; return; }
+	g_vcStereoApplied = 1;
 	// RW view columns = librw columns with x-component negated (undo the beginUpdate X-flip).
 	CVector R(-v[0], v[1], v[2]), F(-v[4], v[5], v[6]), U(-v[8], v[9], v[10]), P(-v[12], v[13], v[14]);
 	CMatrix rwView = TheCamera.m_viewMatrix;   // copy for valid struct/padding, then overwrite
@@ -2093,8 +2126,50 @@ Idle(void *arg)
 				// Set TheCamera to this eye (CPU sky/coronas/lighting read it). GPU world
 				// path is unchanged (eye pass already uploaded the uniform) -> world identical.
 				if (vcStereoCameraOn()) vcStereoSetGameCamera(eye);
+#ifdef LIBRW_VISIONOS
+				// [vc-stereo] once per frame (eye 0): camera mode, whether the per-eye camera
+				// applied, the age of the newest pushed head pose, and the game-thread frame
+				// spacing. A door-transition stall shows as a big frameDtMs + poseAgeMs spike
+				// (candidate 1); a mode switch with applied=0 for a few frames is candidate 2.
+				if (eye == 0 && vcStereoLogOn()) {
+					double ageMs = 0.0, dtMs = 0.0; vc_stereo_probe(&ageMs, &dtMs);
+					printf("[vc-stereo] fc=%u cam=%d mode=%d applied=%d poseAgeMs=%.1f frameDtMs=%.1f\n",
+					       (unsigned)CTimer::GetFrameCounter(), TheCamera.ActiveCam,
+					       TheCamera.Cams[TheCamera.ActiveCam].Mode, g_vcStereoApplied, ageMs, dtMs);
+				}
+#endif
 				vcEyeTag = eye + 1;   // mark: CalcScreenCoors calls now belong to this eye
+#ifdef LIBRW_VISIONOS
+				// Q2 test: count entities actually dispatched to draw in this eye's pass.
+				// eye 1 > eye 0 -> extra (outside) geometry is drawn; eye 1 == eye 0 -> same
+				// set drawn, so the wall is overwritten rather than missing.
+				extern int vc_pass_nBuildings, vc_pass_nNonRoad, vc_pass_nRoads;
+				vc_pass_nBuildings = vc_pass_nNonRoad = vc_pass_nRoads = 0;
+				// State-leak test: read ZWRITE/ZTEST as this eye's pass BEGINS (the proof),
+				// then optionally force them back on.
+				if (vcStereoZFixOn()) {
+					static bool zfixAnnounced = false;
+					if (!zfixAnnounced) { zfixAnnounced = true;
+						printf("[vc-zfix] ACTIVE: forcing ZWRITE+ZTEST on at each eye-pass start\n"); }
+					RwUInt32 zwBefore = 0, ztBefore = 0;
+					RwRenderStateGet(rwRENDERSTATEZWRITEENABLE, &zwBefore);
+					RwRenderStateGet(rwRENDERSTATEZTESTENABLE, &ztBefore);
+					if ((CTimer::GetFrameCounter() % 120u) == 0)
+						printf("[vc-zfix] fc=%u eye=%d area=%d before: ZWRITE=%u ZTEST=%u\n",
+						       (unsigned)CTimer::GetFrameCounter(), eye, CGame::currArea,
+						       (unsigned)zwBefore, (unsigned)ztBefore);
+					RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
+					RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
+				}
+#endif
 				RenderScene();
+#ifdef LIBRW_VISIONOS
+				if (vcDrawLogOn() && (CTimer::GetFrameCounter() % 120u) == 0) {
+					printf("[vc-draw] fc=%u eye=%d area=%d bld=%d nonroad=%d road=%d\n",
+					       (unsigned)CTimer::GetFrameCounter(), eye, CGame::currArea,
+					       vc_pass_nBuildings, vc_pass_nNonRoad, vc_pass_nRoads);
+				}
+#endif
 				// World-referenced effects (particles, coronas, glass, weapon fx,
 				// shadows...) belong IN the slices, per eye, with parallax -- not in
 				// the cinema buffer (which stereo never shows). Timed as the fx segment.
