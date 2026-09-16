@@ -48,6 +48,12 @@ bool CWorld::bIncludeBikers;
 
 CColPoint CWorld::m_aTempColPts[MAX_COLLISION_POINTS];
 
+#ifdef LIBRW_VISIONOS
+// Stereo ped-anim head-pose gate (defined in main.cpp).
+extern "C" int vc_anim_headpose_visible(float wx, float wy, float wz, float radius);
+extern int vc_anim_headpose_promoted;
+#endif
+
 void
 CWorld::Initialise()
 {
@@ -1946,6 +1952,9 @@ CWorld::Process(void)
 		CRecordDataForChase::ProcessControlCars();
 		CRecordDataForChase::SaveOrRetrieveCarPositions();
 	} else {
+#ifdef LIBRW_VISIONOS
+		vc_anim_headpose_promoted = 0;
+#endif
 		for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
 			CEntity *movingEnt = (CEntity *)node->item;
 			if(!movingEnt->bRemoveFromWorld && movingEnt->m_rwObject && RwObjectGetType(movingEnt->m_rwObject) == rpCLUMP &&
@@ -1955,10 +1964,28 @@ CWorld::Process(void)
 				else {
 					if (!movingEnt->bOffscreen)
 						movingEnt->bOffscreen = !movingEnt->GetIsOnScreen();
-					RpAnimBlendClumpUpdateAnimations(movingEnt->GetClump(), CTimer::GetTimeStepInSeconds(), !movingEnt->bOffscreen);
+					bool doRender = !movingEnt->bOffscreen;
+#ifdef LIBRW_VISIONOS
+					// Stereo: also pose peds inside the head view but outside the game FOV
+					// (head turn). bOffscreen is left untouched -- streaming (model delete)
+					// and DriveVehicle read it; we only widen the anim's doRender argument.
+					if (!doRender) {
+						CVector c = movingEnt->GetBoundCentre();
+						if (vc_anim_headpose_visible(c.x, c.y, c.z, movingEnt->GetBoundRadius()) == 1) {
+							doRender = true;
+							vc_anim_headpose_promoted++;
+						}
+					}
+#endif
+					RpAnimBlendClumpUpdateAnimations(movingEnt->GetClump(), CTimer::GetTimeStepInSeconds(), doRender);
 				}
 			}
 		}
+#ifdef LIBRW_VISIONOS
+		if (vc_anim_headpose_promoted > 0 && (CTimer::GetFrameCounter() % 120u) == 0)
+			printf("[vc-anim] fc=%u peds promoted to full pose by head view: %d\n",
+			       (unsigned)CTimer::GetFrameCounter(), vc_anim_headpose_promoted);
+#endif
 		for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
 			CPhysical *movingEnt = (CPhysical *)node->item;
 			if(movingEnt->bRemoveFromWorld) {

@@ -1545,13 +1545,6 @@ static bool vcStereoAlphaFixOn(void)
 	if(e < 0){ const char *s = getenv("VC_STEREO_ALPHAFIX"); e = (s && s[0] == '0') ? 0 : 1; }
 	return e != 0;
 }
-// VC_ALPHA_LOG (default OFF): per-eye alpha-list fill counts at end of each pass, throttled.
-static bool vcAlphaLogOn(void)
-{
-	static int e = -1;
-	if(e < 0){ const char *s = getenv("VC_ALPHA_LOG"); e = (s && s[0] == '1') ? 1 : 0; }
-	return e != 0;
-}
 #endif
 static void vcStereoSetGameCamera(int eye)
 {
@@ -1740,6 +1733,61 @@ static void vcCullRestoreGameCamera(void)
 // camera because no eye view was available yet (0). ConstructRenderList reads this to drop
 // occlusion for the wide-FOV cull.
 extern "C" int vc_cull_applied(void) { return vcCullApplied ? 1 : 0; }
+
+// VC_ANIM_HEADPOSE (default ON): peds outside the game-camera FOV but inside the head view
+// (turned by head rotation) get frozen skeletons because RpAnimBlendClumpUpdateAnimations is
+// called with doRender = !bOffscreen, and bOffscreen is the NARROW game-camera visibility.
+// We do NOT touch bOffscreen (streaming deletes offscreen models, DriveVehicle skips on it) --
+// instead we compute a SEPARATE head-pose visibility purely to widen the doRender decision.
+static bool vcAnimHeadPoseOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_ANIM_HEADPOSE"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0;
+}
+// Count of peds this frame promoted from offscreen-cheap to full-pose by the head view
+// (the cost the fix adds). Read+reset by the World.cpp anim loop for the [vc-anim] log.
+int vc_anim_headpose_promoted = 0;
+
+// Non-mutating head-pose sphere visibility for the ped anim gate. Returns 1 = visible in the
+// head view, 0 = not, -1 = no opinion (disabled / not stereo / no head pose yet -> use stock).
+// Same head basis + widened compositor-FOV frustum as vcCullApplyHeadPose, but computed
+// locally without touching TheCamera or any entity flag.
+extern "C" int vc_anim_headpose_visible(float wx, float wy, float wz, float radius)
+{
+	if(!vcAnimHeadPoseOn() || vc_render_mode() != 1) return -1;
+	float v[16], p[16];
+	if(!vc_get_eye_view(v) || !vc_get_eye_proj(p)) return -1;
+	if(!(p[0] > 0.0001f && p[5] > 0.0001f)) return -1;
+
+	// Head world matrix from the eye view (same decode + swap as vcCullApplyHeadPose).
+	CVector R(-v[0], v[1], v[2]), F(-v[4], v[5], v[6]), U(-v[8], v[9], v[10]), P(-v[12], v[13], v[14]);
+	CMatrix rwView = TheCamera.m_viewMatrix;
+	rwView.GetRight() = R; rwView.GetForward() = F; rwView.GetUp() = U; rwView.GetPosition() = P;
+	CMatrix world = Invert(rwView);
+	CVector look = world.GetUp(), up = world.GetForward();
+	world.GetForward() = look; world.GetUp() = up;
+
+	// View-space coords: x=right, y=forward(depth), z=up (VC convention, as IsSphereVisible).
+	CVector d = CVector(wx, wy, wz) - world.GetPosition();
+	float cx = DotProduct(d, world.GetRight());
+	float cy = DotProduct(d, world.GetForward());
+	float cz = DotProduct(d, world.GetUp());
+
+	if(cy + radius < CDraw::GetNearClipZ()) return 0;
+	if(cy - radius > CDraw::GetFarClipZ())  return 0;
+
+	// Widened frustum planes from the compositor eye tangents (same as the cull).
+	float m  = vcCullMargin();
+	float tx = m / p[0], ty = m / p[5];
+	float hh = Atan(tx), vh = Atan(ty);
+	float ch = Cos(hh), sh = Sin(hh), cv = Cos(vh), sv = Sin(vh);
+	if(cx*ch + cy*(-sh) > radius) return 0;   // right
+	if(cx*(-ch) + cy*(-sh) > radius) return 0; // left
+	if(cy*(-sv) + cz*(-cv) > radius) return 0; // bottom
+	if(cy*(-sv) + cz*( cv) > radius) return 0; // top
+	return 1;
+}
 #endif
 
 void
@@ -2168,15 +2216,6 @@ Idle(void *arg)
 				if (vcStereoAlphaFixOn()) CVisibilityPlugins::RestoreAlphaBaseline();
 #endif
 				RenderScene();
-#ifdef LIBRW_VISIONOS
-				// A/B verification: with the fix on, eye 0 and eye 1 ent counts should match.
-				if (vcAlphaLogOn() && (CTimer::GetFrameCounter() % 120u) == 0)
-					printf("[vc-alpha] fc=%u eye=%d area=%d ent=%d uw=%d boat=%d\n",
-					       (unsigned)CTimer::GetFrameCounter(), eye, CGame::currArea,
-					       CVisibilityPlugins::m_alphaEntityList.Count(),
-					       CVisibilityPlugins::m_alphaUnderwaterEntityList.Count(),
-					       CVisibilityPlugins::m_alphaBoatAtomicList.Count());
-#endif
 				// World-referenced effects (particles, coronas, glass, weapon fx,
 				// shadows...) belong IN the slices, per eye, with parallax -- not in
 				// the cinema buffer (which stereo never shows). Timed as the fx segment.
