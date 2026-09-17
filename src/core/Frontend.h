@@ -800,6 +800,7 @@ public:
 
 	void Initialise();
 	void PrintMap();
+	void PrintMapLegend();   // split out of PrintMap: visionOS draws it after the menu borders
 	void SetFrontEndRenderStates();
 	static void CentreMousePointer();
 	void CheckCodesForControls(int);

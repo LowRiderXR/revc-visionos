@@ -1639,6 +1639,18 @@ CRadar::DrawCoordBlip(int32 blipId)
 	}
 }
 
+#ifdef LIBRW_VISIONOS
+// Same factor the map legend's TEXT and box use (CMenuManager::PrintMap, VC_MAP_LEGEND_SCALE
+// -- one source in visionos.cpp). The blip icon size and the icon->text offset live here, so
+// without this the legend would scale only halfway: small text, full-size symbols.
+extern "C" float vc_map_legend_scale(void);
+#define LEG_SX(v) SCREEN_SCALE_X((v) * vc_map_legend_scale())
+#define LEG_SY(v) SCREEN_SCALE_Y((v) * vc_map_legend_scale())
+#else
+#define LEG_SX(v) SCREEN_SCALE_X(v)
+#define LEG_SY(v) SCREEN_SCALE_Y(v)
+#endif
+
 void
 CRadar::DrawLegend(int32 x, int32 y, int32 sprite)
 {
@@ -1663,21 +1675,21 @@ CRadar::DrawLegend(int32 x, int32 y, int32 sprite)
 
 		switch (blipMode) {
 			case BLIP_MODE_TRIANGULAR_UP:
-				CSprite2d::Draw2DPolygon(x + SCREEN_SCALE_X(14.0f), y + SCREEN_SCALE_Y(13.0f), x + SCREEN_SCALE_X(2.0f), y + SCREEN_SCALE_Y(13.0f), x + SCREEN_SCALE_X(8.f), y + SCREEN_SCALE_Y(2.0f), x + SCREEN_SCALE_X(8.f), y + SCREEN_SCALE_Y(2.0f), CRGBA(0, 0, 0, 255));
-				CSprite2d::Draw2DPolygon(x + SCREEN_SCALE_X(12.0f), y + SCREEN_SCALE_Y(12.0f), x + SCREEN_SCALE_X(4.0f), y + SCREEN_SCALE_Y(12.0f), x + SCREEN_SCALE_X(8.f), y + SCREEN_SCALE_Y(4.0f), x + SCREEN_SCALE_X(8.f), y + SCREEN_SCALE_Y(4.0f), color);
+				CSprite2d::Draw2DPolygon(x + LEG_SX(14.0f), y + LEG_SY(13.0f), x + LEG_SX(2.0f), y + LEG_SY(13.0f), x + LEG_SX(8.f), y + LEG_SY(2.0f), x + LEG_SX(8.f), y + LEG_SY(2.0f), CRGBA(0, 0, 0, 255));
+				CSprite2d::Draw2DPolygon(x + LEG_SX(12.0f), y + LEG_SY(12.0f), x + LEG_SX(4.0f), y + LEG_SY(12.0f), x + LEG_SX(8.f), y + LEG_SY(4.0f), x + LEG_SX(8.f), y + LEG_SY(4.0f), color);
 				break;
 			case BLIP_MODE_TRIANGULAR_DOWN:
-				CSprite2d::Draw2DPolygon(x + SCREEN_SCALE_X(8.0f), y + SCREEN_SCALE_Y(14.0f), x + SCREEN_SCALE_X(8.0f), y + SCREEN_SCALE_Y(14.0f), x + SCREEN_SCALE_X(2.f), y + SCREEN_SCALE_Y(3.0f), x + SCREEN_SCALE_X(2.f), y + SCREEN_SCALE_Y(3.0f), CRGBA(0, 0, 0, 255));
-				CSprite2d::Draw2DPolygon(x + SCREEN_SCALE_X(8.0f), y + SCREEN_SCALE_Y(12.0f), x + SCREEN_SCALE_X(8.0f), y + SCREEN_SCALE_Y(12.0f), x + SCREEN_SCALE_X(12.f), y + SCREEN_SCALE_Y(4.0f), x + SCREEN_SCALE_X(4.f), y + SCREEN_SCALE_Y(4.0f), color);
+				CSprite2d::Draw2DPolygon(x + LEG_SX(8.0f), y + LEG_SY(14.0f), x + LEG_SX(8.0f), y + LEG_SY(14.0f), x + LEG_SX(2.f), y + LEG_SY(3.0f), x + LEG_SX(2.f), y + LEG_SY(3.0f), CRGBA(0, 0, 0, 255));
+				CSprite2d::Draw2DPolygon(x + LEG_SX(8.0f), y + LEG_SY(12.0f), x + LEG_SX(8.0f), y + LEG_SY(12.0f), x + LEG_SX(12.f), y + LEG_SY(4.0f), x + LEG_SX(4.f), y + LEG_SY(4.0f), color);
 				break;
 			case BLIP_MODE_SQUARE:
-				CSprite2d::DrawRect(CRect(x + SCREEN_SCALE_X(4.0f), y + SCREEN_SCALE_Y(3.0f), SCREEN_SCALE_X(12.0f) + x, SCREEN_SCALE_Y(12.0f) + y), CRGBA(0, 0, 0, 255));
-				CSprite2d::DrawRect(CRect(x + SCREEN_SCALE_X(5.0f), y + SCREEN_SCALE_Y(4.0f), SCREEN_SCALE_X(11.0f) + x, SCREEN_SCALE_Y(11.0f) + y), color);
+				CSprite2d::DrawRect(CRect(x + LEG_SX(4.0f), y + LEG_SY(3.0f), LEG_SX(12.0f) + x, LEG_SY(12.0f) + y), CRGBA(0, 0, 0, 255));
+				CSprite2d::DrawRect(CRect(x + LEG_SX(5.0f), y + LEG_SY(4.0f), LEG_SX(11.0f) + x, LEG_SY(11.0f) + y), color);
 				break;
 		}
 
 	} else {
-		RadarSprites[sprite]->Draw(CRect(x, y, x + SCREEN_SCALE_X(16.f), y + SCREEN_SCALE_X(16.f)), CRGBA(255, 255, 255, 255));
+		RadarSprites[sprite]->Draw(CRect(x, y, x + LEG_SX(16.f), y + LEG_SX(16.f)), CRGBA(255, 255, 255, 255));
 	}
 
 	wchar *text;
@@ -1807,5 +1819,7 @@ CRadar::DrawLegend(int32 x, int32 y, int32 sprite)
 		default:
 		break;
 	}
-	CFont::PrintString(SCREEN_SCALE_X(20.f) + x, SCREEN_SCALE_Y(3.0f) + y, text);
+	CFont::PrintString(LEG_SX(20.f) + x, LEG_SY(3.0f) + y, text);
 }
+#undef LEG_SX
+#undef LEG_SY

@@ -146,6 +146,59 @@ extern "C" int vc_render_mode(void)
 	return g_renderMode;
 }
 
+// VC_HUD_ASPECT (default ON, stereo only): make the 2D layout scale (SCREEN_SCALE_AR in
+// common.h) use the 4:3 DESIGN aspect instead of the physical buffer aspect. Needed because
+// the near-square buffer from VC_RES=2 up (aspect < 4:3) makes the stock widescreen factor
+// magnify x until the 640-wide menu/HUD design runs off the right edge. The host draws the
+// overlay quad at 4:3 to undo the resulting squeeze, so proportions stay correct at full
+// resolution. =0 restores the stock (cut-off) behaviour for A/B. Cinema keeps stock.
+extern "C" int vc_hud_aspect_fixed(void)
+{
+	static int e = -1;
+	if (e < 0) {
+		const char *s = getenv("VC_HUD_ASPECT");
+		e = (s && s[0] == '0') ? 0 : 1;
+		printf("[vc-hud-aspect] 2D layout aspect = %s (VC_HUD_ASPECT=%s)\n",
+		       e ? "4:3 design (fixed)" : "buffer aspect (stock)", s ? s : "unset");
+	}
+	return (e && vc_render_mode() == VC_MODE_STEREO) ? 1 : 0;
+}
+
+// Map legend geometry (PrintMap in Frontend.cpp + CRadar::DrawLegend in Radar.cpp). The
+// stock legend covers a large part of the map; in VR that is worse than on a monitor.
+// ONE source for both knobs so the text (Frontend) and the blip ICONS (Radar) can never
+// drift apart -- a half-scaled legend (small text, full-size symbols) would look worse
+// than the stock one.
+//   VC_MAP_LEGEND       design units the box is moved UP          (default 100, 0 = stock)
+//   VC_MAP_LEGEND_SCALE size factor about (design-centre x, box-top y) (default 0.6)
+// Shift default history: 90 (pure move) -> 40 when the scaling landed (the map's top edge is
+// at design y 63 = centre 225 - size 162, so ~37 puts the box flush with it) -> 100 after the
+// device test, i.e. the box top sits at design y 0. That is only usable because the legend is
+// now drawn AFTER the menu border polygons (CMenuManager::PrintMapLegend): at 40 it kept the
+// map's upper band, at 100 it sits in the frame band above the map and is out of the way.
+// Anchoring x at the design centre keeps the box CENTRED at any scale (the stock box spans
+// design x 95..555, so a left-edge anchor pushed it visibly off-centre); anchoring y at the
+// box top keeps the two knobs ORTHOGONAL: the shift moves the top edge without changing the
+// size, the scale changes the size without moving that edge.
+static float g_mapLegendShift = -1.0f;
+static float g_mapLegendScale = -1.0f;
+static void vcMapLegendInit(void)
+{
+	if (g_mapLegendShift >= 0.0f) return;
+	const char *sh = getenv("VC_MAP_LEGEND");
+	const char *sc = getenv("VC_MAP_LEGEND_SCALE");
+	g_mapLegendShift = sh ? (float)atof(sh) : 100.0f;
+	if (g_mapLegendShift < 0.0f) g_mapLegendShift = 0.0f;
+	g_mapLegendScale = sc ? (float)atof(sc) : 0.6f;
+	// Clamped: below ~0.2 the font is unreadable, above 1.0 it would grow past the map.
+	if (g_mapLegendScale < 0.2f) g_mapLegendScale = 0.2f;
+	if (g_mapLegendScale > 1.0f) g_mapLegendScale = 1.0f;
+	printf("[vc-map] legend shift=%.0f design units up, scale=%.2f (VC_MAP_LEGEND=%s VC_MAP_LEGEND_SCALE=%s)\n",
+	       g_mapLegendShift, g_mapLegendScale, sh ? sh : "unset", sc ? sc : "unset");
+}
+extern "C" float vc_map_legend_shift(void) { vcMapLegendInit(); return g_mapLegendShift; }
+extern "C" float vc_map_legend_scale(void) { vcMapLegendInit(); return g_mapLegendScale; }
+
 
 // --- Camera matrix override seam (stereo injection point) -------------------
 // gl3device beginUpdate consumes these (getters below) after computing its own
@@ -836,16 +889,22 @@ _psSelectScreenVM(RwInt32 videoMode)
 	return;
 }
 
-// Derived from the single source above so it never drifts (stringify the macro).
-#define VC_STR2(x) #x
-#define VC_STR(x)  VC_STR2(x)
-static RwChar  _VMString[] = VC_STR(VISIONOS_SCREEN_WIDTH) " X " VC_STR(VISIONOS_SCREEN_HEIGHT) " X 32";
+// The graphics menu prints this string verbatim (Frontend.cpp:1295 AsciiToUnicode of
+// _psGetVideoModeList()[m_nDisplayVideoMode]). It used to be STRINGIFIED FROM THE
+// COMPILE-TIME DEFINES, so it always claimed 1920x1080 no matter what VC_RES /
+// VC_RES_W/H selected -- the render resolution became a runtime value (vcScreenW/H)
+// when the resolution switch landed, and this string never followed. Built on first
+// request instead: vcScreenInit() runs inside vcScreenW/H, so the numbers are correct
+// even if the menu asks before psSelectDevice.
+static RwChar  _VMString[40] = { 0 };
 static RwChar *_VMList[1]  = { _VMString };
 
 RwChar **
 _psGetVideoModeList()
 {
-	// TODO(visionos): genau ein hartkodierter Modus.
+	// Still exactly one mode (fixed drawable), but now labelled with the real size.
+	if (_VMString[0] == '\0')
+		snprintf(_VMString, sizeof(_VMString), "%d X %d X 32", vcScreenW(), vcScreenH());
 	return _VMList;
 }
 

@@ -52,6 +52,7 @@ CColPoint CWorld::m_aTempColPts[MAX_COLLISION_POINTS];
 // Stereo ped-anim head-pose gate (defined in main.cpp).
 extern "C" int vc_anim_headpose_visible(float wx, float wy, float wz, float radius);
 extern int vc_anim_headpose_promoted;
+extern "C" int vc_perf_log(void);   // visionos.cpp: VC_PERF_LOG gate for the [vc-anim] probe
 #endif
 
 void
@@ -1982,7 +1983,7 @@ CWorld::Process(void)
 			}
 		}
 #ifdef LIBRW_VISIONOS
-		if (vc_anim_headpose_promoted > 0 && (CTimer::GetFrameCounter() % 120u) == 0)
+		if (vc_perf_log() && vc_anim_headpose_promoted > 0 && (CTimer::GetFrameCounter() % 120u) == 0)
 			printf("[vc-anim] fc=%u peds promoted to full pose by head view: %d\n",
 			       (unsigned)CTimer::GetFrameCounter(), vc_anim_headpose_promoted);
 #endif

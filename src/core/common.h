@@ -205,7 +205,25 @@ inline uint32 ldb(uint32 p, uint32 s, uint32 w)
 #define SCREEN_SCALE_FROM_BOTTOM(a) (SCREEN_HEIGHT - SCREEN_SCALE_Y(a))
 
 #ifdef ASPECT_RATIO_SCALE
+#ifdef LIBRW_VISIONOS
+// visionOS: the 2D layout aspect must NOT follow the physical render buffer. The factor
+// below is (4:3)/aspect -- built for aspect >= 4:3 only, where it SHRINKS x to keep the
+// 640x448 design 4:3-correct (pillarbox). Our stereo buffer is near-SQUARE from VC_RES=2
+// up (2720x2624 at VC_RES=4), i.e. aspect < 4:3, where the same factor MAGNIFIES x: the
+// 640-wide menu/HUD design needs 3498 of 2720 px and everything past design x~498 falls
+// off the right edge (cut-off menu text). With VC_HUD_ASPECT (default on, stereo only)
+// the 2D layout uses the DESIGN aspect instead -> factor 1.0, so the design maps exactly
+// onto the full buffer and nothing is clipped. That leaves the layout horizontally
+// squeezed IN THE TEXTURE; the host undoes it by drawing the HUD/menu quad at 4:3
+// (Renderer.swift overlayAspect) instead of at the texture's own aspect. Nothing else
+// moves: RsGlobal, the camera raster and the slice size stay identical, so the in-slice
+// 2D (DoFade rect), the sprite mapping and the camera FOV are untouched.
+extern "C" int vc_hud_aspect_fixed(void);
+#define VC_2D_ASPECT_RATIO (vc_hud_aspect_fixed() ? DEFAULT_ASPECT_RATIO : SCREEN_ASPECT_RATIO)
+#define SCREEN_SCALE_AR(a) ((a) * DEFAULT_ASPECT_RATIO / VC_2D_ASPECT_RATIO)
+#else
 #define SCREEN_SCALE_AR(a) ((a) * DEFAULT_ASPECT_RATIO / SCREEN_ASPECT_RATIO)
+#endif
 #define SCALE_AND_CENTER_X(x) ((SCREEN_WIDTH == DEFAULT_SCREEN_WIDTH) ? (x) : (SCREEN_WIDTH - SCREEN_SCALE_X(DEFAULT_SCREEN_WIDTH)) / 2 + SCREEN_SCALE_X((x)))
 #ifdef PROPER_SCALING
 	#ifndef FORCE_PC_SCALING			

@@ -178,6 +178,37 @@ const char* FrontendFilenames[][2] = {
 #define MENU_Y(y) StretchY(y)
 #endif
 
+#ifdef LIBRW_VISIONOS
+// Map legend (PrintMap below): the stock box covers a large part of the map -- it starts at
+// design y 100 and grows DOWNWARD with the number of blips
+// (boxBottom = 100 + 19*((MapLegendCounter-1)/2 + 3)), so at VC_RES=4 it spans y 586..1476 px
+// while the map centre sits at 1318. Two knobs, both read from visionos.cpp so the text here
+// and the blip ICONS in CRadar::DrawLegend share ONE factor (a legend with small text and
+// full-size symbols would look worse than the stock one):
+//   VC_MAP_LEGEND       = design units the box moves UP               (default 40, 0 = stock)
+//   VC_MAP_LEGEND_SCALE = size factor about (centre-x, top-y) anchor  (default 0.6)
+// ANCHOR: x at the DESIGN CENTRE (320), y at the box top (100). The stock box spans design
+// x 95..555, i.e. it is centred -- anchoring x at the left edge (as the first version did)
+// shrank it towards the left and pushed it visibly off-centre. Centre-x keeps it centred at
+// any scale (and the centred title at x 320 is the anchor's fixed point), while top-y keeps
+// the two knobs ORTHOGONAL: shift moves the top edge without resizing, scale resizes without
+// moving that edge. The box WIDTH was already brought in line by the design-aspect fix
+// (VC_HUD_ASPECT): 133% -> 103% of the map width before this scaling.
+extern "C" float vc_map_legend_shift(void);
+extern "C" float vc_map_legend_scale(void);
+#define VC_LEGEND_AX 320.0f
+#define VC_LEGEND_AY 100.0f
+#define MENU_X_LEGEND(x) MENU_X_LEFT_ALIGNED(VC_LEGEND_AX + vc_map_legend_scale() * ((x) - VC_LEGEND_AX))
+#define MENU_Y_LEGEND(y) MENU_Y(VC_LEGEND_AY - vc_map_legend_shift() + vc_map_legend_scale() * ((y) - VC_LEGEND_AY))
+#define MENU_D_LEGEND(d) MENU_Y(vc_map_legend_scale() * (d))   // deltas (row pitch): scale, never shift
+#define VC_LEGEND_FS(s)  (vc_map_legend_scale() * (s))          // font scale
+#else
+#define MENU_X_LEGEND(x) MENU_X_LEFT_ALIGNED(x)
+#define MENU_Y_LEGEND(y) MENU_Y(y)
+#define MENU_D_LEGEND(d) MENU_Y(d)
+#define VC_LEGEND_FS(s)  (s)
+#endif
+
 #ifdef XBOX_MESSAGE_SCREEN
 bool CMenuManager::m_bDialogOpen = false;
 uint32 CMenuManager::m_nDialogHideTimer = 0;
@@ -2360,6 +2391,13 @@ CMenuManager::DrawBackground(bool transitionCall)
 			// Right border
 			CSprite2d::Draw2DPolygon(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_STRETCH_X(menuBg.bottomRight_x), SCREEN_STRETCH_Y(menuBg.bottomRight_y),
 				SCREEN_WIDTH, 0.0f, SCREEN_STRETCH_X(menuBg.topRight_x), SCREEN_STRETCH_Y(menuBg.topRight_y), CRGBA(0, 0, 0, 255));
+
+#ifdef LIBRW_VISIONOS
+			// LAST, so the four black border polygons above cannot cover it (the legend
+			// reaches into the frame area since VC_MAP_LEGEND moves it up).
+			if (m_nCurrScreen == MENUPAGE_MAP)
+				PrintMapLegend();
+#endif
 		} else {
 			m_nMenuFadeAlpha = 255;
 			m_firstStartCounter = 255;
@@ -2382,6 +2420,13 @@ CMenuManager::DrawBackground(bool transitionCall)
 			// Right border
 			CSprite2d::Draw2DPolygon(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_STRETCH_X(menuBg.bottomRight_x), SCREEN_STRETCH_Y(menuBg.bottomRight_y),
 				SCREEN_WIDTH, 0.0f, SCREEN_STRETCH_X(menuBg.topRight_x), SCREEN_STRETCH_Y(menuBg.topRight_y), CRGBA(0, 0, 0, 255));
+
+#ifdef LIBRW_VISIONOS
+			// LAST, so the four black border polygons above cannot cover it (the legend
+			// reaches into the frame area since VC_MAP_LEGEND moves it up).
+			if (m_nCurrScreen == MENUPAGE_MAP)
+				PrintMapLegend();
+#endif
 		}
 	} else {
 		menuBg.SaveCurrentCoors();
@@ -5890,53 +5935,11 @@ CMenuManager::PrintMap(void)
 	}
 
 	CRadar::DrawBlips();
-	if (m_PrefsShowLegends) {
-		CFont::SetWrapx(MENU_X_RIGHT_ALIGNED(40.0f));
-		CFont::SetRightJustifyWrap(MENU_X_LEFT_ALIGNED(84.0f));
-		CFont::SetBackGroundOnlyTextOff();
-		CFont::SetColor(CRGBA(LABEL_COLOR.r, LABEL_COLOR.g, LABEL_COLOR.b, FadeIn(255)));
-		CFont::SetDropShadowPosition(2);
-		CFont::SetDropColor(CRGBA(0, 0, 0, FadeIn(255)));
-		CFont::SetCentreOn();
-		CFont::SetFontStyle(FONT_LOCALE(FONT_HEADING));
-		CFont::SetScale(SCREEN_SCALE_X(0.65f), SCREEN_SCALE_Y(0.95f));
-
-		int secondColumnStart = (CRadar::MapLegendCounter - 1) / 2;
-		int boxBottom = MENU_Y(100.0f);
-
-		// + 3, because we want 19*3 px padding
-		for (int i = 0; i < secondColumnStart + 3; i++) {
-			boxBottom += MENU_Y(19.f);
-		}
-
-		CSprite2d::DrawRect(CRect(MENU_X_LEFT_ALIGNED(95.0f), MENU_Y(100.0f), MENU_X_LEFT_ALIGNED(555.f), boxBottom),
-			CRGBA(0, 0, 0, FadeIn(190)));
-
-		CFont::PrintString(MENU_X_LEFT_ALIGNED(320.0f), MENU_Y(102.0f), TheText.Get("FE_MLG"));
-		CFont::SetRightJustifyOff();
-		CFont::SetFontStyle(FONT_LOCALE(FONT_STANDARD));
-		if (m_PrefsLanguage == LANGUAGE_AMERICAN)
-			CFont::SetScale(SCREEN_SCALE_X(0.55f), SCREEN_SCALE_Y(0.55f));
-		else
-			CFont::SetScale(SCREEN_SCALE_X(0.45f), SCREEN_SCALE_Y(0.55f));
-
-		CFont::SetColor(CRGBA(225, 225, 225, FadeIn(255)));
-		CFont::SetDropShadowPosition(0);
-
-		int y = MENU_Y(127.0f);
-		int x = MENU_X_LEFT_ALIGNED(160.0f);
-
-		for (int16 i = 0; i < CRadar::MapLegendCounter; i++) {
-			CRadar::DrawLegend(x, y, CRadar::MapLegendList[i]);
-
-			if (i == secondColumnStart) {
-				x = MENU_X_LEFT_ALIGNED(350.0f);
-				y = MENU_Y(127.0f);
-			} else {
-				y += MENU_Y(19.0f);
-			}
-		}
-	}
+#ifndef LIBRW_VISIONOS
+	// Stock order: legend here, i.e. BEFORE DrawBackground paints the slanted menu borders
+	// over it. visionOS calls PrintMapLegend() after those borders instead (see below).
+	PrintMapLegend();
+#endif
 
 #ifdef MAP_ENHANCEMENTS
 	if (m_nMenuFadeAlpha != 255 && !m_bShowMouse) {
@@ -5960,6 +5963,70 @@ CMenuManager::PrintMap(void)
 	CFont::SetWrapx(MENU_X_RIGHT_ALIGNED(MENU_X_MARGIN));
 	CFont::SetRightJustifyWrap(MENU_X_LEFT_ALIGNED(MENU_X_MARGIN));
 	DisplayHelperText("FEH_MPH");
+}
+
+// Split out of PrintMap so it can be drawn LAST. The four black menuBg border polygons in
+// DrawBackground are painted AFTER PrintMap, so a legend that reaches into the frame area
+// (which ours does since VC_MAP_LEGEND moves it up) gets partly covered by them. Same code,
+// same place in the frame -- only the call site moved.
+void
+CMenuManager::PrintMapLegend(void)
+{
+	if (m_PrefsShowLegends) {
+		// Wrap bounds go through the same transform, else long entries would wrap at the
+		// full-size box edge and spill out of the shrunken one.
+		CFont::SetWrapx(MENU_X_LEGEND(DEFAULT_SCREEN_WIDTH - 40.0f));
+		CFont::SetRightJustifyWrap(MENU_X_LEGEND(84.0f));
+		CFont::SetBackGroundOnlyTextOff();
+		CFont::SetColor(CRGBA(LABEL_COLOR.r, LABEL_COLOR.g, LABEL_COLOR.b, FadeIn(255)));
+		CFont::SetDropShadowPosition(2);
+		CFont::SetDropColor(CRGBA(0, 0, 0, FadeIn(255)));
+		CFont::SetCentreOn();
+		CFont::SetFontStyle(FONT_LOCALE(FONT_HEADING));
+		CFont::SetScale(SCREEN_SCALE_X(VC_LEGEND_FS(0.65f)), SCREEN_SCALE_Y(VC_LEGEND_FS(0.95f)));
+
+		int secondColumnStart = (CRadar::MapLegendCounter - 1) / 2;
+		int boxBottom = MENU_Y_LEGEND(100.0f);
+
+		// + 3, because we want 19*3 px padding
+		for (int i = 0; i < secondColumnStart + 3; i++) {
+			boxBottom += MENU_D_LEGEND(19.f);
+		}
+
+		CSprite2d::DrawRect(CRect(MENU_X_LEGEND(95.0f), MENU_Y_LEGEND(100.0f), MENU_X_LEGEND(555.f), boxBottom),
+			CRGBA(0, 0, 0, FadeIn(190)));
+
+		CFont::PrintString(MENU_X_LEGEND(320.0f), MENU_Y_LEGEND(102.0f), TheText.Get("FE_MLG"));
+		CFont::SetRightJustifyOff();
+		CFont::SetFontStyle(FONT_LOCALE(FONT_STANDARD));
+		if (m_PrefsLanguage == LANGUAGE_AMERICAN)
+			CFont::SetScale(SCREEN_SCALE_X(VC_LEGEND_FS(0.55f)), SCREEN_SCALE_Y(VC_LEGEND_FS(0.55f)));
+		else
+			CFont::SetScale(SCREEN_SCALE_X(VC_LEGEND_FS(0.45f)), SCREEN_SCALE_Y(VC_LEGEND_FS(0.55f)));
+
+		CFont::SetColor(CRGBA(225, 225, 225, FadeIn(255)));
+		CFont::SetDropShadowPosition(0);
+
+		int y = MENU_Y_LEGEND(127.0f);
+		int x = MENU_X_LEGEND(160.0f);
+
+		for (int16 i = 0; i < CRadar::MapLegendCounter; i++) {
+			CRadar::DrawLegend(x, y, CRadar::MapLegendList[i]);
+
+			if (i == secondColumnStart) {
+				x = MENU_X_LEGEND(350.0f);
+				y = MENU_Y_LEGEND(127.0f);
+			} else {
+				y += MENU_D_LEGEND(19.0f);
+			}
+		}
+	}
+
+	// Restore the font wrap state. In the stock order PrintMap did this right after the
+	// legend; on visionOS the legend runs LAST (after the borders), so it has to hand the
+	// same state to whatever draws next (DrawStandardMenus). Same values either way.
+	CFont::SetWrapx(MENU_X_RIGHT_ALIGNED(MENU_X_MARGIN));
+	CFont::SetRightJustifyWrap(MENU_X_LEFT_ALIGNED(MENU_X_MARGIN));
 }
 
 void
