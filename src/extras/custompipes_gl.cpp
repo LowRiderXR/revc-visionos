@@ -19,6 +19,13 @@
 #error "Need librw for EXTENDED_PIPELINES"
 #endif
 
+#ifdef LIBRW_VISIONOS
+// Shared with librw's skin pipeline (gl3skin.cpp) so the two ped shader fixes -- fog depth
+// component and atlas mip bias -- have exactly one source for value and default.
+extern "C" const char *vc_skin_fog_define(void);
+extern "C" const char *vc_skin_lodbias_define(void);
+#endif
+
 namespace CustomPipes {
 
 static int32 u_viewVec;
@@ -516,8 +523,17 @@ CreateRimLightPipes(void)
 	{
 #include "shaders/obj/simple_frag.inc"
 #include "shaders/obj/neoRimSkin_vert.inc"
+#ifdef LIBRW_VISIONOS
+	// Peds render through THIS pipeline whenever NeoRimLight is on (AttachRimPipe is
+	// unconditional in CPedModelInfo::SetClump), so it needs the same two ped fixes librw's
+	// skin pipeline gets -- otherwise enabling the rim light silently brings the NPC
+	// discoloration back (device-confirmed). Defines come from gl3skin.cpp (one source).
+	const char *vs[] = { shaderDecl, vc_skin_fog_define(), "#define DIRECTIONALS\n", header_vert_src, neoRimSkin_vert_src, nil };
+	const char *fs[] = { shaderDecl, vc_skin_lodbias_define(), header_frag_src, simple_frag_src, nil };
+#else
 	const char *vs[] = { shaderDecl, "#define DIRECTIONALS\n", header_vert_src, neoRimSkin_vert_src, nil };
 	const char *fs[] = { shaderDecl, header_frag_src, simple_frag_src, nil };
+#endif
 	neoRimSkinShader = Shader::create(vs, fs);
 	assert(neoRimSkinShader);
 	}
@@ -526,7 +542,13 @@ CreateRimLightPipes(void)
 #include "shaders/obj/simple_frag.inc"
 #include "shaders/obj/neoRim_vert.inc"
 	const char *vs[] = { shaderDecl, "#define DIRECTIONALS\n", header_vert_src, neoRim_vert_src, nil };
+#ifdef LIBRW_VISIONOS
+	// Non-skinned rim atomics (e.g. cutscene objects) share the atlas problem; neoRim.vert
+	// already feeds clip-W to DoFog, so only the mip bias is needed here.
+	const char *fs[] = { shaderDecl, vc_skin_lodbias_define(), header_frag_src, simple_frag_src, nil };
+#else
 	const char *fs[] = { shaderDecl, header_frag_src, simple_frag_src, nil };
+#endif
 	neoRimShader = Shader::create(vs, fs);
 	assert(neoRimShader);
 	}

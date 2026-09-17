@@ -1,4 +1,9 @@
 const char *neoRimSkin_vert_src =
+// Kept in sync with ../neoRimSkin.vert by hand. VC_SKINFOG picks the fog depth
+// component: z (original) or w (visionOS, matches buildings and neoRim.vert).
+"#ifndef VC_SKINFOG\n"
+"#define VC_SKINFOG z\n"
+"#endif\n"
 "uniform mat4 u_boneMatrices[64];\n"
 
 "uniform vec3 u_viewVec;\n"
@@ -40,6 +45,6 @@ const char *neoRimSkin_vert_src =
 "	v_color = clamp(v_color, 0.0, 1.0);\n"
 "	v_color *= u_matColor;\n"
 
-"	v_fog = DoFog(gl_Position.z);\n"
+"	v_fog = DoFog(gl_Position.VC_SKINFOG);\n"
 "}\n"
 ;
