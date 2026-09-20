@@ -8,6 +8,13 @@
 #ifdef ASPECT_RATIO_SCALE
 #include "Frontend.h"
 #endif
+#ifdef LIBRW_VISIONOS
+// Particle sprite-area probe: w/h here are HALF extents (the quad spans x+-w, y+-h), so a
+// sprite covers 4*w*h. Only accumulates while CParticle::Render has the gate open, so HUD,
+// coronas and menu sprites -- which use the same entry points -- stay out of the number.
+extern "C" void vc_sprite_area(float w, float h);
+#endif
+
 
 float CSprite::m_f2DNearScreenZ;
 float CSprite::m_f2DFarScreenZ;
@@ -248,6 +255,9 @@ CSprite::RenderOneXLUSprite_Rotate_Aspect(float x, float y, float z, float w, fl
 void
 CSprite::RenderBufferedOneXLUSprite(float x, float y, float z, float w, float h, uint8 r, uint8 g, uint8 b, int16 intens, float recipz, uint8 a)
 {
+#ifdef LIBRW_VISIONOS
+	vc_sprite_area(w, h);   // particle sprite pixels (gated to CParticle::Render)
+#endif
 	m_bFlushSpriteBufferSwitchZTest = 0;
 
 	// 0---3
@@ -313,6 +323,9 @@ CSprite::RenderBufferedOneXLUSprite(float x, float y, float z, float w, float h,
 void
 CSprite::RenderBufferedOneXLUSprite_Rotate_Dimension(float x, float y, float z, float w, float h, uint8 r, uint8 g, uint8 b, int16 intens, float recipz, float rotation, uint8 a)
 {
+#ifdef LIBRW_VISIONOS
+	vc_sprite_area(w, h);   // particle sprite pixels (gated to CParticle::Render)
+#endif
 	m_bFlushSpriteBufferSwitchZTest = 0;
 	// TODO: replace with lookup
 	float c = Cos(rotation);
@@ -614,6 +627,9 @@ CSprite::Set6Vertices2D(RwIm2DVertex *verts, float x1, float y1, float x2, float
 void
 CSprite::RenderBufferedOneXLUSprite2D(float x, float y, float w, float h, const RwRGBA &colour, int16 intens, uint8 alpha)
 {
+#ifdef LIBRW_VISIONOS
+	vc_sprite_area(w, h);   // particle sprite pixels (gated to CParticle::Render)
+#endif
 	m_bFlushSpriteBufferSwitchZTest = 1;
 	CRGBA col(intens * colour.red >> 8, intens * colour.green >> 8, intens * colour.blue >> 8, alpha);
 	CRect rect(x - w, y - h, x + h, y + h);
@@ -626,6 +642,9 @@ CSprite::RenderBufferedOneXLUSprite2D(float x, float y, float w, float h, const 
 void
 CSprite::RenderBufferedOneXLUSprite2D_Rotate_Dimension(float x, float y, float w, float h, const RwRGBA &colour, int16 intens, float rotation, uint8 alpha)
 {
+#ifdef LIBRW_VISIONOS
+	vc_sprite_area(w, h);   // particle sprite pixels (gated to CParticle::Render)
+#endif
 	m_bFlushSpriteBufferSwitchZTest = 1;
 	CRGBA col(intens * colour.red >> 8, intens * colour.green >> 8, intens * colour.blue >> 8, alpha);
 	float c = Cos(rotation);

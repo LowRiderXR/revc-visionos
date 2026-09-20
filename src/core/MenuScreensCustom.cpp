@@ -116,17 +116,38 @@ void FPSLimitChanged(int8 before, int8 after) {
 	}
 }
 
+#if defined(LIBRW_VISIONOS) && defined(NO_ISLAND_LOADING)
+void IslandLoadingAfterChange(int8 before, int8 after);   // defined below; reused by the restore
+#endif
+
 void RestoreDefGraphics(int8 action) {
 	if (action != FEOPTION_ACTION_SELECT)
 		return;
 
 	#ifdef PS2_ALPHA_TEST
+	#ifdef LIBRW_VISIONOS
+		// Keep the shipped default. Whether the PS2 alpha-test emulation is worth its cost is
+		// an open measurement (it draws every alpha-blended instance TWICE, so four times per
+		// frame across both eyes) -- until that is decided, "restore defaults" must not
+		// silently change the rendering.
+		gPS2alphaTest = true;
+	#else
 		gPS2alphaTest = false;
+	#endif
 	#endif
 	#ifdef MULTISAMPLING
 		FrontEndMenuManager.m_nPrefsMSAALevel = FrontEndMenuManager.m_nDisplayMSAALevel = 0;
 	#endif
 	#ifdef NO_ISLAND_LOADING
+	#ifdef LIBRW_VISIONOS
+		// visionOS default is HIGH, not LOW: keeping both islands resident removes the
+		// synchronous island streaming that caused reproducible stutters while driving
+		// (device-confirmed). Reuse the option's own change handler so the streaming side
+		// effects match what the menu does.
+		if (!FrontEndMenuManager.m_bGameNotLoaded)
+			IslandLoadingAfterChange(FrontEndMenuManager.m_PrefsIslandLoading, FrontEndMenuManager.ISLAND_LOADING_HIGH);
+		FrontEndMenuManager.m_PrefsIslandLoading = FrontEndMenuManager.ISLAND_LOADING_HIGH;
+	#else
 	    	if (!FrontEndMenuManager.m_bGameNotLoaded) {
 	    		FrontEndMenuManager.m_PrefsIslandLoading = FrontEndMenuManager.ISLAND_LOADING_LOW;
 				CStreaming::RemoveUnusedBigBuildings(CGame::currLevel);
@@ -136,13 +157,34 @@ void RestoreDefGraphics(int8 action) {
 	    	} else
 	    		FrontEndMenuManager.m_PrefsIslandLoading = FrontEndMenuManager.ISLAND_LOADING_LOW;
 	#endif
+	#endif
+	#ifdef EXTENDED_PIPELINES
+	#ifdef LIBRW_VISIONOS
+		// All four neo pipelines default OFF/cheap on visionOS -- they are real per-pixel and
+		// (for the gloss) extra-pass costs, and everything is rendered twice for the two eyes.
+		// NOT off because anything is broken: since the rim pipeline shares librw's ped shader
+		// fixes (see custompipes_gl.cpp), CHARAKTER KANTEN LICHT is functionally correct now.
+		// It is off purely because it costs performance -- switch it on to judge the look.
+		CustomPipes::VehiclePipeSwitch = CustomPipes::VEHICLEPIPE_MATFX;
+		CustomPipes::RimlightEnable = false;
+		CustomPipes::LightmapEnable = false;
+		CustomPipes::GlossEnable = false;
+	#endif
+	#endif
 	#ifdef GRAPHICS_MENU_OPTIONS // otherwise Frontend will handle those
+	#ifdef LIBRW_VISIONOS
+		// reVC's limiter stays OFF: our own frame cap paces to the measured display rate, and
+		// a second brake driven by m_PrefsFPSLimit (30/60/120) would fight it.
+		FrontEndMenuManager.m_PrefsFrameLimiter = false;
+		FrontEndMenuManager.m_PrefsUseWideScreen = AR_AUTO;
+	#else
 		FrontEndMenuManager.m_PrefsFrameLimiter = true;
+		FrontEndMenuManager.m_PrefsUseWideScreen = false;
+	#endif
 		FrontEndMenuManager.m_PrefsVsyncDisp = true;
 		#ifdef LEGACY_MENU_OPTIONS
 			FrontEndMenuManager.m_PrefsVsync = true;
 		#endif
-		FrontEndMenuManager.m_PrefsUseWideScreen = false;
 		FrontEndMenuManager.m_nDisplayVideoMode = FrontEndMenuManager.m_nPrefsVideoMode;
 		CMBlur::BlurOn = false;
 		FrontEndMenuManager.SaveSettings();
@@ -475,16 +517,32 @@ CMenuScreenCustom aScreens[] = {
 	},
 #else
 	{ "FEH_DIS", MENUPAGE_OPTIONS, new CCustomScreenLayout({40, 78, 25, true}), nil,
+#ifndef LIBRW_VISIONOS
+		// visionOS: BRIGHTNESS is dead here. m_PrefsBrightness is consumed ONLY by
+		// CMBlur::OverlayRenderFx, reached via CCamera::RenderMotionBlur -- which the stereo
+		// path skips (it is a screen-space post effect, see main.cpp). If brightness is ever
+		// wanted, it belongs as a gain in the eye-slice pass, not here.
 		MENUACTION_BRIGHTNESS,	"FED_BRI", { nil, SAVESLOT_NONE, MENUPAGE_DISPLAY_SETTINGS }, 0, 0, MENUALIGN_LEFT,
+#endif
 		MENUACTION_DRAWDIST,	"FEM_LOD", { nil, SAVESLOT_NONE, MENUPAGE_DISPLAY_SETTINGS }, 0, 0, MENUALIGN_LEFT,
 		DENSITY_SLIDERS
+#ifndef LIBRW_VISIONOS
+		// visionOS: no letterbox bars in stereo -- CCamera::DrawBordersForWideScreen is
+		// skipped (there is no screen edge to crop), so the toggle does nothing.
 		CUTSCENE_BORDERS_TOGGLE
+#endif
 		FREE_CAM_TOGGLE
 		MENUACTION_LEGENDS,		"MAP_LEG", { nil, SAVESLOT_NONE, MENUPAGE_DISPLAY_SETTINGS }, 0, 0, MENUALIGN_LEFT,
 		MENUACTION_RADARMODE,	"FED_RDR", { nil, SAVESLOT_NONE, MENUPAGE_DISPLAY_SETTINGS }, 0, 0, MENUALIGN_LEFT,
 		MENUACTION_HUD,			"FED_HUD", { nil, SAVESLOT_NONE, MENUPAGE_DISPLAY_SETTINGS }, 0, 0, MENUALIGN_LEFT,
 		MENUACTION_SUBTITLES,	"FED_SUB", { nil, SAVESLOT_NONE, MENUPAGE_DISPLAY_SETTINGS }, 0, 0, MENUALIGN_LEFT,
+#ifndef LIBRW_VISIONOS
+		// visionOS: FPS limit is a trap. It feeds RsGlobal.maxFPS (30/60/120) into reVC's own
+		// limiter, a SECOND brake next to our frame cap on the measured display rate -- at 60
+		// it would throttle to a rate the Vision Pro cannot present. reVC's limiter is pinned
+		// off instead (see visionos.cpp). The key also had no German GXT text.
 		MENUACTION_CFO_SELECT, "FED_FPS", { new CCFOSelect((int8*)&FrontEndMenuManager.m_PrefsFPSLimit, "Display", "FPSLimit", fpsLimitOptions, 3, false, FPSLimitChanged) }, 0, 0, MENUALIGN_LEFT,
+#endif
 		MENUACTION_CFO_DYNAMIC,	"FET_DEF", { new CCFODynamic(nil, nil, nil, nil, RestoreDefDisplay) }, 320, 0, MENUALIGN_CENTER,
 		MENUACTION_GOBACK,		"FEDS_TB", { nil, SAVESLOT_NONE, MENUPAGE_NONE}, 320, 0, MENUALIGN_CENTER,
 	},
@@ -787,6 +845,19 @@ CMenuScreenCustom aScreens[] = {
 	// MENUPAGE_GRAPHICS_SETTINGS
 	{ "FET_GFX", MENUPAGE_OPTIONS, new CCustomScreenLayout({40, 78, 25, true, true}), GraphicsGoBack,
 
+#ifndef LIBRW_VISIONOS
+		// visionOS: all of these are dead or harmful on a fixed-drawable VR target.
+		//  FED_RES  screen resolution -- _psSelectScreenVM() is an empty stub and
+		//           _psGetNumVideModes() == 1, so there is nothing to switch.
+		//  FED_WIS  widescreen -- feeds SCREEN_SCALE_AR, which VC_HUD_ASPECT replaces in
+		//           stereo; only side effect left is the cull FOV. Pinned to AR_AUTO.
+		//  FEM_SCF  windowed/fullscreen -- meaningless without a window.
+		//  FEM_VSC  frame sync -- m_PrefsVsync is read only by win.cpp/glfw.cpp, never here.
+		//  FEM_FRM  frame limiter -- a second brake next to our display-rate frame cap.
+		//           Pinned OFF in visionos.cpp.
+		//  FED_FPS  FPS limit -- same trap as on the Display page (and listed twice).
+		//  FED_AAS  anti-aliasing -- our gl3 deviceSystem reports max 1 sample, so only
+		//           "off" is selectable; real MSAA runs via VC_MSAA on the slice target.
 #ifndef GTA_HANDHELD
 		MENUACTION_SCREENRES,	"FED_RES", { nil, SAVESLOT_NONE, MENUPAGE_GRAPHICS_SETTINGS }, 0, 0, MENUALIGN_LEFT,
 #endif
@@ -798,12 +869,17 @@ CMenuScreenCustom aScreens[] = {
 		MENUACTION_FRAMELIMIT,	"FEM_FRM", { nil, SAVESLOT_NONE, MENUPAGE_GRAPHICS_SETTINGS }, 0, 0, MENUALIGN_LEFT,
 		MENUACTION_CFO_SELECT, "FED_FPS", { new CCFOSelect((int8*)&FrontEndMenuManager.m_PrefsFPSLimit, "Display", "FPSLimit", fpsLimitOptions, 3, false, FPSLimitChanged) }, 0, 0, MENUALIGN_LEFT,
 		MULTISAMPLING_SELECTOR
+#endif
 		ISLAND_LOADING_SELECTOR
 		DUALPASS_SELECTOR
+#ifndef LIBRW_VISIONOS
+		// visionOS: colour filter and motion blur both run only through
+		// CMBlur::MotionBlurRender/CPostFX::Render, which the stereo path skips.
 #ifdef EXTENDED_COLOURFILTER
 		POSTFX_SELECTORS
 #elif defined LEGACY_MENU_OPTIONS
 		MENUACTION_TRAILS,		"FED_TRA", { nil, SAVESLOT_NONE, MENUPAGE_GRAPHICS_SETTINGS }, 0, 0, MENUALIGN_LEFT,
+#endif
 #endif
 		// re3.cpp inserts here pipeline selectors if neo/neo.txd exists and EXTENDED_PIPELINES defined
 		MENUACTION_CFO_DYNAMIC,	"FET_DEF", { new CCFODynamic(nil, nil, nil, nil, RestoreDefGraphics) }, 320, 0, MENUALIGN_CENTER,

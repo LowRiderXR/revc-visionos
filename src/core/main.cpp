@@ -1474,6 +1474,33 @@ extern "C" void vc_frame_mark(int id);         // visionos: per-frame phase timi
 extern "C" int  vc_perf_log(void);             // visionos: VC_PERF_LOG gate
 extern "C" void vc_frame_fx_begin(void);       // visionos: time RenderEffects (2x) as the [vc-frame] fx segment
 extern "C" void vc_frame_fx_end(void);
+// visionos: the LOGIC phase (CGame::Process) runs BEFORE mark 0, so [vc-frame]'s "total"
+// never contained it. Slot ids must match the VC_LG_* enum in visionos.cpp; the sub-slots
+// (stream/script/world) are bracketed in Game.cpp.
+// RenderScene stage timing (VC_DRAW_PROFILE): slots must match the VC_SC_* enum in
+// visionos.cpp. VC_SCENE(slot, code) brackets a stage; without the profile it is a no-op.
+extern "C" void vc_scene_begin(int id);
+extern "C" void vc_scene_end(int id);
+#define VC_SC_SKY 0
+#define VC_SC_ROADS 1
+#define VC_SC_EBR 2
+#define VC_SC_WATER 3
+#define VC_SC_FADE 4
+#define VC_SC_MISC 5
+// Eye-pass boundary + RenderEffects breakdown. The boundary slots are the decisive
+// test: constant CPU work that GROWS with the draw count is not CPU work but WAITING
+// for the GPU (FBO switch, MSAA resolve via glBlitFramebuffer in restore_main).
+#define VC_SC_EYESET 6   // vc_stereo_eye_pass: bind slice FBO, per-eye matrices
+#define VC_SC_EYEEND 7   // vc_stereo_restore_main: MSAA resolve + rebind
+#define VC_SC_FXPART 8   // CParticle::Render
+#define VC_SC_FXSHAD 9   // CShadows static + stored
+#define VC_SC_FXGLAS 10  // CGlass + CSpecialFX (shards, brightlights, 3d markers)
+#define VC_SC_FXCORO 11  // CCoronas::Render
+#define VC_SC_FXREST 12  // the remaining RenderEffects entries
+#define VC_SCENE(slot, code) do { vc_scene_begin(slot); code vc_scene_end(slot); } while(0);
+extern "C" void vc_logic_begin(int id);
+extern "C" void vc_logic_end(int id);
+#define VC_LG_TOTAL 0
 extern "C" void vc_fade_set_draw_only(int on);  // visionos: gate DoFade state mutation (per-eye fade)
 extern "C" int  vc_get_eye_view(float m[16]);   // gl3device: eye VIEW (librw) the last eye pass uploaded
 extern "C" int  vc_get_eye_proj(float m[16]);   // gl3device: eye PROJECTION (librw clip) the GPU world used
@@ -1745,6 +1772,21 @@ static bool vcAnimHeadPoseOn(void)
 	if(e < 0){ const char *s = getenv("VC_ANIM_HEADPOSE"); e = (s && s[0] == '0') ? 0 : 1; }
 	return e != 0;
 }
+
+// VC_DROPLETS: screen droplets + the unconditional full-screen back-buffer copy they need.
+// Default OFF in stereo (screen-space effect, see the gate in RenderScene's caller), ON in
+// cinema, where the effect still works on the single flat target. =1/=0 override both.
+static bool vcScreenDropletsOn(void)
+{
+	static int e = -2;
+	if(e == -2){
+		const char *s = getenv("VC_DROPLETS");
+		e = (s && s[0]) ? (s[0] != '0') : -1;   // -1 = follow the render mode
+		printf("[vc-drops] screen droplets = %s\n",
+		       e < 0 ? "stereo:off / cinema:on (default)" : e ? "forced on" : "forced off");
+	}
+	return e < 0 ? (vc_render_mode() != 1) : (e != 0);
+}
 // Count of peds this frame promoted from offscreen-cheap to full-pose by the head view
 // (the cost the fix adds). Read+reset by the World.cpp anim loop for the [vc-anim] log.
 int vc_anim_headpose_promoted = 0;
@@ -1800,20 +1842,22 @@ RenderScene(void)
 	}
 #endif
 	PUSH_RENDERGROUP("RenderScene");
-	CClouds::Render();
-	DoRWRenderHorizon();
-	CRenderer::RenderRoads();
-	CCoronas::RenderReflections();
-	CRenderer::RenderEverythingBarRoads();
+	// visionOS: ~75% of the eye-pass time sits ABOVE librw (measured: its default render
+	// callback plus all GL calls account for only ~20%). Bracket the stages of RenderScene
+	// so the next question -- WHICH stage -- is answered by measurement, not by guessing.
+	// Accumulates over BOTH eye passes, which is what `eyes` covers. VC_DRAW_PROFILE only.
+	VC_SCENE(VC_SC_SKY,   CClouds::Render(); DoRWRenderHorizon(); )
+	VC_SCENE(VC_SC_ROADS, CRenderer::RenderRoads(); )
+	VC_SCENE(VC_SC_MISC,  CCoronas::RenderReflections(); )
+	VC_SCENE(VC_SC_EBR,   CRenderer::RenderEverythingBarRoads(); )
 	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
-	CWaterLevel::RenderWater();
-	CRenderer::RenderBoats();
-	CRenderer::RenderFadingInUnderwaterEntities();
+	VC_SCENE(VC_SC_WATER, CWaterLevel::RenderWater(); )
+	VC_SCENE(VC_SC_MISC,  CRenderer::RenderBoats(); CRenderer::RenderFadingInUnderwaterEntities(); )
 	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
-	CWaterLevel::RenderTransparentWater();
-	CRenderer::RenderFadingInEntities();
+	VC_SCENE(VC_SC_WATER, CWaterLevel::RenderTransparentWater(); )
+	VC_SCENE(VC_SC_FADE,  CRenderer::RenderFadingInEntities(); )
 	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
-	CWeather::RenderRainStreaks();
+	VC_SCENE(VC_SC_MISC,  CWeather::RenderRainStreaks(); )
 	CCoronas::RenderSunReflection();
 	POP_RENDERGROUP();
 }
@@ -1843,22 +1887,20 @@ RenderEffects(void)
 	}
 #endif
 	PUSH_RENDERGROUP("RenderEffects");
-	CGlass::Render();
-	CWaterCannons::Render();
-	CSpecialFX::Render();
-	CRopes::Render();
-	CShadows::RenderStaticShadows();
-	CShadows::RenderStoredShadows();
-	CSkidmarks::Render();
-	CAntennas::Render();
-	CRubbish::Render();
-	CCoronas::Render();
-	CParticle::Render();
-	CPacManPickups::Render();
-	CWeaponEffects::Render();
-	CPointLights::RenderFogEffect();
-	CMovingThings::Render();
-	CRenderer::RenderFirstPersonVehicle();
+	// Split because fx spiked to 10.1 ms once against a 0.5 ms norm -- an outlier the
+	// average hid completely. Collision aftermath (sparks, smoke, shards, skidmarks) is
+	// the suspicion, so particles/glass/shadows get their own slots.
+	VC_SCENE(VC_SC_FXGLAS, CGlass::Render(); )
+	VC_SCENE(VC_SC_FXREST, CWaterCannons::Render(); )
+	VC_SCENE(VC_SC_FXGLAS, CSpecialFX::Render(); )
+	VC_SCENE(VC_SC_FXREST, CRopes::Render(); )
+	VC_SCENE(VC_SC_FXSHAD, CShadows::RenderStaticShadows(); CShadows::RenderStoredShadows(); )
+	VC_SCENE(VC_SC_FXREST, CSkidmarks::Render(); CAntennas::Render(); CRubbish::Render(); )
+	VC_SCENE(VC_SC_FXCORO, CCoronas::Render(); )
+	VC_SCENE(VC_SC_FXPART, CParticle::Render(); )
+	VC_SCENE(VC_SC_FXREST, CPacManPickups::Render(); CWeaponEffects::Render();
+	                       CPointLights::RenderFogEffect(); CMovingThings::Render();
+	                       CRenderer::RenderFirstPersonVehicle(); )
 	POP_RENDERGROUP();
 }
 
@@ -1986,7 +2028,13 @@ Idle(void *arg)
 	CPointLights::InitPerFrame();
 
 	tbStartTimer(0, "CGame::Process");
+#ifdef LIBRW_VISIONOS
+	vc_logic_begin(VC_LG_TOTAL);   // opens the logic phase AND resets the sub-slots
+#endif
 	CGame::Process();
+#ifdef LIBRW_VISIONOS
+	vc_logic_end(VC_LG_TOTAL);
+#endif
 	tbEndTimer("CGame::Process");
 	POP_MEMID();
 
@@ -2179,7 +2227,7 @@ Idle(void *arg)
 				if (vcStereoAlphaFixOn()) CVisibilityPlugins::SaveAlphaBaseline();
 #endif
 			for (int eye = 0; eye < 2; eye++) {
-				vc_stereo_eye_pass(eye);
+				VC_SCENE(VC_SC_EYESET, vc_stereo_eye_pass(eye); )
 				// Set TheCamera to this eye (CPU sky/coronas/lighting read it). GPU world
 				// path is unchanged (eye pass already uploaded the uniform) -> world identical.
 				if (vcStereoCameraOn()) vcStereoSetGameCamera(eye);
@@ -2233,7 +2281,7 @@ Idle(void *arg)
 			// Restore the game camera so gameplay + the mono/HUD path see the original.
 			if (vcStereoCameraOn()) vcStereoRestoreGameCamera();
 			vc_frame_mark(2);   // eyes done (2x RenderScene + 2x RenderEffects + 2x DoFade)
-			vc_stereo_restore_main();
+			VC_SCENE(VC_SC_EYEEND, vc_stereo_restore_main(); )
 			// Wipe any stale OPAQUE content baked into this ring buffer's cinema/HUD
 			// colour (e.g. the load "please wait" MessageScreen) before the 2D/HUD pass
 			// draws the fresh, transparent HUD. Without this it flickers back in.
@@ -2260,9 +2308,28 @@ Idle(void *arg)
 		        TheCamera.SetMotionBlurAlpha(150);
 
 #ifdef SCREEN_DROPLETS
+#ifdef LIBRW_VISIONOS
+		// Screen droplets are a SCREEN-SPACE effect and belong to the family we skip in
+		// stereo (motion blur, colour filter, sniper vignette -- all gated below). This one
+		// sat ABOVE that gate and was missed in the audit: it ran every frame, in every
+		// weather, and `CPostFX::GetBackBuffer` is an unconditional FULL-SCREEN raster copy
+		// (RwRasterRenderFast, 2720x2624 = 7.1 MP). In stereo it cannot even be correct --
+		// Scene.camera's raster is the HUD/overlay buffer, the world lives in the eye slices,
+		// so the droplets sample the wrong image.
+		// EVIDENCE (recorded BEFORE the fix, so the expectation stays falsifiable): post-3d
+		// is 0.2 ms normally but PEAKed at 15.2 and 19.7 ms in two separate device runs --
+		// this copy is the only heavy thing in that segment. EXPECTED after the gate:
+		// (a) the post-3d PEAKs disappear, (b) [vc-eyegpu] avg drops ~0.5-1 ms, (c) the
+		// instRate dips get rarer. If the PEAKs REMAIN, the copy was not the cause and the
+		// search in post-3d continues -- do not treat this as closed on faith.
+		// VC_DROPLETS=1 forces the effect back on (A/B in the same build), =0 forces it off.
+		if (vcScreenDropletsOn())
+#endif
+		{
 		CPostFX::GetBackBuffer(Scene.camera);
 		ScreenDroplets::Process();
 		ScreenDroplets::Render();
+		}
 #endif
 
 		tbStartTimer(0, "RenderMotionBlur");

@@ -221,6 +221,24 @@ RwTexture *gpLaserSightTex;
 RwTexture *gpLaserDotTex;
 RwTexture *gpViewFinderTex;
 
+#ifdef LIBRW_VISIONOS
+// The radar map is a small texture blown up over the HUD quad. Point sampling makes it read
+// as blocky at our render resolution -- exactly the kind of undersampling the resolution work
+// was about -- while the rest of the HUD keeps NEAREST (pixel-art icons and numbers are meant
+// to be crisp). Applies ONLY to CRadar::DrawMap below.
+// VC_RADAR_FILTER=nearest restores the stock look.
+static RwInt32
+vcRadarFilter(void)
+{
+	static RwInt32 f = -1;
+	if (f < 0) {
+		const char *e = getenv("VC_RADAR_FILTER");
+		f = (e && (e[0] == 'n' || e[0] == 'N')) ? rwFILTERNEAREST : rwFILTERLINEAR;
+	}
+	return f;
+}
+#endif
+
 void CHud::Draw()
 {
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERNEAREST);
@@ -1091,7 +1109,11 @@ void CHud::Draw()
 		if (FrontEndMenuManager.m_PrefsRadarMode != 2 &&
 			!m_HideRadar && (m_ItemToFlash == ITEM_RADAR && FRAMECOUNTER & 8 || m_ItemToFlash != ITEM_RADAR)) {
 
+#ifdef LIBRW_VISIONOS
+			RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)(uintptr_t)vcRadarFilter());
+#else
 			RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERNEAREST);
+#endif
 			CRadar::DrawMap();
 			if (FrontEndMenuManager.m_PrefsRadarMode != 1) {
 				CRect rect(0.0f, 0.0f, SCREEN_SCALE_X(RADAR_WIDTH), SCREEN_SCALE_Y(RADAR_HEIGHT));

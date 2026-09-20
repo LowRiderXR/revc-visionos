@@ -1369,11 +1369,153 @@ vcrt_slice_test(void)
 }
 
 // ===========================================================================
+// ===========================================================================
+// GL capability dump, once, with a current context. The question it has to answer:
+// does this ANGLE build expose OVR_multiview2? The measured pass-boundary wait
+// (eyeset+eyeend = 74-78 % of the render time) has exactly one structural fix --
+// render both eyes in ONE pass -- and without the extension that plan does not
+// exist, so every estimate built on it is void. Logged in every run, not asserted:
+// it is a fact about the build, and it is the first thing to check when the
+// multiview question comes up again.
+// ===========================================================================
+typedef const unsigned char *(*PFN_glGetStringVC)(GLenumVC);
+typedef const unsigned char *(*PFN_glGetStringiVC)(GLenumVC, GLuintVC);
+typedef void (*PFN_glGetIntegervVC)(GLenumVC, GLintVC *);
+
+// Word-boundary match: "GL_OVR_multiview" is a PREFIX of "GL_OVR_multiview2", so a
+// plain strstr reports the wrong one as present.
+static bool
+vcrt_has_ext(const char *haystack, const char *name)
+{
+	size_t len = strlen(name);
+	for (const char *p = strstr(haystack, name); p; p = strstr(p + 1, name)) {
+		char before = (p == haystack) ? ' ' : p[-1];
+		char after  = p[len];
+		if ((before == ' ' || before == '\0') && (after == ' ' || after == '\0')) return true;
+	}
+	return false;
+}
+
+static void
+vcrt_log_gl_extensions(void)
+{
+	static bool done = false;
+	if (done) return;
+	done = true;
+
+	PFN_glGetStringVC   getString   = (PFN_glGetStringVC)g_eglGetProcAddress("glGetString");
+	PFN_glGetStringiVC  getStringi  = (PFN_glGetStringiVC)g_eglGetProcAddress("glGetStringi");
+	PFN_glGetIntegervVC getIntegerv = (PFN_glGetIntegervVC)g_eglGetProcAddress("glGetIntegerv");
+	if (!getString) { VCLOG(@"[vc-caps] glGetString unresolved -- cannot query extensions"); return; }
+
+	const unsigned char *ver = getString(0x1F02 /* GL_VERSION */);
+	const unsigned char *ren = getString(0x1F01 /* GL_RENDERER */);
+	VCLOG(@"[vc-caps] GL_VERSION = %s | GL_RENDERER = %s",
+	      ver ? (const char*)ver : "?", ren ? (const char*)ren : "?");
+
+	// ES 3 reports extensions one at a time; the monolithic GL_EXTENSIONS string is the
+	// ES 2 fallback. Collect into one buffer either way so the search is the same.
+	static char all[16384];
+	size_t used = 0;
+	all[0] = '\0';
+	GLintVC n = 0;
+	if (getStringi && getIntegerv) {
+		getIntegerv(0x821D /* GL_NUM_EXTENSIONS */, &n);
+		for (GLintVC i = 0; i < n; i++) {
+			const unsigned char *e = getStringi(0x1F03 /* GL_EXTENSIONS */, (GLuintVC)i);
+			if (!e) continue;
+			size_t l = strlen((const char*)e);
+			if (used + l + 2 >= sizeof(all)) break;
+			memcpy(all + used, e, l); used += l;
+			all[used++] = ' '; all[used] = '\0';
+		}
+	}
+	if (used == 0) {
+		const unsigned char *e = getString(0x1F03 /* GL_EXTENSIONS */);
+		if (e) { strncpy(all, (const char*)e, sizeof(all) - 1); all[sizeof(all) - 1] = '\0'; used = strlen(all); }
+	}
+
+	static const char *kWanted[] = {
+		"GL_OVR_multiview",
+		"GL_OVR_multiview2",
+		"GL_OVR_multiview_multisampled_render_to_texture",
+		"GL_ANGLE_multiview_multisample",
+		"GL_ANGLE_texture_multisample",
+	};
+	bool haveMV2 = false;
+	for (unsigned i = 0; i < sizeof(kWanted)/sizeof(kWanted[0]); i++) {
+		bool have = vcrt_has_ext(all, kWanted[i]);
+		if (strcmp(kWanted[i], "GL_OVR_multiview2") == 0) haveMV2 = have;
+		VCLOG(@"[vc-caps]   %-50s %s", kWanted[i], have ? "YES" : "no");
+	}
+
+	// GL_ANGLE_request_extension is present on this build, and that changes what "absent"
+	// means: ANGLE keeps some extensions IMPLEMENTED BUT DISABLED, listed separately under
+	// GL_REQUESTABLE_EXTENSIONS_ANGLE and switched on with glRequestExtensionANGLE. So
+	// missing from GL_EXTENSIONS does NOT yet mean missing from the build -- checking only
+	// the active list would have answered a different question than the one asked.
+	static char req[8192];
+	size_t reqUsed = 0;
+	req[0] = '\0';
+	GLintVC nReq = 0;
+	if (vcrt_has_ext(all, "GL_ANGLE_request_extension") && getStringi && getIntegerv) {
+		getIntegerv(0x93A9 /* GL_NUM_REQUESTABLE_EXTENSIONS_ANGLE */, &nReq);
+		for (GLintVC i = 0; i < nReq; i++) {
+			const unsigned char *e = getStringi(0x93A8 /* GL_REQUESTABLE_EXTENSIONS_ANGLE */, (GLuintVC)i);
+			if (!e) continue;
+			size_t l = strlen((const char*)e);
+			if (reqUsed + l + 2 >= sizeof(req)) break;
+			memcpy(req + reqUsed, e, l); reqUsed += l;
+			req[reqUsed++] = ' '; req[reqUsed] = '\0';
+		}
+	}
+	bool reqMV2 = vcrt_has_ext(req, "GL_OVR_multiview2");
+	bool reqMV  = vcrt_has_ext(req, "GL_OVR_multiview");
+	VCLOG(@"[vc-caps] requestable (GL_ANGLE_request_extension): %d entries | GL_OVR_multiview=%s GL_OVR_multiview2=%s",
+	      (int)nReq, reqMV ? "YES" : "no", reqMV2 ? "YES" : "no");
+	if (reqUsed && (reqMV || reqMV2 || nReq <= 24)) {
+		for (size_t off = 0; off < reqUsed; off += 280) {
+			char chunk[288];
+			size_t l = (reqUsed - off < 280) ? (reqUsed - off) : 280;
+			memcpy(chunk, req + off, l); chunk[l] = '\0';
+			VCLOG(@"[vc-caps]   req: %s", chunk);
+		}
+	}
+
+	if (haveMV2 && getIntegerv) {
+		GLintVC maxViews = 0;
+		getIntegerv(0x9631 /* GL_MAX_VIEWS_OVR */, &maxViews);
+		VCLOG(@"[vc-caps]   GL_MAX_VIEWS_OVR = %d (need >= 2)", maxViews);
+	}
+	VCLOG(@"[vc-caps] VERDICT: one-pass stereo (multiview) is %s",
+	      haveMV2 ? "AVAILABLE NOW (active extension)"
+	      : (reqMV2 ? "AVAILABLE VIA glRequestExtensionANGLE -- implemented but off by default"
+	                : "NOT IN THIS BUILD -- neither active nor requestable; the ANGLE Metal backend would have to implement it"));
+
+	// Independent of multiview: EXT_multisampled_render_to_texture would let the eye FBO
+	// carry MSAA in tile memory and resolve on store, instead of our separate 228 MB
+	// multisample FBO plus a full-screen blit per eye. Different question, same log.
+	VCLOG(@"[vc-caps] GL_EXT_multisampled_render_to_texture = %s (implicit MSAA resolve -> no separate MSAA FBO, no resolve blit)",
+	      vcrt_has_ext(all, "GL_EXT_multisampled_render_to_texture") ? "YES" : "no");
+
+	// When it is missing, the full list IS the useful part: it says what the Metal
+	// backend does expose, which is the starting point for judging the port effort.
+	if (!haveMV2) {
+		VCLOG(@"[vc-caps] %d extensions, %zu bytes; full list follows", (int)n, used);
+		for (size_t off = 0; off < used; off += 280) {
+			char chunk[288];
+			size_t l = (used - off < 280) ? (used - off) : 280;
+			memcpy(chunk, all + off, l); chunk[l] = '\0';
+			VCLOG(@"[vc-caps]   %s", chunk);
+		}
+	}
+}
+
 // Phase 5.5 stereo target: DOUBLE-BUFFERED to share the cinema state machine.
 // Per back buffer i: ONE MTLTexture (2D array, arrayLength=2) whose slices are
-// the two eyes, plus a GL FBO per slice. One DEDICATED depth renderbuffer shared
-// by all FBOs and cleared per eye pass (passes are sequential on this GL thread;
-// never the cinema depth). The eye textures are tied to the SAME index as the
+// the two eyes, plus a GL FBO per slice. Depth is a DEDICATED renderbuffer, never
+// the cinema depth, cleared per eye pass. It used to be ONE for all FBOs -- see
+// VC_STEREO_DEPTH_SPLIT below for why that is now per eye. The eye textures are tied to the SAME index as the
 // cinema g_buf[i], so vcrt_begin_frame / vcrt_publish_frame / the shared-event
 // sync all apply unchanged -- only which texture vc_acquire_ready_frame hands out
 // (and eye_count) differs by mode.
@@ -1386,9 +1528,33 @@ typedef struct {
 } VCStereoBuffer;
 
 static VCStereoBuffer g_stereoBuf[VC_NUM_BUFFERS];
-static GLuintVC       g_stereoDepthRbo = 0;
+// VC_STEREO_DEPTH_SPLIT (default 1): one depth renderbuffer PER EYE instead of one
+// shared by every eye FBO of every ring buffer.
+// WHY, measured: with VC_MSAA=0 the per-eye split of the boundary timers showed
+// eyClr = 0.0 / 3.2-4.9 ms -- eye 0's clear is free, eye 1's costs 3-5 ms. Eye 0's clear
+// writes an EGLImage-imported slice too and costs nothing, so it is NOT a per-touch
+// interop tax; the CPU waits for the PREVIOUS EYE. The shared depth renderbuffer is the
+// coupling: eye 1's glClear(COLOR|DEPTH) writes the very buffer eye 0 has just been
+// writing -- a write-after-write hazard on one resource. Eye 0 hits the same hazard
+// against the previous FRAME's eye 1, but a whole logic phase and a publish sit in
+// between, so that work is long finished -- which is exactly the 0.0 / 3-5 asymmetry.
+// Not caught by the MSAA=2 test because there each MSAA FBO already had its own depth;
+// the wait came from the resolve blit's read-after-write on eye 0's colour instead.
+// Cost: one extra D24S8 renderbuffer, ~28 MB at 7.1 MP. Index 1 unused when off.
+static GLuintVC       g_stereoDepthRbo[2] = {0, 0};
+static int            g_stereoDepthSplit  = -1;   // -1 = unread
 static bool           g_stereoReady    = false;
 static bool           g_stereoFailed   = false;
+
+static int
+vcStereoDepthSplit(void)
+{
+	if (g_stereoDepthSplit < 0) {
+		const char *e = getenv("VC_STEREO_DEPTH_SPLIT");
+		g_stereoDepthSplit = e ? (atoi(e) ? 1 : 0) : 1;   // default: one depth per eye
+	}
+	return g_stereoDepthSplit;
+}
 
 extern "C" bool  vc_stereo_ready(void) { return g_stereoReady; }
 extern "C" void *vc_stereo_array_texture(int idx)
@@ -1418,6 +1584,18 @@ typedef void (*PFN_ANGLESetRateMapForSize)(unsigned int, unsigned int, unsigned 
 static PFN_ANGLESetRateMap         p_ANGLESetRateMap = NULL;
 static PFN_ANGLESetRateMapForSize  p_ANGLESetRateMapForSize = NULL;
 static int vcMsaaSamples(void);   // forward: foveation registration depends on the MSAA path
+// IMPLICIT MSAA (GL_EXT_multisampled_render_to_texture, confirmed present on this build).
+// Instead of our own multisample FBO plus a full-screen glBlitFramebuffer resolve per eye,
+// the slice FBO itself carries the sample count and Metal resolves as the pass's STORE
+// ACTION. Verified in the ANGLE source (Prototypes/angle-src) rather than assumed:
+//   RenderBufferMtl.mm / TextureMtl.mm allocate the multisample surface with
+//   MakeMemoryLess2DMSTexture -> MTLStorageModeMemoryless, i.e. tile memory only, and
+//   RenderTargetMtl::setWithImplicitMSTexture makes the base texture the resolve target.
+// So it is a REAL implicit resolve, not an emulated blit -- the 228 MB and the blit both
+// go away. VC_MSAA_IMPLICIT=0 falls back to the explicit path for the A/B.
+static int vcMsaaImplicit(void);
+static bool g_msaaImplicitActive = false;   // set only once the FBO is verified COMPLETE
+static bool g_msaaImplicitFailed = false;   // set if any slice rejected it -> explicit path
 static id<MTLRasterizationRateMap> g_foveMap = nil;
 
 // Sampled optical curve pushed from Swift (vc_set_foveation_curve): the compositor's own
@@ -1516,10 +1694,26 @@ vcrt_foveation_apply(int W, int H)
 		p_ANGLESetRateMapForSize = (PFN_ANGLESetRateMapForSize)dlsym(RTLD_DEFAULT, "ANGLEMetalSetRasterizationRateMapForSize");
 
 	int samples = vcMsaaSamples();
-	if (samples > 0 && p_ANGLESetRateMapForSize) {
-		// MSAA path: the eye passes render into the shared multisample target (W x H, N
+	if (samples > 0 && g_msaaImplicitActive) {
+		// IMPLICIT MSAA: register BY IDENTITY, like the no-MSAA path. The by-size hack
+		// below exists only because the EXPLICIT path's multisample renderbuffer is
+		// ANGLE-owned and has no MTLTexture anyone outside can name. With the implicit
+		// path the render target's BASE texture is our own slice again, and klepton's
+		// lookup (RateMapForRenderTarget -> GetRasterizationRateMapForTarget) tries
+		// identity FIRST, walking up parentTexture -- so registering the array texture
+		// matches, and the resolve store action preserves the physical layout the same
+		// way the blit did. Checked against the patch source, not assumed.
+		int n = 0;
+		for (int i = 0; i < g_numBuffers; i++) {
+			id<MTLTexture> t = g_stereoBuf[i].arrayTex;
+			if (t) { p_ANGLESetRateMap(VC_OBJ_TO_VOID(t), VC_OBJ_TO_VOID(g_foveMap)); n++; }
+		}
+		VCLOG(@"[vc-fove] rate map bound BY IDENTITY to %d stereo slices (implicit MSAA %dx: the pass resolves into the slice, so the slice IS the render target)", n, samples);
+	} else if (samples > 0 && p_ANGLESetRateMapForSize) {
+		// MSAA path: the eye passes render into the multisample target(s) (W x H, N
 		// samples), which ANGLE owns -> register the map BY SIZE so it attaches to that
-		// pass. The position-preserving resolve blit then carries the warped layout into
+		// pass. By SIZE, so VC_MSAA_SPLIT's second per-eye target is covered by the same
+		// registration. The position-preserving resolve blit then carries the warped layout into
 		// the slice. Do NOT register the slice by identity here: the resolve writes into
 		// the slice and must stay a clean 1:1 copy (the by-size registry only matches the
 		// N-sample target, so the 1-sample slice/HUD are untouched either way).
@@ -1600,10 +1794,36 @@ vcrt_stereo_ensure(void)
 
 	const int W = g_rtWidth, H = g_rtHeight;
 
-	// Depth renderbuffer: ONE, shared by all eye FBOs, cleared per pass.
-	glGenRenderbuffers_(1, &g_stereoDepthRbo);
-	glBindRenderbuffer_(VC_GL_RENDERBUFFER, g_stereoDepthRbo);
-	glRenderbufferStorage_(VC_GL_RENDERBUFFER, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
+	// Implicit-MSAA entry points (EXT_multisampled_render_to_texture). Resolved locally;
+	// absence is not fatal, it just means the explicit path stays.
+	typedef void (*PFN_glFramebufferTexture2DMultisampleEXT)(GLenumVC, GLenumVC, GLenumVC, GLuintVC, GLintVC, GLsizeiVC);
+	typedef void (*PFN_glRenderbufferStorageMultisampleEXT)(GLenumVC, GLsizeiVC, GLenumVC, GLsizeiVC, GLsizeiVC);
+	PFN_glFramebufferTexture2DMultisampleEXT fbTex2DMS =
+		(PFN_glFramebufferTexture2DMultisampleEXT)g_eglGetProcAddress("glFramebufferTexture2DMultisampleEXT");
+	PFN_glRenderbufferStorageMultisampleEXT rbStorageMSExt =
+		(PFN_glRenderbufferStorageMultisampleEXT)g_eglGetProcAddress("glRenderbufferStorageMultisampleEXT");
+	const int implicitSamples = (vcMsaaImplicit() && vcMsaaSamples() > 0 && fbTex2DMS && rbStorageMSExt)
+	                            ? vcMsaaSamples() : 0;
+	if (vcMsaaImplicit() && vcMsaaSamples() > 0 && !(fbTex2DMS && rbStorageMSExt))
+		VCLOG(@"[vc-msaa] implicit MSAA requested but entry points unresolved (fbTex2DMS=%p rbStorageMSExt=%p) -- falling back to the EXPLICIT resolve path",
+		      (void*)fbTex2DMS, (void*)rbStorageMSExt);
+
+	// Depth renderbuffer(s), cleared per pass. One PER EYE by default so eye 1 does not
+	// write the buffer eye 0 is still writing (see VC_STEREO_DEPTH_SPLIT above).
+	// With implicit MSAA the depth must carry the SAME sample count as the colour or the
+	// FBO is incomplete -- and glRenderbufferStorageMultisampleEXT is what makes ANGLE
+	// allocate it memoryless too (RenderBufferMtl.mm), so the depth buffer also stops
+	// costing real memory.
+	const int nDepth = vcStereoDepthSplit() ? 2 : 1;
+	for (int d = 0; d < nDepth; d++) {
+		glGenRenderbuffers_(1, &g_stereoDepthRbo[d]);
+		glBindRenderbuffer_(VC_GL_RENDERBUFFER, g_stereoDepthRbo[d]);
+		if (implicitSamples > 0)
+			rbStorageMSExt(VC_GL_RENDERBUFFER, implicitSamples, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
+		else
+			glRenderbufferStorage_(VC_GL_RENDERBUFFER, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
+	}
+	if (nDepth == 1) g_stereoDepthRbo[1] = g_stereoDepthRbo[0];
 
 	for (int i = 0; i < g_numBuffers; i++) {
 		VCStereoBuffer *b = &g_stereoBuf[i];
@@ -1634,17 +1854,47 @@ vcrt_stereo_ensure(void)
 			GLenumVC bindErr = p_glGetError();
 			p_glGenFramebuffers(1, &b->fbo[s]);
 			p_glBindFramebuffer(VC_GL_FRAMEBUFFER, b->fbo[s]);
-			p_glFramebufferTexture2D(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0, VC_GL_TEXTURE_2D, b->glTex[s], 0);
-			p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, g_stereoDepthRbo);
+			if (implicitSamples > 0)
+				fbTex2DMS(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0, VC_GL_TEXTURE_2D, b->glTex[s], 0, implicitSamples);
+			else
+				p_glFramebufferTexture2D(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0, VC_GL_TEXTURE_2D, b->glTex[s], 0);
+			GLenumVC msErr = implicitSamples > 0 ? p_glGetError() : 0;
+			p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, g_stereoDepthRbo[s]);
 			GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
-			VCLOG(@"[vc-stereo] buffer %d slice %d: %dx%d RGBA8 gltex %u fbo %u bindErr=0x%x status=%s",
-			      i, s, W, H, b->glTex[s], b->fbo[s], (unsigned)bindErr, vcrt_fbo_status_name(status));
+			// LOUD on failure and FALL BACK: the slices are EGLImage-imported Metal
+			// textures, and ANGLE-on-Metal has silently failed on EGLImage combinations
+			// before. An incomplete FBO here must not ship as a black screen.
+			if (implicitSamples > 0 && (status != VC_GL_FRAMEBUFFER_COMPLETE || msErr != 0)) {
+				VCLOG(@"[vc-msaa] IMPLICIT MSAA %dx REJECTED on buffer %d slice %d: status=%s glErr=0x%x (EGLImage slice + implicit resolve not supported) -- reverting to the EXPLICIT resolve path",
+				      implicitSamples, i, s, vcrt_fbo_status_name(status), (unsigned)msErr);
+				p_glFramebufferTexture2D(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0, VC_GL_TEXTURE_2D, b->glTex[s], 0);
+				glBindRenderbuffer_(VC_GL_RENDERBUFFER, g_stereoDepthRbo[s]);
+				glRenderbufferStorage_(VC_GL_RENDERBUFFER, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
+				p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, g_stereoDepthRbo[s]);
+				status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
+				g_msaaImplicitFailed = true;
+			}
+			VCLOG(@"[vc-stereo] buffer %d slice %d: %dx%d RGBA8 gltex %u fbo %u depthRbo %u samples=%d(%s) bindErr=0x%x status=%s",
+			      i, s, W, H, b->glTex[s], b->fbo[s], g_stereoDepthRbo[s],
+			      g_msaaImplicitFailed ? 1 : implicitSamples,
+			      implicitSamples > 0 && !g_msaaImplicitFailed ? "implicit resolve" : "explicit path",
+			      (unsigned)bindErr, vcrt_fbo_status_name(status));
 		}
 	}
 	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, 0);
 	g_stereoReady = true;
-	VCLOG(@"[vc-stereo] array render target ready (%d buffers x 2 slices, %dx%d, dedicated depth)",
-	      g_numBuffers, W, H);
+	// Must be settled BEFORE vcrt_foveation_apply below: it picks identity vs by-size
+	// registration off this flag.
+	g_msaaImplicitActive = (implicitSamples > 0 && !g_msaaImplicitFailed);
+	if (vcMsaaSamples() > 0)
+		VCLOG(@"[vc-msaa] MSAA %dx path = %s", vcMsaaSamples(), g_msaaImplicitActive
+		      ? "IMPLICIT (EXT_multisampled_render_to_texture: memoryless tile-memory samples, resolve as store action -- no separate MSAA FBO, no resolve blit)"
+		      : "EXPLICIT (own multisample FBO + glBlitFramebuffer resolve per eye)");
+	vcrt_log_gl_extensions();   // multiview support -- decides whether the one-pass plan exists at all
+	VCLOG(@"[vc-stereo] array render target ready (%d buffers x 2 slices, %dx%d, %d dedicated depth rbo%s -- VC_STEREO_DEPTH_SPLIT=%d: %s)",
+	      g_numBuffers, W, H, nDepth, nDepth == 1 ? "" : "s", vcStereoDepthSplit(),
+	      vcStereoDepthSplit() ? "one per eye -- no write-after-write between the eye passes"
+	                           : "SHARED by both eyes (old behaviour)");
 	vcrt_foveation_apply(W, H);   // bind the rate map to the slices when VC_FOVEATE=1
 	// Render-target VRAM per resolution step, and the bytes WRITTEN per frame (both eye
 	// slices; that is the fragment/bandwidth cost the eye passes pay). Answers area-vs-
@@ -1655,10 +1905,10 @@ vcrt_stereo_ensure(void)
 		uint64_t sliceBuf = (uint64_t)W * H * 4ull * 2ull;              // 2 slices RGBA8, per buffer
 		uint64_t sliceAll = sliceBuf * (uint64_t)g_numBuffers;         // x N buffers (resident)
 		uint64_t cinema   = (uint64_t)W * H * 4ull * (uint64_t)g_numBuffers; // HUD/cinema 2D tex x N
-		uint64_t depth    = (uint64_t)W * H * 4ull;                    // one shared D24S8 renderbuffer
+		uint64_t depth    = (uint64_t)W * H * 4ull * (uint64_t)nDepth; // D24S8 renderbuffer(s)
 		uint64_t resident = sliceAll + cinema + depth;
 		uint64_t writtenPerFrame = (uint64_t)W * H * 4ull * 2ull       // 2 eye slice colours
-		                         + (uint64_t)W * H * 4ull;             // + shared depth
+		                         + (uint64_t)W * H * 4ull * 2ull;      // + depth, once per eye pass
 		VCLOG(@"[vc-vram] %dx%d (%.2f MP/eye)  resident: slices=%llu MB cinema=%llu MB depth=%llu MB total=%llu MB  |  written/frame(2 slices+depth)=%llu MB",
 		      W, H, mp,
 		      (unsigned long long)(sliceAll / 1000000ull), (unsigned long long)(cinema / 1000000ull),
@@ -1685,12 +1935,26 @@ typedef void (*PFN_glRenderbufferStorageMultisample)(GLenumVC, GLsizeiVC, GLenum
 typedef void (*PFN_glBlitFramebuffer)(GLintVC, GLintVC, GLintVC, GLintVC, GLintVC, GLintVC, GLintVC, GLintVC, GLenumVC, GLenumVC);
 
 static int      g_msaaSamples  = -1;   // -1 = unread; 0 = off; 2/4/8 = on
-static GLuintVC g_msaaFbo      = 0;
-static GLuintVC g_msaaColorRbo = 0;
-static GLuintVC g_msaaDepthRbo = 0;
+// VC_MSAA_SPLIT (default 0 = OFF, shared target): one multisample target PER EYE.
+// MEASURED AND REFUTED on device. The idea was that the shared target is a write-after-
+// write hazard -- eye 1 re-renders the exact renderbuffer eye 0 just wrote. Two targets
+// changed NOTHING (eyPre 1.9/2.0/3.9/4.2 ms split vs 1.9/2.0/3.4/4.3 shared, at matching
+// draw counts; refutation threshold was 20 %).
+// WHY IT COULD NOT WORK: the per-eye split of the boundary timers, added in the same
+// build, showed the wait sits ONLY at eye 1's boundary (e0/e1 = 0.0/1.9 etc.) -- i.e. in
+// the resolve blit of eye 0, which READS eye 0's multisample buffer. That is a
+// READ-after-write dependency on eye 0's rendering, not a write-after-write one on the
+// target, so giving eye 1 its own target cannot help. Kept behind the switch (off, no
+// memory cost) because it is the cheap A/B if the resolve scheme is ever restructured.
+// Cost when on: one extra colour + one extra depth multisample renderbuffer (~114 MB at
+// 7.1 MP / 2x), logged below. Index 1 is only used when split is on; else both use [0].
+static GLuintVC g_msaaFbo[2]      = {0, 0};
+static GLuintVC g_msaaColorRbo[2] = {0, 0};
+static GLuintVC g_msaaDepthRbo[2] = {0, 0};
+static int      g_msaaSplit    = -1;   // -1 = unread
 static bool     g_msaaReady    = false;
 static bool     g_msaaFailed   = false;
-static int      g_msaaPending  = -1;    // eye whose content sits in g_msaaFbo awaiting resolve
+static int      g_msaaPending  = -1;    // eye whose content sits in its MSAA FBO awaiting resolve
 static PFN_glGenRenderbuffers               p_msGenRenderbuffers  = NULL;
 static PFN_glBindRenderbuffer               p_msBindRenderbuffer  = NULL;
 static PFN_glRenderbufferStorageMultisample p_msRenderbufferStorageMultisample = NULL;
@@ -1715,7 +1979,31 @@ vcMsaaSamples(void)
 	return g_msaaSamples;
 }
 
-// Lazily create the shared multisample FBO. Latches failure; logs LOUD once.
+static int
+vcMsaaImplicit(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("VC_MSAA_IMPLICIT");
+		v = e ? (atoi(e) ? 1 : 0) : 1;   // default: implicit resolve
+	}
+	return v;
+}
+
+static int
+vcMsaaSplit(void)
+{
+	if (g_msaaSplit < 0) {
+		const char *e = getenv("VC_MSAA_SPLIT");
+		g_msaaSplit = e ? (atoi(e) ? 1 : 0) : 0;   // default: shared (split measured and refuted)
+	}
+	return g_msaaSplit;
+}
+
+// Which multisample FBO an eye renders into. Without split both share index 0.
+static inline int vcMsaaIdx(int eye) { return (vcMsaaSplit() && eye == 1) ? 1 : 0; }
+
+// Lazily create the multisample FBO(s). Latches failure; logs LOUD once.
 static bool
 vcrt_msaa_ensure(void)
 {
@@ -1723,6 +2011,8 @@ vcrt_msaa_ensure(void)
 	if (g_msaaFailed) return false;
 	int samples = vcMsaaSamples();
 	if (samples == 0) { g_msaaFailed = true; return false; }
+	// The implicit path needs none of this: the slice FBO carries the samples itself.
+	if (g_msaaImplicitActive) { g_msaaFailed = true; return false; }
 
 	if (!p_msGenRenderbuffers)  p_msGenRenderbuffers  = (PFN_glGenRenderbuffers)g_eglGetProcAddress("glGenRenderbuffers");
 	if (!p_msBindRenderbuffer)  p_msBindRenderbuffer  = (PFN_glBindRenderbuffer)g_eglGetProcAddress("glBindRenderbuffer");
@@ -1736,63 +2026,76 @@ vcrt_msaa_ensure(void)
 	}
 
 	const int W = g_rtWidth, H = g_rtHeight;
+	const int nTargets = vcMsaaSplit() ? 2 : 1;
+	GLenumVC eColor = 0, eDepth = 0;
 
-	p_msGenRenderbuffers(1, &g_msaaColorRbo);
-	p_msBindRenderbuffer(VC_GL_RENDERBUFFER, g_msaaColorRbo);
-	p_msRenderbufferStorageMultisample(VC_GL_RENDERBUFFER, samples, 0x8058 /* GL_RGBA8 */, W, H);
-	GLenumVC eColor = p_glGetError();
+	for (int i = 0; i < nTargets; i++) {
+		p_msGenRenderbuffers(1, &g_msaaColorRbo[i]);
+		p_msBindRenderbuffer(VC_GL_RENDERBUFFER, g_msaaColorRbo[i]);
+		p_msRenderbufferStorageMultisample(VC_GL_RENDERBUFFER, samples, 0x8058 /* GL_RGBA8 */, W, H);
+		if (p_glGetError() != 0) eColor = 1;
 
-	p_msGenRenderbuffers(1, &g_msaaDepthRbo);
-	p_msBindRenderbuffer(VC_GL_RENDERBUFFER, g_msaaDepthRbo);
-	p_msRenderbufferStorageMultisample(VC_GL_RENDERBUFFER, samples, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
-	GLenumVC eDepth = p_glGetError();
+		p_msGenRenderbuffers(1, &g_msaaDepthRbo[i]);
+		p_msBindRenderbuffer(VC_GL_RENDERBUFFER, g_msaaDepthRbo[i]);
+		p_msRenderbufferStorageMultisample(VC_GL_RENDERBUFFER, samples, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H);
+		if (p_glGetError() != 0) eDepth = 1;
 
-	p_glGenFramebuffers(1, &g_msaaFbo);
-	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_msaaFbo);
-	p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0,        VC_GL_RENDERBUFFER, g_msaaColorRbo);
-	p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, g_msaaDepthRbo);
-	GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
-	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, 0);
+		p_glGenFramebuffers(1, &g_msaaFbo[i]);
+		p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_msaaFbo[i]);
+		p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0,        VC_GL_RENDERBUFFER, g_msaaColorRbo[i]);
+		p_glFramebufferRenderbuffer(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, VC_GL_RENDERBUFFER, g_msaaDepthRbo[i]);
+		GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
+		p_glBindFramebuffer(VC_GL_FRAMEBUFFER, 0);
 
-	if (status != VC_GL_FRAMEBUFFER_COMPLETE) {
-		g_msaaFailed = true;
-		VCLOG(@"[vc-msaa] ERROR: MSAA %dx FBO INCOMPLETE %dx%d status=%s (colourStorageErr=0x%x depthStorageErr=0x%x) -- MSAA OFF, FALLING BACK TO 1x",
-		      samples, W, H, vcrt_fbo_status_name(status), (unsigned)eColor, (unsigned)eDepth);
-		return false;
+		if (status != VC_GL_FRAMEBUFFER_COMPLETE) {
+			g_msaaFailed = true;
+			VCLOG(@"[vc-msaa] ERROR: MSAA %dx FBO[%d] INCOMPLETE %dx%d status=%s (colourStorageErr=%u depthStorageErr=%u) -- MSAA OFF, FALLING BACK TO 1x",
+			      samples, i, W, H, vcrt_fbo_status_name(status), (unsigned)eColor, (unsigned)eDepth);
+			return false;
+		}
 	}
+	if (!vcMsaaSplit()) { g_msaaFbo[1] = g_msaaFbo[0]; g_msaaColorRbo[1] = g_msaaColorRbo[0]; g_msaaDepthRbo[1] = g_msaaDepthRbo[0]; }
 
 	g_msaaReady = true;
-	VCLOG(@"[vc-msaa] MSAA %dx render target READY %dx%d (colour+depth multisample renderbuffers, resolve via glBlitFramebuffer; colourStorageErr=0x%x depthStorageErr=0x%x)",
-	      samples, W, H, (unsigned)eColor, (unsigned)eDepth);
+	// (colour RGBA8 + depth24stencil8) x samples x W x H, per target.
+	unsigned long long perTarget = (unsigned long long)W * H * (4ull + 4ull) * (unsigned)samples;
+	VCLOG(@"[vc-msaa] MSAA %dx render target READY %dx%d -- %d target%s (VC_MSAA_SPLIT=%d: %s), %llu MB total; resolve via glBlitFramebuffer (colourStorageErr=%u depthStorageErr=%u)",
+	      samples, W, H, nTargets, nTargets == 1 ? "" : "s", vcMsaaSplit(),
+	      vcMsaaSplit() ? "one per eye -- no write-after-write between the eye passes"
+	                    : "SHARED by both eyes (old behaviour)",
+	      perTarget * (unsigned)nTargets / 1000000ull, (unsigned)eColor, (unsigned)eDepth);
 	return true;
 }
 
 // Resolve the pending eye's multisample content into its single-sample slice FBO.
 // Called between eyes (from vc_stereo_eye_fbo) and for the last eye (from
-// vc_stereo_restore_main). Leaves GL_FRAMEBUFFER bound to g_msaaFbo so librw's
-// currentFramebuffer cache stays coherent (the next eye binds g_msaaFbo; a cache
-// early-out is then safe because the real binding already matches).
+// vc_stereo_restore_main).
 extern "C" void
 vc_stereo_msaa_resolve_pending(void)
 {
+	if (g_msaaImplicitActive) return;   // resolved by the pass's store action, nothing to do
 	if (!g_msaaReady || g_msaaPending < 0) return;
 	int eye = g_msaaPending;
 	g_msaaPending = -1;
 
+	GLuintVC srcFbo = g_msaaFbo[vcMsaaIdx(eye)];
 	GLuintVC dstFbo = g_stereoBuf[g_currentBack].fbo[eye];
 	const int W = g_rtWidth, H = g_rtHeight;
 
-	p_glBindFramebuffer(0x8CA8 /* GL_READ_FRAMEBUFFER */, g_msaaFbo);
+	p_glBindFramebuffer(0x8CA8 /* GL_READ_FRAMEBUFFER */, srcFbo);
 	p_glBindFramebuffer(0x8CA9 /* GL_DRAW_FRAMEBUFFER */, dstFbo);
 	p_msBlitFramebuffer(0, 0, W, H, 0, 0, W, H, VC_GL_COLOR_BUFFER_BIT, VC_GL_NEAREST);
 	GLenumVC err = p_glGetError();
-	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, g_msaaFbo);   // leave both READ+DRAW = MSAA, cache-coherent
+	// Leave both READ+DRAW on the MSAA FBO we just read, so librw's currentFramebuffer
+	// cache matches the real binding. With split targets the next eye binds the OTHER
+	// FBO, which differs from librw's cached value too -- so the bind is not skipped.
+	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, srcFbo);
 
 	static bool loggedOnce = false;
 	if (!loggedOnce) {
 		loggedOnce = true;
-		VCLOG(@"[vc-msaa] first resolve: blit %dx%d MSAA->slice eye=%d dstFbo=%u glErr=0x%x %s",
-		      W, H, eye, dstFbo, (unsigned)err, err == 0 ? "OK" : "*** BLIT FAILED ***");
+		VCLOG(@"[vc-msaa] first resolve: blit %dx%d MSAA->slice eye=%d srcFbo=%u dstFbo=%u glErr=0x%x %s",
+		      W, H, eye, srcFbo, dstFbo, (unsigned)err, err == 0 ? "OK" : "*** BLIT FAILED ***");
 	} else if (err != 0) {
 		VCLOG(@"[vc-msaa] ERROR: resolve blit eye=%d glErr=0x%x", eye, (unsigned)err);
 	}
@@ -1807,10 +2110,17 @@ vc_stereo_eye_fbo(int eye)
 {
 	if (!(g_stereoReady && (eye == 0 || eye == 1))) return 0;
 	int slot = eye;
+	// Implicit MSAA: the slice FBO IS the multisample render target, and Metal resolves
+	// into the slice when the pass ends. No shared target, no pending resolve, and -- the
+	// point of the change -- no full-screen blit at the eye boundary.
+	if (g_msaaImplicitActive) return g_stereoBuf[g_currentBack].fbo[slot];
 	if (vcMsaaSamples() > 0 && vcrt_msaa_ensure()) {
-		vc_stereo_msaa_resolve_pending();   // resolve the previous eye before reusing the shared FBO
+		// Resolve the previous eye. With a SHARED target this must happen before we
+		// overwrite it; with split targets it is only "the previous eye's content is
+		// due" -- the ordering constraint on the render target itself is gone.
+		vc_stereo_msaa_resolve_pending();
 		g_msaaPending = slot;               // resolve target = slice
-		return g_msaaFbo;
+		return g_msaaFbo[vcMsaaIdx(slot)];
 	}
 	return g_stereoBuf[g_currentBack].fbo[slot];
 }

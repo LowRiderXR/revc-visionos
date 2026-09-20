@@ -1785,9 +1785,20 @@ void CParticle::Update()
 	}
 }
 
+#ifdef LIBRW_VISIONOS
+// Reported next to the fx breakdown in [vc-frame]: a collision throws sparks, smoke
+// and shards, and the suspicion is that an fx outlier coincides with a particle
+// surge. Counted where they are actually walked. Storage/reset in visionos.cpp.
+extern "C" unsigned g_vcParticles;
+extern "C" void vc_sprite_gate(int on);   // open/close the particle sprite-area probe
+#endif
+
 void CParticle::Render()
 {
 	PUSH_RENDERGROUP("CParticle::Render");
+#ifdef LIBRW_VISIONOS
+	vc_sprite_gate(1);   // count sprite PIXELS from here on (see vc_sprite_area)
+#endif
 
 	RwRenderStateSet(rwRENDERSTATETEXTUREADDRESS, (void *)rwTEXTUREADDRESSWRAP);
 	RwRenderStateSet(rwRENDERSTATETEXTUREPERSPECTIVE, (void *)TRUE);
@@ -1863,6 +1874,9 @@ void CParticle::Render()
 		
 		while ( particle != nil )
 		{
+#ifdef LIBRW_VISIONOS
+			g_vcParticles++;   // active particles walked this frame (both eye passes)
+#endif
 			bool canDraw = true;
 
 			if ( particle->m_nAlpha == 0 )
@@ -2302,6 +2316,9 @@ void CParticle::Render()
 	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void *)rwBLENDSRCALPHA);
 	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void *)rwBLENDINVSRCALPHA);
 
+#ifdef LIBRW_VISIONOS
+	vc_sprite_gate(0);
+#endif
 	POP_RENDERGROUP();
 }
 

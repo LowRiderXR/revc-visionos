@@ -140,8 +140,29 @@ void CWeather::Init(void)
 		DMAudio.SetEntityStatus(SoundHandle, TRUE);
 }
 
+#ifdef LIBRW_VISIONOS
+// VC_WEATHER pins the weather so the same route can be driven twice with exactly one
+// variable changed. -1 (unset) = normal weather cycle; 0..5 = WEATHER_SUNNY, CLOUDY,
+// RAINY, FOGGY, EXTRA_SUNNY, HURRICANE.
+extern "C" int vc_forced_weather(void);
+#endif
+
 void CWeather::Update(void)
 {
+#ifdef LIBRW_VISIONOS
+	// Re-asserted EVERY frame, not set once at startup: mission scripts call
+	// ForceWeather/ReleaseWeather and set bScriptsForceRain, any of which would silently
+	// change the weather mid-drive and invalidate the run without anything in the log
+	// saying so. Old == New also pins InterpolationValue out of the picture, so there is
+	// no slow transition between two weather types either.
+	{
+		int fw = vc_forced_weather();
+		if (fw >= 0) {
+			OldWeatherType = NewWeatherType = ForcedWeatherType = (int16)fw;
+			bScriptsForceRain = false;
+		}
+	}
+#endif
 	if(!CReplay::IsPlayingBack()){
 		float fNewInterpolation = (CClock::GetMinutes() + CClock::GetSeconds()/60.0f)/60.0f;
 		if (fNewInterpolation < InterpolationValue) {

@@ -568,7 +568,16 @@ CMenuManager::CMenuManager()
 	DMAudio.SetEffectsMasterVolume(m_PrefsSfxVolume);
 
 #ifdef NO_ISLAND_LOADING
+#ifdef LIBRW_VISIONOS
+	// visionOS default HIGH: keeping both islands resident removes the synchronous island
+	// streaming (RequestIslands + LoadAllRequestedModels) that caused reproducible stutters
+	// while driving -- device-confirmed. Costs memory, of which we have plenty (the streaming
+	// budget alone is ~2 GB, see CStreaming::Init), and a per-frame scan of both big-building
+	// lists, which is a fraction of a millisecond against a 100 ms+ streaming stall.
+	m_PrefsIslandLoading = ISLAND_LOADING_HIGH;
+#else
 	m_PrefsIslandLoading = ISLAND_LOADING_LOW;
+#endif
 #endif
 
 #ifdef GAMEPAD_MENU

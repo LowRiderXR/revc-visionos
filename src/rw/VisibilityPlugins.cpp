@@ -121,19 +121,60 @@ CVisibilityPlugins::InitAlphaAtomicList(void)
 #ifdef LIBRW_VISIONOS
 // Baseline snapshot storage for the stereo alpha-list restore (see the header). Sized to
 // each list's capacity. AlphaObjectInfo is a small POD (pointer + sort key).
-static CVisibilityPlugins::AlphaObjectInfo s_entitySave[NUMALPHAENTITYLIST];
+//
+// The entity list's capacity is NOT NUMALPHAENTITYLIST: Initialise() triples it under
+// ASPECT_RATIO_SCALE ("default 150 is not enough for bigger FOVs"), and our stereo FOV is
+// exactly that case. Sizing the snapshot to the untripled constant silently truncated the
+// baseline at 200 and the restore then rebuilt only those 200 -- so from the 201st alpha
+// entity on, objects that were scanned and should be drawn simply vanished, in BOTH eye
+// passes. The list is ascending by distance, so it was the FARTHEST alpha objects that
+// dropped, and since the count drifts frame to frame the dropped set changed with it:
+// alpha geometry popping in and out. Keep this expression in lockstep with Initialise().
+#ifdef ASPECT_RATIO_SCALE
+	#define VC_ALPHAENTITY_CAP (NUMALPHAENTITYLIST * 3)
+#else
+	#define VC_ALPHAENTITY_CAP (NUMALPHAENTITYLIST)
+#endif
+
+static CVisibilityPlugins::AlphaObjectInfo s_entitySave[VC_ALPHAENTITY_CAP];
 static CVisibilityPlugins::AlphaObjectInfo s_underwaterSave[NUMALPHAUNTERWATERENTITYLIST];
 static CVisibilityPlugins::AlphaObjectInfo s_boatSave[NUMBOATALPHALIST];
 static int s_nEntitySave = 0, s_nUnderwaterSave = 0, s_nBoatSave = 0;
 
+// Truncation used to be silent, which is why the capacity mismatch survived so long.
+// Report it once per list so a future mismatch announces itself instead of quietly
+// deleting geometry. VC_ALPHA_TRACE=1 reports every occurrence with the count.
+static bool
+vcAlphaTrace(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_ALPHA_TRACE"); e = (s && s[0] == '1') ? 1 : 0; }
+	return e == 1;
+}
+
 static int
 vcSaveList(CLinkList<CVisibilityPlugins::AlphaObjectInfo> &list,
-           CVisibilityPlugins::AlphaObjectInfo *out, int cap)
+           CVisibilityPlugins::AlphaObjectInfo *out, int cap, const char *name)
 {
 	int n = 0;
-	for(CLink<CVisibilityPlugins::AlphaObjectInfo> *l = list.head.next;
-	    l != &list.tail && n < cap; l = l->next)
+	CLink<CVisibilityPlugins::AlphaObjectInfo> *l = list.head.next;
+	for(; l != &list.tail && n < cap; l = l->next)
 		out[n++] = l->item;
+	if(l != &list.tail){
+		// Still entries left: the snapshot is short and the restore will drop them.
+		int dropped = 0;
+		for(; l != &list.tail; l = l->next)
+			dropped++;
+		static bool warned = false;
+		if(!warned || vcAlphaTrace()){
+			warned = true;
+			printf("[vc-alpha] baseline TRUNCATED: %s kept %d, dropped %d "
+			       "(snapshot capacity too small -> alpha geometry disappears)\n",
+			       name, n, dropped);
+		}
+	}else if(vcAlphaTrace()){
+		printf("[vc-alpha] baseline %s n=%d cap=%d\n", name, n, cap);
+	}
 	return n;
 }
 
@@ -149,9 +190,9 @@ vcRestoreList(CLinkList<CVisibilityPlugins::AlphaObjectInfo> &list,
 void
 CVisibilityPlugins::SaveAlphaBaseline(void)
 {
-	s_nEntitySave     = vcSaveList(m_alphaEntityList,           s_entitySave,     NUMALPHAENTITYLIST);
-	s_nUnderwaterSave = vcSaveList(m_alphaUnderwaterEntityList, s_underwaterSave, NUMALPHAUNTERWATERENTITYLIST);
-	s_nBoatSave       = vcSaveList(m_alphaBoatAtomicList,       s_boatSave,       NUMBOATALPHALIST);
+	s_nEntitySave     = vcSaveList(m_alphaEntityList,            s_entitySave,     VC_ALPHAENTITY_CAP,            "entity");
+	s_nUnderwaterSave = vcSaveList(m_alphaUnderwaterEntityList,  s_underwaterSave, NUMALPHAUNTERWATERENTITYLIST,  "underwater");
+	s_nBoatSave       = vcSaveList(m_alphaBoatAtomicList,        s_boatSave,       NUMBOATALPHALIST,              "boat");
 }
 
 void

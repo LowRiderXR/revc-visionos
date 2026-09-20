@@ -44,6 +44,7 @@
 #include "Timer.h"    // CTimer
 #include "Pad.h"      // CPad, CControllerState (gamepad input)
 #include "DMAudio.h"  // DMAudio (music mode on restart/load)
+#include "Draw.h"     // AR_AUTO (pinned 2D layout aspect)
 
 // Game render-target size. THE single source: feeds the two vcrt MTLTextures,
 // rsCAMERASIZE, RsGlobal and the librw open params. This is the OFFSCREEN size
@@ -312,10 +313,103 @@ extern "C" int vc_perf_log(void)
 // pulling the world effects into the slices), reported as the [vc-frame] "fx" segment
 // -- so we can decide whether 2x RenderEffects fits the budget before committing.
 static uint64_t g_fxStart = 0, g_fxAccum = 0;
-extern "C" void vc_frame_fx_begin(void) { g_fxStart = mach_absolute_time(); }
+
+// Forward decls: the scene-stage accumulators the spike probe reads live further down
+// (next to the other VC_SC_* machinery), and the eye tag lives in main.cpp.
+static void vc_fx_snapshot(void);
+static void vc_fx_delta(double *part, double *shad, double *glas, double *coro, double *rest, unsigned *parts);
+extern "C" int vc_in_stereo_eye(void);
+extern "C" int vc_draw_profile(void);
+extern "C" {
+extern unsigned long long g_vcSprArea;   // particle sprite pixels (defined below)
+extern unsigned g_vcSprDrawn;
+extern float g_vcSprMaxW, g_vcSprMaxH;
+}
+
+// mach ticks -> ms, timebase read once.
+static double vcTicksMs(uint64_t ticks)
+{
+	static double scale = 0.0;
+	if (scale == 0.0) {
+		mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+		scale = (double)tb.numer / (double)tb.denom / 1.0e6;
+	}
+	return (double)ticks * scale;
+}
+
+// --- fx spike probe (VC_FX_SPIKE_MS, default 4.0 ms) ---------------------------------
+// [vc-frame] prints ONE sampled frame per 10 s. A RenderEffects call of 10.1 ms was seen
+// exactly once in that sampling and never again -- with a 10 s throttle we will essentially
+// never catch it, and "not reproduced" would be an artefact of the probe, not a fact about
+// the game. So print the outlier the moment it happens, with the per-stage split and the
+// particle count, because the suspicion (a collision spawning a particle burst) is testable
+// only against those two numbers together.
+// Rate-limited to ~20 lines/s; the number of SUPPRESSED spikes is printed with the next
+// line, so a capped log never reads as "it happened 20 times" when it happened 200.
+static double vcFxSpikeMs(void)
+{
+	static double v = -1.0;
+	if (v < 0.0) {
+		const char *e = getenv("VC_FX_SPIKE_MS");
+		v = e ? atof(e) : 4.0;
+		if (v <= 0.0) v = 1.0e9;   // VC_FX_SPIKE_MS=0 disables
+	}
+	return v;
+}
+// Snapshot of the RenderEffects sub-stages at fx_begin, so the spike line can report the
+// DELTA of this one call instead of the frame accumulator (which mixes both eye passes).
+static uint64_t g_fxSnap[5] = {0}, g_fxSnapParts = 0;
+static unsigned long long g_fxSnapArea = 0;
+static unsigned g_fxSnapDrawn = 0;
+
+extern "C" void vc_frame_fx_begin(void) { g_fxStart = mach_absolute_time(); vc_fx_snapshot(); }
 extern "C" void vc_frame_fx_end(void)
 {
-	if (g_fxStart) { g_fxAccum += mach_absolute_time() - g_fxStart; g_fxStart = 0; }
+	if (!g_fxStart) return;
+	uint64_t dt = mach_absolute_time() - g_fxStart;
+	g_fxAccum += dt;
+	g_fxStart = 0;
+
+	double ms = vcTicksMs(dt);
+	if (ms < vcFxSpikeMs()) return;
+
+	static uint64_t lastPrint = 0;
+	static unsigned dropped = 0;
+	uint64_t now = mach_absolute_time();
+	if (lastPrint && vcTicksMs(now - lastPrint) < 50.0) { dropped++; return; }
+	lastPrint = now;
+
+	double part = 0.0, shad = 0.0, glas = 0.0, coro = 0.0, rest = 0.0;
+	unsigned parts = 0;
+	vc_fx_delta(&part, &shad, &glas, &coro, &rest, &parts);
+
+	// Sprite pixels of THIS call, against the eye's own screen area -- the ratio is the
+	// overdraw factor, which is the number that decides between "few huge sprites"
+	// (cap the size) and "many stacked ones" (cut the count or the alpha layers).
+	unsigned long long area = (g_vcSprArea >= g_fxSnapArea) ? (g_vcSprArea - g_fxSnapArea) : g_vcSprArea;
+	unsigned drawn = (g_vcSprDrawn >= g_fxSnapDrawn) ? (g_vcSprDrawn - g_fxSnapDrawn) : g_vcSprDrawn;
+	double screenPx = (double)vcScreenW() * (double)vcScreenH();
+	double maxPx = 4.0 * (double)g_vcSprMaxW * (double)g_vcSprMaxH;
+
+	// Wall clock since the first spike-capable frame: [vc-frame] only prints every 10 s,
+	// so a frame counter alone is hard to line up with what was seen on the device.
+	static uint64_t t0 = 0;
+	if (t0 == 0) t0 = now;
+	double sinceStart = vcTicksMs(now - t0) / 1000.0;
+
+	printf("[vc-fx-spike] t=%.1fs fc=%u eye=%d fx=%.1f ms | fxPart=%.1f fxShad=%.1f fxGlas=%.1f fxCoro=%.1f fxRest=%.1f"
+	       " | parts=%u drawn=%u area=%.2f MP (%.2fx screen) maxSprite=%.0fx%.0f px (%.2f MP, %.1f%% of area)"
+	       " (threshold %.1f ms, suppressed=%u)%s\n",
+	       sinceStart,
+	       // vcEyeTag is 1-based inside the eye loop (0 = outside); print the eye index.
+	       (unsigned)CTimer::GetFrameCounter(), vc_in_stereo_eye() - 1, ms,
+	       part, shad, glas, coro, rest,
+	       parts, drawn, (double)area / 1.0e6, screenPx > 0.0 ? (double)area / screenPx : 0.0,
+	       2.0 * g_vcSprMaxW, 2.0 * g_vcSprMaxH, maxPx / 1.0e6,
+	       area > 0 ? 100.0 * maxPx / (double)area : 0.0,
+	       vcFxSpikeMs(), dropped,
+	       vc_draw_profile() ? "" : "  [stage split needs VC_DRAW_PROFILE=1]");
+	dropped = 0;
 }
 
 // Stereo fade-into-slices guard. DoFade() both MUTATES fade/music state (the
@@ -328,6 +422,187 @@ static int g_fadeDrawOnly = 0;
 extern "C" void vc_fade_set_draw_only(int on) { g_fadeDrawOnly = on ? 1 : 0; }
 extern "C" int  vc_fade_draw_only(void)       { return g_fadeDrawOnly; }
 
+// --- Game-logic timing: the blind spot ------------------------------------------------
+// [vc-frame]'s "total" is mark0..mark5 and mark 0 sits INSIDE the render block
+// (main.cpp), while CGame::Process -- input, script, streaming, physics, AI, population --
+// runs BEFORE it. So "total" never was the frame: a 16 ms frame with 10 ms of render has
+// 6 ms here, invisible. These accumulators close that gap, plus the print below now
+// reports the TRUE frame period (mark0 -> mark0) next to the render total.
+// Slot ids (keep in sync with the VC_LG_* macros in main.cpp/Game.cpp):
+//   0 TOTAL  = all of CGame::Process (opening it resets the other slots)
+//   1 STREAM = CStreaming::Update      (asset I/O; the known source of long stalls)
+//   2 SCRIPT = CTheScripts::Process    (mission VM)
+//   3 WORLD  = CWorld::Process         (physics/ProcessControl + the ped anim loop)
+// TOTAL minus the three is "everything else" (population, camera, particles, ...).
+// --- Draw-call counter per eye pass ---------------------------------------------------
+// `eyes` (mark1->2) is CPU WALL TIME for submitting both eye passes, and it grows from
+// ~4.6 to ~8.2 ms in the dips while the GPU time stays flat -- the signature of more DRAW
+// CALLS, not more fill. Counted in librw's drawInst_simple (the single glDrawElements
+// funnel for all atomic pipelines: default, matfx, skin), so the PS2 alpha-test doubling
+// shows up here too. Split by the eye tag: [0] outside the eye loop (HUD/2D/RTT cameras),
+// [1] eye 0, [2] eye 1. Reported in [vc-frame] as draws=/tris=; also the input for two
+// open questions: what our widened cull (VC_CULL_HEADPOSE, ~108 deg vs the game's ~70)
+// costs on this axis, and what view amplification could save (it halves submission, not
+// fill). One add per draw -- no measurable cost, so no env gate.
+extern "C" {
+unsigned g_vcDraws[3] = {0, 0, 0};
+unsigned g_vcTris[3]  = {0, 0, 0};
+
+// --- Per-draw overhead split (VC_DRAW_PROFILE=1) ------------------------------------
+// The measured cost is ~2.2 us per draw for ~160 triangles. To find out WHERE that goes,
+// drawInst_simple brackets its two halves separately: flushCache() (GL state diffing +
+// uniform uploads -- librw re-walks its whole uniform registry per draw, see
+// gl3shader.cpp flushUniforms) against the bare glDrawElements. Plus counters for the GL
+// entry points that actually fire (each one is a validated call through ANGLE).
+// Timing costs ~2 mach_absolute_time reads per draw (~0.2 ms/frame at 2200 draws), hence
+// the env gate; the three counters are single increments and always on.
+uint64_t g_vcFlushTicks = 0, g_vcDrawTicks = 0;
+unsigned g_vcUniCalls = 0, g_vcTexBinds = 0, g_vcShaderSwitch = 0;
+unsigned g_vcParticles = 0;   // active particles walked in CParticle::Render
+// --- Particle sprite AREA ------------------------------------------------------------
+// MEASURED: parts (the list walk) sits at 682-750 in every fx spike while the cost varies
+// from 4.1 to 20.7 ms, and [vc-eyegpu] max jumps from ~7 to 20-27 ms. So the cost is per
+// PIXEL, not per particle -- but "pixels" was still a deduction, not a measurement. These
+// close that: every buffered-sprite call issued from INSIDE CParticle::Render, with w/h as
+// HALF extents (the quad spans x+-w, y+-h -- checked in all four CSprite entry points), so
+// one sprite covers 4*w*h. Gated to the particle loop so HUD, coronas and 2D do not mix in.
+// g_vcSprDrawn is the count that actually REACHED a draw -- unlike g_vcParticles, which is
+// incremented before the culling and alpha checks.
+// The MAX single sprite is tracked separately: a handful of huge quads and a swarm of
+// medium ones give the same sum but need completely different fixes.
+unsigned long long g_vcSprArea = 0;    // summed sprite pixels
+unsigned g_vcSprDrawn = 0;             // sprites that reached a draw call
+float g_vcSprMaxW = 0.0f, g_vcSprMaxH = 0.0f;   // largest single sprite, half extents
+int g_vcSprGate = 0;                   // 1 = inside CParticle::Render
+// Finer split after VAOs were measured and did NOT help (us/draw stayed at ~2.9): the cost
+// is neither the attribute setup nor the GL calls inside drawInst_simple. These three cover
+// the rest of librw's default render callback, per atomic / per mesh:
+//   pre = setWorldMatrix + lightingCB (light enumeration + light uniforms)
+//   vtx = setupVertexInput + teardownVertexInput
+//   mat = setMaterial + setTexture + VERTEXALPHA + shader selection, per mesh
+// What eyes has beyond pre+vtx+mat+flush+gldraw is reVC's own renderer above librw.
+uint64_t g_vcVtxTicks = 0, g_vcPreTicks = 0, g_vcMatTicks = 0;
+}
+
+// Called from CParticle::Render so the sprite probe only sees particle sprites.
+extern "C" void vc_sprite_gate(int on) { g_vcSprGate = on ? 1 : 0; }
+
+// VC_WEATHER: pin the weather for A/B runs (rain vs sun on the same route).
+// -1 / unset = normal cycle. 0 SUNNY, 1 CLOUDY, 2 RAINY, 3 FOGGY, 4 EXTRA_SUNNY,
+// 5 HURRICANE. Read once; re-applied every frame in CWeather::Update.
+extern "C" int vc_forced_weather(void)
+{
+	static int w = -2;
+	if (w == -2) {
+		const char *e = getenv("VC_WEATHER");
+		w = e ? atoi(e) : -1;
+		if (w < 0 || w > 5) w = -1;
+		static const char *kNames[6] = { "SUNNY", "CLOUDY", "RAINY", "FOGGY", "EXTRA_SUNNY", "HURRICANE" };
+		printf("[vc-weather] VC_WEATHER = %d (%s)\n", w, w < 0 ? "off -- normal weather cycle" : kNames[w]);
+	}
+	return w;
+}
+// Called from the four CSprite::RenderBuffered* entry points the particle code uses.
+// One multiply and an add per sprite at ~700 sprites/pass -- below the noise, no env gate.
+extern "C" void vc_sprite_area(float w, float h)
+{
+	if (!g_vcSprGate) return;
+	float aw = w < 0.0f ? -w : w;
+	float ah = h < 0.0f ? -h : h;
+	g_vcSprArea += (unsigned long long)(4.0 * (double)aw * (double)ah);
+	g_vcSprDrawn++;
+	if (aw * ah > g_vcSprMaxW * g_vcSprMaxH) { g_vcSprMaxW = aw; g_vcSprMaxH = ah; }
+}
+
+extern "C" int vc_draw_profile(void)
+{
+	static int e = -1;
+	if (e < 0) {
+		const char *s = getenv("VC_DRAW_PROFILE");
+		e = (s && s[0] && s[0] != '0') ? 1 : 0;
+		if (e) printf("[vc-drawprof] per-draw timing ON (adds ~0.2 ms/frame of probe cost)\n");
+	}
+	return e;
+}
+
+// RenderScene stage timing (VC_DRAW_PROFILE). Motivation from the device: of `eyes`,
+// librw's default render callback plus ALL GL calls account for only ~20 % -- the other
+// 73-79 % ("rest") sits ABOVE librw: reVC's renderer loops, the CVisibilityPlugins
+// callbacks, and the skin/matfx pipelines (not instrumented). Instead of bracketing those
+// one by one, measure the CONTAINING stages first. Slot ids must match the VC_SC_* macros
+// in main.cpp; accumulates over both eye passes, reset with the other counters at mark 0.
+enum { VC_SC_SKY = 0, VC_SC_ROADS, VC_SC_EBR, VC_SC_WATER, VC_SC_FADE, VC_SC_MISC,
+       VC_SC_EYESET, VC_SC_EYEEND, VC_SC_FXPART, VC_SC_FXSHAD, VC_SC_FXGLAS,
+       VC_SC_FXCORO, VC_SC_FXREST, VC_SC_EYBIND, VC_SC_EYCLR, VC_SC_EYMTX, VC_SC_EYPRE, VC_SC_N };
+static const char *kScNames[VC_SC_N] = { "sky", "roads", "ebr", "water", "fade", "misc",
+                                         "eyeset", "eyeend", "fxPart", "fxShad",
+                                         "fxGlas", "fxCoro", "fxRest",
+                                         "eyBind", "eyClr", "eyMtx", "eyPre" };
+// Accumulated PER EYE PASS ([slot][0|1]). The eye split is what decides whether the
+// pass-boundary wait is a BETWEEN-EYES dependency (eye 1 waiting for eye 0, which the
+// shared MSAA target would explain and per-eye targets would fix) or a FRAME-TO-FRAME
+// one (eye 0 waiting for the previous frame, which per-eye targets cannot touch).
+// Without the split both land in one number and the two cases are indistinguishable.
+// vcEyeTag in main.cpp is only set AFTER vc_stereo_eye_pass returns, so the boundary
+// code would all be attributed to "eye 0" -- hence this separate tag, set at the top of
+// vc_stereo_eye_pass. It stays at the last eye's value afterwards, so `eyeend` is always
+// booked under eye 1.
+static uint64_t g_scStart[VC_SC_N] = {0}, g_scAccum[VC_SC_N][2] = {{0}};
+static int g_scEye = 0;
+extern "C" void vc_scene_set_eye(int eye) { g_scEye = (eye == 1) ? 1 : 0; }
+extern "C" void vc_scene_begin(int id)
+{
+	if (id < 0 || id >= VC_SC_N || !vc_draw_profile()) return;
+	g_scStart[id] = mach_absolute_time();
+}
+extern "C" void vc_scene_end(int id)
+{
+	if (id < 0 || id >= VC_SC_N || g_scStart[id] == 0) return;
+	g_scAccum[id][g_scEye] += mach_absolute_time() - g_scStart[id];
+	g_scStart[id] = 0;
+}
+static double vcScMs(int id) { return vcTicksMs(g_scAccum[id][0] + g_scAccum[id][1]); }
+
+// fx spike support (declared up with the probe): snapshot the RenderEffects sub-stages so
+// a spike can report ITS OWN call's split rather than the two-eye frame accumulator.
+static void vc_fx_snapshot(void)
+{
+	static const int slots[5] = { VC_SC_FXPART, VC_SC_FXSHAD, VC_SC_FXGLAS, VC_SC_FXCORO, VC_SC_FXREST };
+	for (int i = 0; i < 5; i++) g_fxSnap[i] = g_scAccum[slots[i]][0] + g_scAccum[slots[i]][1];
+	g_fxSnapParts = g_vcParticles;
+	g_fxSnapArea  = g_vcSprArea;
+	g_fxSnapDrawn = g_vcSprDrawn;
+	// The max is a per-call figure, so it is RESET here rather than differenced.
+	g_vcSprMaxW = g_vcSprMaxH = 0.0f;
+}
+static void vc_fx_delta(double *part, double *shad, double *glas, double *coro, double *rest, unsigned *parts)
+{
+	static const int slots[5] = { VC_SC_FXPART, VC_SC_FXSHAD, VC_SC_FXGLAS, VC_SC_FXCORO, VC_SC_FXREST };
+	double *out[5] = { part, shad, glas, coro, rest };
+	for (int i = 0; i < 5; i++) {
+		uint64_t now = g_scAccum[slots[i]][0] + g_scAccum[slots[i]][1];
+		*out[i] = vcTicksMs(now >= g_fxSnap[i] ? now - g_fxSnap[i] : 0);
+	}
+	*parts = (g_vcParticles >= g_fxSnapParts) ? (g_vcParticles - g_fxSnapParts) : g_vcParticles;
+}
+
+enum { VC_LG_TOTAL = 0, VC_LG_STREAM, VC_LG_SCRIPT, VC_LG_WORLD, VC_LG_N };
+static uint64_t g_lgStart[VC_LG_N] = {0};
+static uint64_t g_lgAccum[VC_LG_N] = {0};
+extern "C" void vc_logic_begin(int id)
+{
+	if (id < 0 || id >= VC_LG_N) return;
+	if (id == VC_LG_TOTAL)
+		for (int i = 0; i < VC_LG_N; i++) g_lgAccum[i] = 0;   // new frame's logic phase
+	g_lgStart[id] = mach_absolute_time();
+}
+extern "C" void vc_logic_end(int id)
+{
+	if (id < 0 || id >= VC_LG_N || g_lgStart[id] == 0) return;
+	g_lgAccum[id] += mach_absolute_time() - g_lgStart[id];
+	g_lgStart[id] = 0;
+}
+
 extern "C" void vc_frame_mark(int id)
 {
 	if (id < 0 || id >= 10) return;
@@ -338,10 +613,23 @@ extern "C" void vc_frame_mark(int id)
 	// SUSPENDED (OS paused the app -- e.g. a system dialog / head-anchored-content
 	// throttle), not doing work. cpuWall gap = external stall, not a reVC/render bug.
 	static uint64_t cpu0 = 0;
+	// TRUE frame period: mark0 -> mark0, i.e. render AND the logic phase before it, plus any
+	// wait. This is the number to compare against the display period (11.1 ms at 90 Hz) --
+	// "total" below is only the render part.
+	static uint64_t prevT0 = 0, framePeriod = 0;
 	if (id == 0) {
+		if (prevT0) framePeriod = t[0] - prevT0;
+		prevT0 = t[0];
 		struct timespec cts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cts);
 		cpu0 = (uint64_t)cts.tv_sec * 1000000000ull + (uint64_t)cts.tv_nsec;
 		g_fxAccum = 0;                       // reset per frame; fx accrues across the two eye passes
+		for (int i = 0; i < 3; i++) { g_vcDraws[i] = 0; g_vcTris[i] = 0; }   // draw counters
+		g_vcFlushTicks = g_vcDrawTicks = 0;
+		g_vcUniCalls = g_vcTexBinds = g_vcShaderSwitch = 0;
+		g_vcParticles = 0;
+		g_vcSprArea = 0; g_vcSprDrawn = 0; g_vcSprMaxW = g_vcSprMaxH = 0.0f;
+		g_vcVtxTicks = g_vcPreTicks = g_vcMatTicks = 0;
+		for (int i = 0; i < VC_SC_N; i++) g_scAccum[i][0] = g_scAccum[i][1] = 0;
 		for (int i = 1; i < 10; i++) t[i] = 0;  // marks 2/3/4 are set ONLY in the in-game block; zero
 		                                        // every frame so menu/splash/fade/loading frames (which
 		                                        // skip that block) are detected as INCOMPLETE below and
@@ -379,9 +667,70 @@ extern "C" void vc_frame_mark(int id)
 	if (nowS - lastLog < 10.0) { (void)total; return; }
 	lastLog = nowS;
 	double fxMs = (double)g_fxAccum * (double)sNum / (double)sDen / 1.0e6;   // 2x RenderEffects
-	printf("[vc-frame] last: cnstrList=%.1f prerender=%.1f startframe=%.1f eyes=%.1f (fx=%.1f) post-3d=%.1f menus=%.1f afterfade=%.1f present=%.1f total=%.1f | PEAK total=%.1f ms (%s=%.1f) cpu=%.1f ms [cpu<<total => OS suspended, not work]\n",
-	       VC_SEG_MS(0,6), VC_SEG_MS(6,7), VC_SEG_MS(7,1), VC_SEG_MS(1,2), fxMs, VC_SEG_MS(3,4), VC_SEG_MS(4,8), VC_SEG_MS(8,9), VC_SEG_MS(9,5), total, maxTotal, maxPhase, maxSeg, maxCpu);
+	#define VC_ACC_MS(i) ((double)g_lgAccum[i] * (double)sNum / (double)sDen / 1.0e6)
+	double lgTotal = VC_ACC_MS(VC_LG_TOTAL), lgStream = VC_ACC_MS(VC_LG_STREAM);
+	double lgScript = VC_ACC_MS(VC_LG_SCRIPT), lgWorld = VC_ACC_MS(VC_LG_WORLD);
+	double lgRest = lgTotal - lgStream - lgScript - lgWorld;
+	double frameMs = (double)framePeriod * (double)sNum / (double)sDen / 1.0e6;
+	// frame = the real budget (mark0->mark0); total = render only; logic = CGame::Process.
+	// frame - total - logic = wait (frame cap / buffer) outside both.
+	double eyesMs = VC_SEG_MS(1,2);
+	unsigned drawsEye = g_vcDraws[1] + g_vcDraws[2];
+	// us per draw: eyes is wall time for the submission of BOTH passes. ~1-3 us/draw = the
+	// submission itself dominates (then halving the passes helps); much more = something in
+	// the pass BLOCKS (driver/GPU backpressure) and fewer calls would not help.
+	double usPerDraw = drawsEye ? (eyesMs * 1000.0 / (double)drawsEye) : 0.0;
+	// Per-draw overhead split (VC_DRAW_PROFILE): where the us/draw actually go.
+	char profBuf[1024]; profBuf[0] = '\0';
+	unsigned drawsAll = g_vcDraws[0] + g_vcDraws[1] + g_vcDraws[2];
+	if (drawsAll && (g_vcFlushTicks || g_vcUniCalls)) {
+		#define VC_TICK_MS(t) ((double)(t) * (double)sNum / (double)sDen / 1.0e6)
+		double flushMs = VC_TICK_MS(g_vcFlushTicks), drawMs = VC_TICK_MS(g_vcDrawTicks);
+		double preMs = VC_TICK_MS(g_vcPreTicks), vtxMs = VC_TICK_MS(g_vcVtxTicks);
+		double matMs = VC_TICK_MS(g_vcMatTicks);
+		// rest = eyes minus everything librw's default callback accounts for -> reVC's own
+		// renderer (visibility plugins, per-atomic setup) plus the skin/matfx callbacks,
+		// which are NOT instrumented.
+		double restMs = eyesMs - (preMs + vtxMs + matMs + flushMs + drawMs);
+		int n = snprintf(profBuf, sizeof(profBuf),
+		         " | pre=%.1f vtx=%.1f mat=%.1f flush=%.1f gldraw=%.1f rest=%.1f ms | per draw: uni=%.1f tex=%.2f shd=%.3f",
+		         preMs, vtxMs, matMs, flushMs, drawMs, restMs,
+		         (double)g_vcUniCalls / drawsAll, (double)g_vcTexBinds / drawsAll,
+		         (double)g_vcShaderSwitch / drawsAll);
+		// RenderScene stages (both eye passes). scene-sum vs eyes shows how much of the eye
+		// pass is NOT RenderScene at all (eye-pass setup, RenderEffects, DoFade).
+		double scSum = 0.0;
+		if (n > 0 && n < (int)sizeof(profBuf)) {
+			n += snprintf(profBuf + n, sizeof(profBuf) - n, " | scene:");
+			for (int i = 0; i < VC_SC_N && n > 0 && n < (int)sizeof(profBuf); i++) {
+				double ms = vcScMs(i);
+				scSum += ms;
+				n += snprintf(profBuf + n, sizeof(profBuf) - n, " %s=%.1f", kScNames[i], ms);
+			}
+			if (n > 0 && n < (int)sizeof(profBuf))
+				n += snprintf(profBuf + n, sizeof(profBuf) - n, " sum=%.1f parts=%u spr=%u/%.2fMP(%.2fx)",
+				              scSum, g_vcParticles, g_vcSprDrawn, (double)g_vcSprArea / 1.0e6,
+				              (double)g_vcSprArea / ((double)vcScreenW() * (double)vcScreenH() * 2.0));
+			// Eye split of the pass-boundary stages only (the rest is uninteresting per eye).
+			// eye0 >> eye1 => the wait is frame-to-frame; eye1 >> eye0 => between the eyes.
+			#define VC_SC_E(i,e) vcTicksMs(g_scAccum[i][e])
+			if (n > 0 && n < (int)sizeof(profBuf))
+				snprintf(profBuf + n, sizeof(profBuf) - n,
+				         " | e0/e1: eyeset=%.1f/%.1f eyPre=%.1f/%.1f eyClr=%.1f/%.1f",
+				         VC_SC_E(VC_SC_EYESET,0), VC_SC_E(VC_SC_EYESET,1),
+				         VC_SC_E(VC_SC_EYPRE,0),  VC_SC_E(VC_SC_EYPRE,1),
+				         VC_SC_E(VC_SC_EYCLR,0),  VC_SC_E(VC_SC_EYCLR,1));
+			#undef VC_SC_E
+		}
+		#undef VC_TICK_MS
+	}
+	printf("[vc-frame] last: FRAME=%.1f | logic=%.1f (stream=%.1f script=%.1f world=%.1f rest=%.1f) | render: cnstrList=%.1f prerender=%.1f startframe=%.1f eyes=%.1f (fx=%.1f) readback=%.1f post-3d=%.1f menus=%.1f afterfade=%.1f present=%.1f total=%.1f | draws=%u/%u+%u tris=%uk %.2f us/draw | PEAK total=%.1f ms (%s=%.1f) cpu=%.1f ms [cpu<<total => waiting (GPU/OS), not work]%s\n",
+	       frameMs, lgTotal, lgStream, lgScript, lgWorld, lgRest,
+	       VC_SEG_MS(0,6), VC_SEG_MS(6,7), VC_SEG_MS(7,1), eyesMs, fxMs, VC_SEG_MS(2,3), VC_SEG_MS(3,4), VC_SEG_MS(4,8), VC_SEG_MS(8,9), VC_SEG_MS(9,5), total,
+	       g_vcDraws[1], g_vcDraws[2], g_vcDraws[0], (g_vcTris[0] + g_vcTris[1] + g_vcTris[2]) / 1000u, usPerDraw,
+	       maxTotal, maxPhase, maxSeg, maxCpu, profBuf);
 	maxTotal = 0.0; maxSeg = 0.0; maxPhase = "-"; maxCpu = 0.0;
+	#undef VC_ACC_MS
 	#undef VC_SEG_MS
 }
 
@@ -567,6 +916,32 @@ psTimer(void)
 }
 
 // ===========================================================================
+// Pinned settings
+// ===========================================================================
+// A few reVC preferences must not be user-settable on this target: their menu entries were
+// removed because they are dead or actively harmful here, but the VALUES still live in
+// gta_vc.set and reVC.ini -- and an installation that ran an older build already has the old
+// values written there. So they are forced once, right after the settings are loaded, which
+// beats both sources. Everything else stays a normal preference.
+static void
+vcPinSettings(void)
+{
+	// reVC's own frame limiter OFF. We pace the frame START ourselves to the measured
+	// display rate (vcrt_begin_frame / VC_FRAME_CAP_HZ). reVC's limiter is a SECOND brake
+	// driven by m_PrefsFPSLimit (30/60/120): at 60 it would throttle to a rate the display
+	// cannot present, and the two brakes would fight. Verify on device: [vc-pub] instRate
+	// must read ~display rate (90), not 60 (both limiting) and not 130+ (neither).
+	FrontEndMenuManager.m_PrefsFrameLimiter = false;
+	FrontEndMenuManager.m_PrefsFPSLimit = 2;      // 120 -- only reached if the limiter is ever
+	RsGlobal.maxFPS = 120;                        // re-enabled; keeps it above the display rate
+	// 2D layout aspect: AR_AUTO. In stereo SCREEN_SCALE_AR goes through VC_HUD_ASPECT (the
+	// design aspect), so the only thing this value still touches is the game camera FOV used
+	// for culling -- which we widen separately. Any other setting would only skew that.
+	FrontEndMenuManager.m_PrefsUseWideScreen = AR_AUTO;
+	printf("[vc-pins] frameLimiter=off fpsLimit=120 aspect=AR_AUTO\n");
+}
+
+// ===========================================================================
 // Lifecycle
 // ===========================================================================
 RwBool
@@ -609,6 +984,7 @@ psInitialize(void)
 	C_PcSave::SetSaveDirectory(_psGetUserFilesFolder());
 	InitialiseLanguage();                              // sets language + loads TEXT
 	FrontEndMenuManager.LoadSettings();                // defaults on first run
+	vcPinSettings();                                   // force the settings VR can't tolerate
 	TheText.Unload();
 
 	// --- ANGLE bring-up (context only; NOT made current here) ------------

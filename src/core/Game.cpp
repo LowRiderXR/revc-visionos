@@ -109,6 +109,17 @@ char CGame::aDatFile[32];
 bool CGame::russianGame = false;
 bool CGame::japaneseGame = false;
 #endif
+
+#ifdef LIBRW_VISIONOS
+// Sub-buckets of the logic phase for [vc-frame] (see the VC_LG_* enum in visionos.cpp --
+// ids must match). The whole of CGame::Process is bracketed in main.cpp; these split the
+// three candidates with very different levers: asset I/O, mission VM, physics+anim.
+extern "C" void vc_logic_begin(int id);
+extern "C" void vc_logic_end(int id);
+#define VC_LG_STREAM 1
+#define VC_LG_SCRIPT 2
+#define VC_LG_WORLD  3
+#endif
 #ifndef MASTER
 CVector CGame::PlayerCoords;
 bool8 CGame::VarUpdatePlayerCoords;
@@ -865,7 +876,13 @@ void CGame::Process(void)
 	}
 #endif
 	uint32 startTime = CTimer::GetCurrentTimeInCycles() / CTimer::GetCyclesPerMillisecond();
+#ifdef LIBRW_VISIONOS
+	vc_logic_begin(VC_LG_STREAM);
+#endif
 	CStreaming::Update();
+#ifdef LIBRW_VISIONOS
+	vc_logic_end(VC_LG_STREAM);
+#endif
 	uint32 processTime = CTimer::GetCurrentTimeInCycles() / CTimer::GetCyclesPerMillisecond() - startTime;
 	CWindModifiers::Number = 0;
 	if (!CTimer::GetIsPaused())
@@ -886,7 +903,13 @@ void CGame::Process(void)
 		CWeather::Update();
 
 		PUSH_MEMID(MEMID_SCRIPT);
+#ifdef LIBRW_VISIONOS
+		vc_logic_begin(VC_LG_SCRIPT);
+#endif
 		CTheScripts::Process();
+#ifdef LIBRW_VISIONOS
+		vc_logic_end(VC_LG_SCRIPT);
+#endif
 		POP_MEMID();
 
 		CCollision::Update();
@@ -930,7 +953,13 @@ void CGame::Process(void)
 		CReplay::Update();
 
 		PUSH_MEMID(MEMID_WORLD);
+#ifdef LIBRW_VISIONOS
+		vc_logic_begin(VC_LG_WORLD);
+#endif
 		CWorld::Process();
+#ifdef LIBRW_VISIONOS
+		vc_logic_end(VC_LG_WORLD);
+#endif
 		POP_MEMID();
 
 		gAccidentManager.Update();
