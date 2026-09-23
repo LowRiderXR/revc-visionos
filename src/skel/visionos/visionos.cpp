@@ -446,6 +446,10 @@ extern "C" int  vc_fade_draw_only(void)       { return g_fadeDrawOnly; }
 // fill). One add per draw -- no measurable cost, so no env gate.
 extern "C" {
 unsigned g_vcDraws[3] = {0, 0, 0};
+// Immediate-mode (im2d/im3d) draws, counted in gl3immed.cpp -- the share g_vcDraws
+// never saw. Same eye split. Decides how much of the frame multiview can touch:
+// im2d vertices are CPU-projected PER EYE, an amplified pass cannot reuse them.
+unsigned g_vcImmDraws[3] = {0, 0, 0};
 unsigned g_vcTris[3]  = {0, 0, 0};
 
 // --- Per-draw overhead split (VC_DRAW_PROFILE=1) ------------------------------------
@@ -623,7 +627,7 @@ extern "C" void vc_frame_mark(int id)
 		struct timespec cts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cts);
 		cpu0 = (uint64_t)cts.tv_sec * 1000000000ull + (uint64_t)cts.tv_nsec;
 		g_fxAccum = 0;                       // reset per frame; fx accrues across the two eye passes
-		for (int i = 0; i < 3; i++) { g_vcDraws[i] = 0; g_vcTris[i] = 0; }   // draw counters
+		for (int i = 0; i < 3; i++) { g_vcDraws[i] = 0; g_vcTris[i] = 0; g_vcImmDraws[i] = 0; }   // draw counters
 		g_vcFlushTicks = g_vcDrawTicks = 0;
 		g_vcUniCalls = g_vcTexBinds = g_vcShaderSwitch = 0;
 		g_vcParticles = 0;
@@ -724,10 +728,10 @@ extern "C" void vc_frame_mark(int id)
 		}
 		#undef VC_TICK_MS
 	}
-	printf("[vc-frame] last: FRAME=%.1f | logic=%.1f (stream=%.1f script=%.1f world=%.1f rest=%.1f) | render: cnstrList=%.1f prerender=%.1f startframe=%.1f eyes=%.1f (fx=%.1f) readback=%.1f post-3d=%.1f menus=%.1f afterfade=%.1f present=%.1f total=%.1f | draws=%u/%u+%u tris=%uk %.2f us/draw | PEAK total=%.1f ms (%s=%.1f) cpu=%.1f ms [cpu<<total => waiting (GPU/OS), not work]%s\n",
+	printf("[vc-frame] last: FRAME=%.1f | logic=%.1f (stream=%.1f script=%.1f world=%.1f rest=%.1f) | render: cnstrList=%.1f prerender=%.1f startframe=%.1f eyes=%.1f (fx=%.1f) readback=%.1f post-3d=%.1f menus=%.1f afterfade=%.1f present=%.1f total=%.1f | draws=%u/%u+%u imm=%u/%u+%u tris=%uk %.2f us/draw | PEAK total=%.1f ms (%s=%.1f) cpu=%.1f ms [cpu<<total => waiting (GPU/OS), not work]%s\n",
 	       frameMs, lgTotal, lgStream, lgScript, lgWorld, lgRest,
 	       VC_SEG_MS(0,6), VC_SEG_MS(6,7), VC_SEG_MS(7,1), eyesMs, fxMs, VC_SEG_MS(2,3), VC_SEG_MS(3,4), VC_SEG_MS(4,8), VC_SEG_MS(8,9), VC_SEG_MS(9,5), total,
-	       g_vcDraws[1], g_vcDraws[2], g_vcDraws[0], (g_vcTris[0] + g_vcTris[1] + g_vcTris[2]) / 1000u, usPerDraw,
+	       g_vcDraws[1], g_vcDraws[2], g_vcDraws[0], g_vcImmDraws[1], g_vcImmDraws[2], g_vcImmDraws[0], (g_vcTris[0] + g_vcTris[1] + g_vcTris[2]) / 1000u, usPerDraw,
 	       maxTotal, maxPhase, maxSeg, maxCpu, profBuf);
 	maxTotal = 0.0; maxSeg = 0.0; maxPhase = "-"; maxCpu = 0.0;
 	#undef VC_ACC_MS
