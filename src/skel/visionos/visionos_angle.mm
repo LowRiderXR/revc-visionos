@@ -1492,6 +1492,54 @@ vcrt_log_gl_extensions(void)
 	      : (reqMV2 ? "AVAILABLE VIA glRequestExtensionANGLE -- implemented but off by default"
 	                : "NOT IN THIS BUILD -- neither active nor requestable; the ANGLE Metal backend would have to implement it"));
 
+	// Stufe 2 Teil 2 (multiview-plan.md): does the backend ACCEPT a multiview
+	// attachment? One self-test FBO -- 64x64x2 array texture, two views --
+	// checked for completeness and error-free acceptance, then torn down and
+	// all bindings restored. Success criteria were fixed in the plan BEFORE
+	// this code existed: COMPLETE (0x8CD5) + all glGetError sweeps 0 + the
+	// game running on unchanged. Runs only when the extension is active,
+	// i.e. behind KL_GL_MULTIVIEW=1.
+	if (haveMV2) {
+		typedef void (*PFN_glTexStorage3DVC)(GLenumVC, GLsizeiVC, GLenumVC, GLsizeiVC, GLsizeiVC, GLsizeiVC);
+		typedef void (*PFN_glDeleteTexturesVC)(GLsizeiVC, const GLuintVC *);
+		typedef void (*PFN_glDeleteFramebuffersVC)(GLsizeiVC, const GLuintVC *);
+		typedef void (*PFN_glFBTexMultiviewOVR)(GLenumVC, GLenumVC, GLuintVC, GLintVC, GLintVC, GLsizeiVC);
+		PFN_glTexStorage3DVC       texStorage3D = (PFN_glTexStorage3DVC)g_eglGetProcAddress("glTexStorage3D");
+		PFN_glDeleteTexturesVC     deleteTex    = (PFN_glDeleteTexturesVC)g_eglGetProcAddress("glDeleteTextures");
+		PFN_glDeleteFramebuffersVC deleteFbo    = (PFN_glDeleteFramebuffersVC)g_eglGetProcAddress("glDeleteFramebuffers");
+		PFN_glFBTexMultiviewOVR    fbTexMV      = (PFN_glFBTexMultiviewOVR)g_eglGetProcAddress("glFramebufferTextureMultiviewOVR");
+		if (!texStorage3D || !deleteTex || !deleteFbo || !fbTexMV || !p_glGenTextures ||
+		    !p_glBindTexture || !p_glGenFramebuffers || !p_glBindFramebuffer ||
+		    !p_glCheckFramebufferStatus || !p_glGetError || !getIntegerv) {
+			VCLOG(@"[vc-caps] multiview FBO self-test: SKIPPED (entry point unresolved; glFramebufferTextureMultiviewOVR=%p)",
+			      (void *)fbTexMV);
+		} else {
+			GLintVC prevDrawFbo = 0, prevTex2DArray = 0;
+			getIntegerv(0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING */, &prevDrawFbo);
+			getIntegerv(0x8C1D /* GL_TEXTURE_BINDING_2D_ARRAY */, &prevTex2DArray);
+			(void)p_glGetError();   // clear any stale error so the sweeps below are ours
+			GLuintVC tex = 0, fbo = 0;
+			p_glGenTextures(1, &tex);
+			p_glBindTexture(0x8C1A /* GL_TEXTURE_2D_ARRAY */, tex);
+			texStorage3D(0x8C1A, 1, 0x8058 /* GL_RGBA8 */, 64, 64, 2);
+			p_glGenFramebuffers(1, &fbo);
+			p_glBindFramebuffer(0x8CA9 /* GL_DRAW_FRAMEBUFFER */, fbo);
+			GLenumVC errSetup = p_glGetError();
+			fbTexMV(0x8CA9, 0x8CE0 /* GL_COLOR_ATTACHMENT0 */, tex, 0, /*baseViewIndex*/ 0, /*numViews*/ 2);
+			GLenumVC errAttach = p_glGetError();
+			GLenumVC status    = p_glCheckFramebufferStatus(0x8CA9);
+			GLenumVC errAfter  = p_glGetError();
+			bool pass = (status == 0x8CD5 /* GL_FRAMEBUFFER_COMPLETE */) &&
+			            errSetup == 0 && errAttach == 0 && errAfter == 0;
+			VCLOG(@"[vc-caps] multiview FBO self-test (2 views on 64x64x2 array): status=0x%X err setup/attach/check=0x%X/0x%X/0x%X -> %s",
+			      status, errSetup, errAttach, errAfter, pass ? "PASS" : "FAIL");
+			p_glBindFramebuffer(0x8CA9, (GLuintVC)prevDrawFbo);
+			p_glBindTexture(0x8C1A, (GLuintVC)prevTex2DArray);
+			deleteFbo(1, &fbo);
+			deleteTex(1, &tex);
+		}
+	}
+
 	// Independent of multiview: EXT_multisampled_render_to_texture would let the eye FBO
 	// carry MSAA in tile memory and resolve on store, instead of our separate 228 MB
 	// multisample FBO plus a full-screen blit per eye. Different question, same log.
