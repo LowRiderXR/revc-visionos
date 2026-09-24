@@ -17,6 +17,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <dlfcn.h>
+#include <math.h>   // fabsf/lroundf (mv4 self-test)
 #include <stdint.h>
 #include <stdlib.h>   // getenv
 #include <pthread.h>  // throttle mutex/cond
@@ -1382,6 +1383,350 @@ typedef const unsigned char *(*PFN_glGetStringVC)(GLenumVC);
 typedef const unsigned char *(*PFN_glGetStringiVC)(GLenumVC, GLuintVC);
 typedef void (*PFN_glGetIntegervVC)(GLenumVC, GLintVC *);
 
+// ===========================================================================
+// Stufe 4a (multiview-plan.md): draw-and-read-back self-test THROUGH ANGLE.
+// Draws colored bars into a 512x512x2 multiview FBO with a real
+// GL_OVR_multiview2 program (one draw call, ANGLE doubles the instances and
+// routes layers), reads both layers back, and verifies every bar center
+// against its expected position -- the spike's method, but through the whole
+// GL stack. Runs twice: without foveation, then with a self-built two-layer
+// rate map (shared V falloff per the measured rule; H uniform on layer 0,
+// falloff on layer 1) registered BY SIZE for the test resolution, where the
+// expected positions come from the map itself. Named failure modes as in the
+// spike: DOUBLE-WARP and UNSHIFTED. Log filter: vc-mv4.
+static const int   kMv4Size  = 512;
+static const float kMv4Shift = 24.0f;   // logical px added per view
+static const float kMv4Half  = 12.0f;
+static const float kMv4Centers[4] = {96.0f, 192.0f, 288.0f, 384.0f};
+
+static id<MTLRasterizationRateMap>
+vcrt_mv4_build_map(void)
+{
+	// Gate-test shape: shared vertical falloff (the rule), horizontal uniform
+	// on layer 0 and falloff on layer 1 so the layers are distinguishable.
+	const int zones = 8;
+	float uni[8], fall[8];
+	for (int i = 0; i < zones; i++) {
+		float d = fabsf((float)i - (zones - 1) / 2.0f) / ((zones - 1) / 2.0f);
+		uni[i]  = 1.0f;
+		fall[i] = 1.0f - 0.75f * d;
+	}
+	MTLRasterizationRateLayerDescriptor *l0 =
+		[[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(zones, zones, 1)
+		                                                      horizontal:uni
+		                                                        vertical:fall];
+	MTLRasterizationRateLayerDescriptor *l1 =
+		[[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(zones, zones, 1)
+		                                                      horizontal:fall
+		                                                        vertical:fall];
+	MTLRasterizationRateMapDescriptor *desc = [[MTLRasterizationRateMapDescriptor alloc] init];
+	desc.screenSize = MTLSizeMake(kMv4Size, kMv4Size, 0);
+	[desc setLayer:l0 atIndex:0];
+	[desc setLayer:l1 atIndex:1];
+	return [g_mtlDevice newRasterizationRateMapWithDescriptor:desc];
+}
+
+// Scans one row (horizontal=true) or column of an RGBA8 readback for the given
+// color; returns the run center in scan units, or -1. Tolerance matches the
+// spike (per-channel 40/255).
+static float
+vcrt_mv4_scan(const unsigned char *px, int stride, bool horizontal, int fixed, int limit,
+              float r, float g, float b)
+{
+	int first = -1, last = -1;
+	for (int i = 0; i < limit; i++) {
+		const unsigned char *p = horizontal ? px + (fixed * stride + i) * 4
+		                                    : px + (i * stride + fixed) * 4;
+		if (abs((int)p[0] - (int)(r * 255)) < 40 && abs((int)p[1] - (int)(g * 255)) < 40 &&
+		    abs((int)p[2] - (int)(b * 255)) < 40) {
+			if (first < 0) first = i;
+			last = i;
+		}
+	}
+	return first >= 0 ? (first + last) / 2.0f : -1.0f;
+}
+
+static void
+vcrt_mv4_draw_selftest(void)
+{
+	typedef GLuintVC (*PFN_glCreateShaderVC)(GLenumVC);
+	typedef void (*PFN_glShaderSourceVC)(GLuintVC, GLsizeiVC, const char **, const GLintVC *);
+	typedef void (*PFN_glCompileShaderVC)(GLuintVC);
+	typedef void (*PFN_glGetShaderivVC)(GLuintVC, GLenumVC, GLintVC *);
+	typedef GLuintVC (*PFN_glCreateProgramVC)(void);
+	typedef void (*PFN_glAttachShaderVC)(GLuintVC, GLuintVC);
+	typedef void (*PFN_glLinkProgramVC)(GLuintVC);
+	typedef void (*PFN_glGetProgramivVC)(GLuintVC, GLenumVC, GLintVC *);
+	typedef void (*PFN_glUseProgramVC)(GLuintVC);
+	typedef GLintVC (*PFN_glGetUniformLocationVC)(GLuintVC, const char *);
+	typedef void (*PFN_glUniform2fVC)(GLintVC, float, float);
+	typedef void (*PFN_glUniform1fVC)(GLintVC, float);
+	typedef void (*PFN_glGenBuffersVC)(GLsizeiVC, GLuintVC *);
+	typedef void (*PFN_glDeleteBuffersVC)(GLsizeiVC, const GLuintVC *);
+	typedef void (*PFN_glBufferDataVC)(GLenumVC, long, const void *, GLenumVC);
+	typedef void (*PFN_glEnableVertexAttribArrayVC)(GLuintVC);
+	typedef void (*PFN_glDisableVertexAttribArrayVC)(GLuintVC);
+	typedef void (*PFN_glVertexAttribPointerVC)(GLuintVC, GLintVC, GLenumVC, unsigned char, GLsizeiVC, const void *);
+	typedef void (*PFN_glDrawArraysVC)(GLenumVC, GLintVC, GLsizeiVC);
+	typedef void (*PFN_glViewportVC)(GLintVC, GLintVC, GLsizeiVC, GLsizeiVC);
+	typedef void (*PFN_glClearColorVC2)(float, float, float, float);
+	typedef void (*PFN_glClearVC2)(GLenumVC);
+	typedef void (*PFN_glReadPixelsVC)(GLintVC, GLintVC, GLsizeiVC, GLsizeiVC, GLenumVC, GLenumVC, void *);
+	typedef void (*PFN_glFramebufferTextureLayerVC)(GLenumVC, GLenumVC, GLuintVC, GLintVC, GLintVC);
+	typedef void (*PFN_glDeleteProgramVC)(GLuintVC);
+	typedef void (*PFN_glDeleteShaderVC)(GLuintVC);
+	typedef void (*PFN_glTexStorage3DVC2)(GLenumVC, GLsizeiVC, GLenumVC, GLsizeiVC, GLsizeiVC, GLsizeiVC);
+	typedef void (*PFN_glDeleteTexturesVC2)(GLsizeiVC, const GLuintVC *);
+	typedef void (*PFN_glDeleteFramebuffersVC2)(GLsizeiVC, const GLuintVC *);
+	typedef void (*PFN_glFBTexMultiviewOVR2)(GLenumVC, GLenumVC, GLuintVC, GLintVC, GLintVC, GLsizeiVC);
+	typedef void (*PFN_glGetIntegervVC2)(GLenumVC, GLintVC *);
+	typedef void (*PFN_ANGLESetRateMapForSize2)(unsigned, unsigned, unsigned, void *);
+
+#define MV4(fn, ty) ty fn = (ty)g_eglGetProcAddress(#fn); if (!fn) { VCLOG(@"[vc-mv4] SKIPPED (%s unresolved)", #fn); return; }
+	MV4(glCreateShader, PFN_glCreateShaderVC) MV4(glShaderSource, PFN_glShaderSourceVC)
+	MV4(glCompileShader, PFN_glCompileShaderVC) MV4(glGetShaderiv, PFN_glGetShaderivVC)
+	MV4(glCreateProgram, PFN_glCreateProgramVC) MV4(glAttachShader, PFN_glAttachShaderVC)
+	MV4(glLinkProgram, PFN_glLinkProgramVC) MV4(glGetProgramiv, PFN_glGetProgramivVC)
+	MV4(glUseProgram, PFN_glUseProgramVC) MV4(glGetUniformLocation, PFN_glGetUniformLocationVC)
+	MV4(glUniform2f, PFN_glUniform2fVC) MV4(glUniform1f, PFN_glUniform1fVC)
+	MV4(glGenBuffers, PFN_glGenBuffersVC) MV4(glDeleteBuffers, PFN_glDeleteBuffersVC)
+	MV4(glBufferData, PFN_glBufferDataVC)
+	typedef void (*PFN_glBindBufferVC)(GLenumVC, GLuintVC);
+	MV4(glBindBuffer, PFN_glBindBufferVC)
+	MV4(glEnableVertexAttribArray, PFN_glEnableVertexAttribArrayVC)
+	MV4(glDisableVertexAttribArray, PFN_glDisableVertexAttribArrayVC)
+	MV4(glVertexAttribPointer, PFN_glVertexAttribPointerVC)
+	MV4(glDrawArrays, PFN_glDrawArraysVC) MV4(glViewport, PFN_glViewportVC)
+	MV4(glClearColor, PFN_glClearColorVC2) MV4(glClear, PFN_glClearVC2)
+	MV4(glReadPixels, PFN_glReadPixelsVC)
+	MV4(glFramebufferTextureLayer, PFN_glFramebufferTextureLayerVC)
+	MV4(glDeleteProgram, PFN_glDeleteProgramVC) MV4(glDeleteShader, PFN_glDeleteShaderVC)
+	MV4(glTexStorage3D, PFN_glTexStorage3DVC2) MV4(glDeleteTextures, PFN_glDeleteTexturesVC2)
+	MV4(glDeleteFramebuffers, PFN_glDeleteFramebuffersVC2)
+	MV4(glFramebufferTextureMultiviewOVR, PFN_glFBTexMultiviewOVR2)
+	MV4(glGetIntegerv, PFN_glGetIntegervVC2)
+#undef MV4
+
+	// --- Program (real OVR_multiview2 shader through ANGLE's translator).
+	const char *vsSrc =
+		"#version 300 es\n"
+		"#extension GL_OVR_multiview2 : require\n"
+		"layout(num_views = 2) in;\n"
+		"layout(location = 0) in vec2 in_pos;\n"
+		"layout(location = 1) in vec4 in_color;\n"
+		"uniform vec2 u_screen;\n"
+		"uniform float u_shift;\n"
+		"out vec4 v_color;\n"
+		"void main() {\n"
+		"  vec2 p = in_pos + float(gl_ViewID_OVR) * vec2(u_shift, u_shift);\n"
+		"  gl_Position = vec4(p.x / u_screen.x * 2.0 - 1.0, 1.0 - p.y / u_screen.y * 2.0, 0.0, 1.0);\n"
+		"  v_color = in_color;\n"
+		"}\n";
+	const char *fsSrc =
+		"#version 300 es\n"
+		"precision highp float;\n"
+		"in vec4 v_color;\n"
+		"out vec4 fragColor;\n"
+		"void main() { fragColor = v_color; }\n";
+
+	GLuintVC vs = glCreateShader(0x8B31), fs = glCreateShader(0x8B30);
+	glShaderSource(vs, 1, &vsSrc, NULL); glCompileShader(vs);
+	glShaderSource(fs, 1, &fsSrc, NULL); glCompileShader(fs);
+	GLintVC ok = 0;
+	glGetShaderiv(vs, 0x8B81 /* COMPILE_STATUS */, &ok);
+	if (!ok) { VCLOG(@"[vc-mv4] RESULT=FAIL stage=vs-compile"); return; }
+	glGetShaderiv(fs, 0x8B81, &ok);
+	if (!ok) { VCLOG(@"[vc-mv4] RESULT=FAIL stage=fs-compile"); return; }
+	GLuintVC prog = glCreateProgram();
+	glAttachShader(prog, vs); glAttachShader(prog, fs);
+	glLinkProgram(prog);
+	glGetProgramiv(prog, 0x8B82 /* LINK_STATUS */, &ok);
+	if (!ok) { VCLOG(@"[vc-mv4] RESULT=FAIL stage=link"); glDeleteProgram(prog); return; }
+
+	// --- Geometry: 4 vertical bars (full height) + 4 horizontal bars in the
+	// left strip, colors as in the spike. 6 verts/quad, [x y r g b a].
+	float verts[8 * 6 * 6];
+	int vi = 0;
+	const float xcol[4][3] = {{1,0,0},{0,1,0},{0,0,1},{1,1,0}};
+	const float ycol[4][3] = {{0,1,1},{1,0,1},{1,1,1},{1,0.5f,0}};
+	for (int b = 0; b < 4; b++) {
+		float c = kMv4Centers[b];
+		float q0x = c - kMv4Half, q1x = c + kMv4Half, q0y = 0, q1y = (float)kMv4Size;
+		float corn[6][2] = {{q0x,q0y},{q1x,q0y},{q0x,q1y},{q1x,q0y},{q1x,q1y},{q0x,q1y}};
+		for (int v = 0; v < 6; v++) {
+			verts[vi++] = corn[v][0]; verts[vi++] = corn[v][1];
+			verts[vi++] = xcol[b][0]; verts[vi++] = xcol[b][1]; verts[vi++] = xcol[b][2]; verts[vi++] = 1;
+		}
+	}
+	for (int b = 0; b < 4; b++) {
+		float c = kMv4Centers[b];
+		float q0x = 8, q1x = 72, q0y = c - kMv4Half, q1y = c + kMv4Half;
+		float corn[6][2] = {{q0x,q0y},{q1x,q0y},{q0x,q1y},{q1x,q0y},{q1x,q1y},{q0x,q1y}};
+		for (int v = 0; v < 6; v++) {
+			verts[vi++] = corn[v][0]; verts[vi++] = corn[v][1];
+			verts[vi++] = ycol[b][0]; verts[vi++] = ycol[b][1]; verts[vi++] = ycol[b][2]; verts[vi++] = 1;
+		}
+	}
+
+	// --- Saved state.
+	GLintVC prevDrawFbo = 0, prevReadFbo = 0, prevArrayBuf = 0, prevProg = 0, prevVp[4];
+	glGetIntegerv(0x8CA6, &prevDrawFbo); glGetIntegerv(0x8CAA, &prevReadFbo);
+	glGetIntegerv(0x8894, &prevArrayBuf); glGetIntegerv(0x8B8D, &prevProg);
+	glGetIntegerv(0x0BA2 /* GL_VIEWPORT */, prevVp);
+
+	GLuintVC tex = 0, fbo = 0, readFbo = 0, vbo = 0;
+	p_glGenTextures(1, &tex);
+	p_glBindTexture(0x8C1A, tex);
+	glTexStorage3D(0x8C1A, 1, 0x8058, kMv4Size, kMv4Size, 2);
+	p_glGenFramebuffers(1, &fbo);
+	p_glBindFramebuffer(0x8CA9 /* DRAW */, fbo);
+	glFramebufferTextureMultiviewOVR(0x8CA9, 0x8CE0, tex, 0, 0, 2);
+	p_glGenFramebuffers(1, &readFbo);
+	glGenBuffers(1, &vbo);
+	glBindBuffer(0x8892 /* ARRAY_BUFFER */, vbo);
+	glBufferData(0x8892, sizeof(verts), verts, 0x88E4 /* STATIC_DRAW */);
+	glUseProgram(prog);
+	glUniform2f(glGetUniformLocation(prog, "u_screen"), (float)kMv4Size, (float)kMv4Size);
+	glUniform1f(glGetUniformLocation(prog, "u_shift"), kMv4Shift);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+	glVertexAttribPointer(0, 2, 0x1406 /* FLOAT */, 0, 24, (const void *)0);
+	glVertexAttribPointer(1, 4, 0x1406, 0, 24, (const void *)8);
+	glViewport(0, 0, kMv4Size, kMv4Size);
+
+	static unsigned char *readback = (unsigned char *)malloc((size_t)kMv4Size * kMv4Size * 4);
+
+	// Two variants: unfoveated, then foveated with a registered two-layer map.
+	typedef void (*PFN_SetRateMapForSize)(unsigned, unsigned, unsigned, void *);
+	PFN_SetRateMapForSize setRateMapForSize =
+		(PFN_SetRateMapForSize)dlsym(RTLD_DEFAULT, "ANGLEMetalSetRasterizationRateMapForSize");
+	int totalFail = 0;
+	for (int variant = 0; variant < 2; variant++) {
+		id<MTLRasterizationRateMap> map = nil;
+		if (variant == 1) {
+			if (!setRateMapForSize || !g_mtlDevice) {
+				VCLOG(@"[vc-mv4] foveated variant SKIPPED (registry entry point or device missing)");
+				break;
+			}
+			map = vcrt_mv4_build_map();
+			if (!map) { VCLOG(@"[vc-mv4] foveated variant SKIPPED (map build failed)"); break; }
+			setRateMapForSize(kMv4Size, kMv4Size, 1, VC_OBJ_TO_VOID(map));
+			// The render pass desc is cached per framebuffer state; re-attach
+			// so the pass rebuilds and picks the freshly registered map up
+			// (found via the host repro: without this the map is ignored).
+			p_glBindFramebuffer(0x8CA9, fbo);
+			glFramebufferTextureMultiviewOVR(0x8CA9, 0x8CE0, tex, 0, 0, 2);
+		}
+		p_glBindFramebuffer(0x8CA9, fbo);
+		glClearColor(0, 0, 0, 1);
+		glClear(0x4000 /* COLOR_BUFFER_BIT */);
+		glDrawArrays(0x0004 /* TRIANGLES */, 0, 48);
+		GLenumVC drawErr = p_glGetError();
+
+		int fails = 0, checks = 0;
+		for (int layer = 0; layer < 2; layer++) {
+			float shift = (float)layer * kMv4Shift;
+			p_glBindFramebuffer(0x8CA8 /* READ */, readFbo);
+			glFramebufferTextureLayer(0x8CA8, 0x8CE0, tex, 0, layer);
+			glReadPixels(0, 0, kMv4Size, kMv4Size, 0x1908 /* RGBA */, 0x1401 /* UNSIGNED_BYTE */, readback);
+
+			// Expected mapping: identity when unfoveated, the map's own answer
+			// when foveated. ANGLE stores FBO content bottom-up and the rate
+			// map warps in Metal row space, so y expectations run through
+			// phys(SIZE - y); readback rows ARE metal rows (host-verified).
+			int physW = kMv4Size, physH = kMv4Size;
+			if (variant == 1) {
+				MTLSize ps = [map physicalSizeForLayer:layer];
+				physW = (int)ps.width;
+				physH = (int)ps.height;
+			}
+			for (int axis = 0; axis < 2; axis++) {
+				// Scan line position (logical), clear of the other bar set.
+				float sx = 40.0f + shift;
+				for (int b = 0; b < 4; b++) {
+					float logical = kMv4Centers[b] + shift;
+					float expected, doubleWarp, unshifted;
+					if (axis == 0) {
+						if (variant == 1) {
+							MTLCoordinate2D e = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(logical, sx) forLayer:layer];
+							MTLCoordinate2D d = [map mapScreenToPhysicalCoordinates:e forLayer:layer];
+							MTLCoordinate2D u = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(kMv4Centers[b], sx) forLayer:layer];
+							expected = e.x; doubleWarp = d.x; unshifted = u.x;
+						} else {
+							expected = logical; doubleWarp = logical; unshifted = kMv4Centers[b];
+						}
+					} else {
+						if (variant == 1) {
+							MTLCoordinate2D e = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(sx, kMv4Size - logical) forLayer:layer];
+							MTLCoordinate2D d = [map mapScreenToPhysicalCoordinates:e forLayer:layer];
+							MTLCoordinate2D u = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(sx, kMv4Size - kMv4Centers[b]) forLayer:layer];
+							expected = e.y; doubleWarp = d.y; unshifted = u.y;
+						} else {
+							expected = kMv4Size - logical; doubleWarp = expected; unshifted = kMv4Size - kMv4Centers[b];
+						}
+					}
+					// Scan row/column in readback (= Metal row) space.
+					int fixed;
+					float measured;
+					if (axis == 0) {
+						float metalRow = variant == 1
+							? [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(256, kMv4Size - sx) forLayer:layer].y
+							: (kMv4Size - sx);
+						fixed = (int)lroundf(metalRow);
+						const float *col = xcol[b];
+						measured = vcrt_mv4_scan(readback, kMv4Size, true, fixed, physW, col[0], col[1], col[2]);
+					} else {
+						float metalCol = variant == 1
+							? [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(sx, 256) forLayer:layer].x
+							: sx;
+						fixed = (int)lroundf(metalCol);
+						const float *col = ycol[b];
+						measured = vcrt_mv4_scan(readback, kMv4Size, false, fixed, physH, col[0], col[1], col[2]);
+					}
+					checks++;
+					float delta = measured - expected;
+					bool pass = measured >= 0 && fabsf(delta) <= 4.0f;
+					if (!pass) fails++;
+					const char *diag = "";
+					if (!pass && measured >= 0) {
+						if (fabsf(measured - doubleWarp) <= 4.0f) diag = " <- DOUBLE-WARP";
+						else if (fabsf(measured - unshifted) <= 4.0f) diag = " <- UNSHIFTED (layer routing broken?)";
+					}
+					VCLOG(@"[vc-mv4] %s layer=%d %c-bar[%d] expected=%.1f measured=%.1f delta=%.1f %s%s",
+					      variant ? "foveated" : "plain", layer, axis == 0 ? 'x' : 'y', b,
+					      expected, measured, measured >= 0 ? delta : -999.0f,
+					      pass ? "OK" : "FAIL", diag);
+				}
+			}
+		}
+		VCLOG(@"[vc-mv4] variant=%s drawErr=0x%X RESULT=%s checks=%d fails=%d",
+		      variant ? "foveated" : "plain", drawErr, fails == 0 && drawErr == 0 ? "PASS" : "FAIL",
+		      checks, fails);
+		totalFail += fails + (drawErr != 0 ? 1 : 0);
+		if (variant == 1) {
+			setRateMapForSize(kMv4Size, kMv4Size, 1, NULL);   // unbind BEFORE releasing (registry rule)
+			map = nil;
+		}
+	}
+	VCLOG(@"[vc-mv4] OVERALL=%s", totalFail == 0 ? "PASS" : "FAIL");
+
+	// --- Restore and tear down.
+	glDisableVertexAttribArray(0);
+	glDisableVertexAttribArray(1);
+	glUseProgram((GLuintVC)prevProg);
+	glBindBuffer(0x8892, (GLuintVC)prevArrayBuf);
+	p_glBindFramebuffer(0x8CA9, (GLuintVC)prevDrawFbo);
+	p_glBindFramebuffer(0x8CA8, (GLuintVC)prevReadFbo);
+	glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+	glDeleteBuffers(1, &vbo);
+	glDeleteFramebuffers(1, &readFbo);
+	glDeleteFramebuffers(1, &fbo);
+	glDeleteTextures(1, &tex);
+	glDeleteProgram(prog);
+	glDeleteShader(vs);
+	glDeleteShader(fs);
+}
+
 // Word-boundary match: "GL_OVR_multiview" is a PREFIX of "GL_OVR_multiview2", so a
 // plain strstr reports the wrong one as present.
 static bool
@@ -1537,6 +1882,11 @@ vcrt_log_gl_extensions(void)
 			p_glBindTexture(0x8C1A, (GLuintVC)prevTex2DArray);
 			deleteFbo(1, &fbo);
 			deleteTex(1, &tex);
+			// Stufe 4a: only once the plain attach is proven COMPLETE does the
+			// draw-and-read-back test add meaning.
+			if (pass) {
+				vcrt_mv4_draw_selftest();
+			}
 		}
 	}
 
