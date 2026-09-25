@@ -1506,6 +1506,9 @@ vcrt_mv4_draw_selftest(void)
 	MV4(glFramebufferTextureMultiviewOVR, PFN_glFBTexMultiviewOVR2)
 	MV4(glGetIntegerv, PFN_glGetIntegervVC2)
 #undef MV4
+	typedef void (*PFN_glFBTexMsMvVC)(GLenumVC, GLenumVC, GLuintVC, GLintVC, GLsizeiVC, GLintVC, GLsizeiVC);
+	PFN_glFBTexMsMvVC glFBTexMsMv =
+		(PFN_glFBTexMsMvVC)g_eglGetProcAddress("glFramebufferTextureMultisampleMultiviewOVR");
 
 	// --- Program (real OVR_multiview2 shader through ANGLE's translator).
 	const char *vsSrc =
@@ -1574,13 +1577,27 @@ vcrt_mv4_draw_selftest(void)
 	glGetIntegerv(0x8894, &prevArrayBuf); glGetIntegerv(0x8B8D, &prevProg);
 	glGetIntegerv(0x0BA2 /* GL_VIEWPORT */, prevVp);
 
-	GLuintVC tex = 0, fbo = 0, readFbo = 0, vbo = 0;
+	GLuintVC tex = 0, fbo = 0, readFbo = 0, vbo = 0, tex2 = 0, fbo2 = 0;
 	p_glGenTextures(1, &tex);
 	p_glBindTexture(0x8C1A, tex);
 	glTexStorage3D(0x8C1A, 1, 0x8058, kMv4Size, kMv4Size, 2);
 	p_glGenFramebuffers(1, &fbo);
 	p_glBindFramebuffer(0x8CA9 /* DRAW */, fbo);
 	glFramebufferTextureMultiviewOVR(0x8CA9, 0x8CE0, tex, 0, 0, 2);
+	// Stufe 4b: same again with the implicit-MSAA variant (2x, like the
+	// production eye passes). The texture is the resolve target.
+	if (glFBTexMsMv) {
+		p_glGenTextures(1, &tex2);
+		p_glBindTexture(0x8C1A, tex2);
+		glTexStorage3D(0x8C1A, 1, 0x8058, kMv4Size, kMv4Size, 2);
+		p_glGenFramebuffers(1, &fbo2);
+		p_glBindFramebuffer(0x8CA9, fbo2);
+		glFBTexMsMv(0x8CA9, 0x8CE0, tex2, 0, 2, 0, 2);
+		VCLOG(@"[vc-mv4] msaa fbo status=0x%X err=0x%X",
+		      p_glCheckFramebufferStatus(0x8CA9), p_glGetError());
+	} else {
+		VCLOG(@"[vc-mv4] glFramebufferTextureMultisampleMultiviewOVR unresolved -> msaa variants skipped");
+	}
 	p_glGenFramebuffers(1, &readFbo);
 	glGenBuffers(1, &vbo);
 	glBindBuffer(0x8892 /* ARRAY_BUFFER */, vbo);
@@ -1601,9 +1618,16 @@ vcrt_mv4_draw_selftest(void)
 	PFN_SetRateMapForSize setRateMapForSize =
 		(PFN_SetRateMapForSize)dlsym(RTLD_DEFAULT, "ANGLEMetalSetRasterizationRateMapForSize");
 	int totalFail = 0;
-	for (int variant = 0; variant < 2; variant++) {
+	for (int variant = 0; variant < 4; variant++) {
+		const bool fove = (variant % 2) == 1;
+		const bool msaa = variant >= 2;
+		if (msaa && !glFBTexMsMv) break;
+		GLuintVC curFbo = msaa ? fbo2 : fbo;
+		GLuintVC curTex = msaa ? tex2 : tex;
+		const char *vname = msaa ? (fove ? "fove-msaa" : "plain-msaa")
+		                         : (fove ? "foveated" : "plain");
 		id<MTLRasterizationRateMap> map = nil;
-		if (variant == 1) {
+		if (fove) {
 			if (!setRateMapForSize || !g_mtlDevice) {
 				VCLOG(@"[vc-mv4] foveated variant SKIPPED (registry entry point or device missing)");
 				break;
@@ -1614,10 +1638,11 @@ vcrt_mv4_draw_selftest(void)
 			// The render pass desc is cached per framebuffer state; re-attach
 			// so the pass rebuilds and picks the freshly registered map up
 			// (found via the host repro: without this the map is ignored).
-			p_glBindFramebuffer(0x8CA9, fbo);
-			glFramebufferTextureMultiviewOVR(0x8CA9, 0x8CE0, tex, 0, 0, 2);
+			p_glBindFramebuffer(0x8CA9, curFbo);
+			if (msaa) glFBTexMsMv(0x8CA9, 0x8CE0, curTex, 0, 2, 0, 2);
+			else      glFramebufferTextureMultiviewOVR(0x8CA9, 0x8CE0, curTex, 0, 0, 2);
 		}
-		p_glBindFramebuffer(0x8CA9, fbo);
+		p_glBindFramebuffer(0x8CA9, curFbo);
 		glClearColor(0, 0, 0, 1);
 		glClear(0x4000 /* COLOR_BUFFER_BIT */);
 		glDrawArrays(0x0004 /* TRIANGLES */, 0, 48);
@@ -1627,7 +1652,7 @@ vcrt_mv4_draw_selftest(void)
 		for (int layer = 0; layer < 2; layer++) {
 			float shift = (float)layer * kMv4Shift;
 			p_glBindFramebuffer(0x8CA8 /* READ */, readFbo);
-			glFramebufferTextureLayer(0x8CA8, 0x8CE0, tex, 0, layer);
+			glFramebufferTextureLayer(0x8CA8, 0x8CE0, curTex, 0, layer);
 			glReadPixels(0, 0, kMv4Size, kMv4Size, 0x1908 /* RGBA */, 0x1401 /* UNSIGNED_BYTE */, readback);
 
 			// Expected mapping: identity when unfoveated, the map's own answer
@@ -1635,7 +1660,7 @@ vcrt_mv4_draw_selftest(void)
 			// map warps in Metal row space, so y expectations run through
 			// phys(SIZE - y); readback rows ARE metal rows (host-verified).
 			int physW = kMv4Size, physH = kMv4Size;
-			if (variant == 1) {
+			if (fove) {
 				MTLSize ps = [map physicalSizeForLayer:layer];
 				physW = (int)ps.width;
 				physH = (int)ps.height;
@@ -1647,7 +1672,7 @@ vcrt_mv4_draw_selftest(void)
 					float logical = kMv4Centers[b] + shift;
 					float expected, doubleWarp, unshifted;
 					if (axis == 0) {
-						if (variant == 1) {
+						if (fove) {
 							MTLCoordinate2D e = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(logical, sx) forLayer:layer];
 							MTLCoordinate2D d = [map mapScreenToPhysicalCoordinates:e forLayer:layer];
 							MTLCoordinate2D u = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(kMv4Centers[b], sx) forLayer:layer];
@@ -1656,7 +1681,7 @@ vcrt_mv4_draw_selftest(void)
 							expected = logical; doubleWarp = logical; unshifted = kMv4Centers[b];
 						}
 					} else {
-						if (variant == 1) {
+						if (fove) {
 							MTLCoordinate2D e = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(sx, kMv4Size - logical) forLayer:layer];
 							MTLCoordinate2D d = [map mapScreenToPhysicalCoordinates:e forLayer:layer];
 							MTLCoordinate2D u = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(sx, kMv4Size - kMv4Centers[b]) forLayer:layer];
@@ -1669,14 +1694,14 @@ vcrt_mv4_draw_selftest(void)
 					int fixed;
 					float measured;
 					if (axis == 0) {
-						float metalRow = variant == 1
+						float metalRow = fove
 							? [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(256, kMv4Size - sx) forLayer:layer].y
 							: (kMv4Size - sx);
 						fixed = (int)lroundf(metalRow);
 						const float *col = xcol[b];
 						measured = vcrt_mv4_scan(readback, kMv4Size, true, fixed, physW, col[0], col[1], col[2]);
 					} else {
-						float metalCol = variant == 1
+						float metalCol = fove
 							? [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(sx, 256) forLayer:layer].x
 							: sx;
 						fixed = (int)lroundf(metalCol);
@@ -1693,17 +1718,17 @@ vcrt_mv4_draw_selftest(void)
 						else if (fabsf(measured - unshifted) <= 4.0f) diag = " <- UNSHIFTED (layer routing broken?)";
 					}
 					VCLOG(@"[vc-mv4] %s layer=%d %c-bar[%d] expected=%.1f measured=%.1f delta=%.1f %s%s",
-					      variant ? "foveated" : "plain", layer, axis == 0 ? 'x' : 'y', b,
+					      vname, layer, axis == 0 ? 'x' : 'y', b,
 					      expected, measured, measured >= 0 ? delta : -999.0f,
 					      pass ? "OK" : "FAIL", diag);
 				}
 			}
 		}
 		VCLOG(@"[vc-mv4] variant=%s drawErr=0x%X RESULT=%s checks=%d fails=%d",
-		      variant ? "foveated" : "plain", drawErr, fails == 0 && drawErr == 0 ? "PASS" : "FAIL",
+		      vname, drawErr, fails == 0 && drawErr == 0 ? "PASS" : "FAIL",
 		      checks, fails);
 		totalFail += fails + (drawErr != 0 ? 1 : 0);
-		if (variant == 1) {
+		if (fove) {
 			setRateMapForSize(kMv4Size, kMv4Size, 1, NULL);   // unbind BEFORE releasing (registry rule)
 			map = nil;
 		}
@@ -1722,6 +1747,8 @@ vcrt_mv4_draw_selftest(void)
 	glDeleteFramebuffers(1, &readFbo);
 	glDeleteFramebuffers(1, &fbo);
 	glDeleteTextures(1, &tex);
+	if (fbo2) glDeleteFramebuffers(1, &fbo2);
+	if (tex2) glDeleteTextures(1, &tex2);
 	glDeleteProgram(prog);
 	glDeleteShader(vs);
 	glDeleteShader(fs);
