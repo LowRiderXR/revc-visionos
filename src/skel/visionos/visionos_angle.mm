@@ -1754,6 +1754,343 @@ vcrt_mv4_draw_selftest(void)
 	glDeleteShader(fs);
 }
 
+// ===========================================================================
+// Stufe 5.0a (multiview-plan.md): layered EGLImage import on DEVICE. Mirrors
+// the host test 1:1 -- a Private MTLTexture2DArray on ANGLE's device, imported
+// WITHOUT the slice attribute, bound as GL_TEXTURE_2D_ARRAY, plus a GL-owned
+// D24S8 array; both attached with glFramebufferTextureMultisampleMultiviewOVR
+// (2x). Bars at z=0.3, full-screen occluder at z=0.8 under GL_LESS: bars must
+// survive (depth array works), background = occluder colour. Variants: plain,
+// foveated BY IDENTITY on the imported Metal object. Log filter: vc-mv5.
+static void
+vcrt_mv5_import_selftest(void)
+{
+	typedef GLuintVC (*F_CreateShader)(GLenumVC);
+	typedef void (*F_ShaderSource)(GLuintVC, GLsizeiVC, const char **, const GLintVC *);
+	typedef void (*F_CompileShader)(GLuintVC);
+	typedef void (*F_GetShaderiv)(GLuintVC, GLenumVC, GLintVC *);
+	typedef GLuintVC (*F_CreateProgram)(void);
+	typedef void (*F_AttachShader)(GLuintVC, GLuintVC);
+	typedef void (*F_LinkProgram)(GLuintVC);
+	typedef void (*F_GetProgramiv)(GLuintVC, GLenumVC, GLintVC *);
+	typedef void (*F_UseProgram)(GLuintVC);
+	typedef GLintVC (*F_GetUniformLocation)(GLuintVC, const char *);
+	typedef void (*F_Uniform2f)(GLintVC, float, float);
+	typedef void (*F_Uniform1f)(GLintVC, float);
+	typedef void (*F_GenBuffers)(GLsizeiVC, GLuintVC *);
+	typedef void (*F_BindBuffer)(GLenumVC, GLuintVC);
+	typedef void (*F_BufferData)(GLenumVC, long, const void *, GLenumVC);
+	typedef void (*F_DeleteBuffers)(GLsizeiVC, const GLuintVC *);
+	typedef void (*F_EnableVAA)(GLuintVC);
+	typedef void (*F_DisableVAA)(GLuintVC);
+	typedef void (*F_VAP)(GLuintVC, GLintVC, GLenumVC, unsigned char, GLsizeiVC, const void *);
+	typedef void (*F_DrawArrays)(GLenumVC, GLintVC, GLsizeiVC);
+	typedef void (*F_Viewport)(GLintVC, GLintVC, GLsizeiVC, GLsizeiVC);
+	typedef void (*F_ClearColor)(float, float, float, float);
+	typedef void (*F_ClearDepthf)(float);
+	typedef void (*F_Clear)(GLenumVC);
+	typedef void (*F_Enable)(GLenumVC);
+	typedef void (*F_Disable)(GLenumVC);
+	typedef void (*F_DepthFunc)(GLenumVC);
+	typedef void (*F_ReadPixels)(GLintVC, GLintVC, GLsizeiVC, GLsizeiVC, GLenumVC, GLenumVC, void *);
+	typedef void (*F_FBTexLayer)(GLenumVC, GLenumVC, GLuintVC, GLintVC, GLintVC);
+	typedef void (*F_TexStorage3D)(GLenumVC, GLsizeiVC, GLenumVC, GLsizeiVC, GLsizeiVC, GLsizeiVC);
+	typedef void (*F_DeleteTextures)(GLsizeiVC, const GLuintVC *);
+	typedef void (*F_DeleteFramebuffers)(GLsizeiVC, const GLuintVC *);
+	typedef void (*F_DeleteProgram)(GLuintVC);
+	typedef void (*F_DeleteShader)(GLuintVC);
+	typedef void (*F_FBTexMsMv)(GLenumVC, GLenumVC, GLuintVC, GLintVC, GLsizeiVC, GLintVC, GLsizeiVC);
+	typedef void (*F_EGLImageTarget)(GLenumVC, void *);
+	typedef void (*F_GetIntegerv)(GLenumVC, GLintVC *);
+	typedef GLenumVC (*F_GetError)(void);
+	typedef GLenumVC (*F_CheckFBStatus)(GLenumVC);
+	typedef void (*F_GenTextures)(GLsizeiVC, GLuintVC *);
+	typedef void (*F_BindTexture)(GLenumVC, GLuintVC);
+	typedef void (*F_GenFramebuffers)(GLsizeiVC, GLuintVC *);
+	typedef void (*F_BindFramebuffer)(GLenumVC, GLuintVC);
+	typedef const unsigned char *(*F_GetString)(GLenumVC);
+#define MV5(var, ty, name) ty var = (ty)g_eglGetProcAddress(name); if (!var) { VCLOG(@"[vc-mv5] SKIPPED (%s unresolved)", name); return; }
+	MV5(fCreateShader, F_CreateShader, "glCreateShader") MV5(fShaderSource, F_ShaderSource, "glShaderSource")
+	MV5(fCompileShader, F_CompileShader, "glCompileShader") MV5(fGetShaderiv, F_GetShaderiv, "glGetShaderiv")
+	MV5(fCreateProgram, F_CreateProgram, "glCreateProgram") MV5(fAttachShader, F_AttachShader, "glAttachShader")
+	MV5(fLinkProgram, F_LinkProgram, "glLinkProgram") MV5(fGetProgramiv, F_GetProgramiv, "glGetProgramiv")
+	MV5(fUseProgram, F_UseProgram, "glUseProgram") MV5(fGetUniformLocation, F_GetUniformLocation, "glGetUniformLocation")
+	MV5(fUniform2f, F_Uniform2f, "glUniform2f") MV5(fUniform1f, F_Uniform1f, "glUniform1f")
+	MV5(fGenBuffers, F_GenBuffers, "glGenBuffers") MV5(fBindBuffer, F_BindBuffer, "glBindBuffer")
+	MV5(fBufferData, F_BufferData, "glBufferData") MV5(fDeleteBuffers, F_DeleteBuffers, "glDeleteBuffers")
+	MV5(fEnableVAA, F_EnableVAA, "glEnableVertexAttribArray") MV5(fDisableVAA, F_DisableVAA, "glDisableVertexAttribArray")
+	MV5(fVAP, F_VAP, "glVertexAttribPointer") MV5(fDrawArrays, F_DrawArrays, "glDrawArrays")
+	MV5(fViewport, F_Viewport, "glViewport") MV5(fClearColor, F_ClearColor, "glClearColor")
+	MV5(fClearDepthf, F_ClearDepthf, "glClearDepthf") MV5(fClear, F_Clear, "glClear")
+	MV5(fEnable, F_Enable, "glEnable") MV5(fDisable, F_Disable, "glDisable") MV5(fDepthFunc, F_DepthFunc, "glDepthFunc")
+	MV5(fReadPixels, F_ReadPixels, "glReadPixels") MV5(fFBTexLayer, F_FBTexLayer, "glFramebufferTextureLayer")
+	MV5(fTexStorage3D, F_TexStorage3D, "glTexStorage3D") MV5(fDeleteTextures, F_DeleteTextures, "glDeleteTextures")
+	MV5(fDeleteFramebuffers, F_DeleteFramebuffers, "glDeleteFramebuffers")
+	MV5(fDeleteProgram, F_DeleteProgram, "glDeleteProgram") MV5(fDeleteShader, F_DeleteShader, "glDeleteShader")
+	MV5(fFBTexMsMv, F_FBTexMsMv, "glFramebufferTextureMultisampleMultiviewOVR")
+	MV5(fEGLImageTarget, F_EGLImageTarget, "glEGLImageTargetTexture2DOES")
+	MV5(fGetIntegerv, F_GetIntegerv, "glGetIntegerv") MV5(fGetError, F_GetError, "glGetError")
+	MV5(fCheckFBStatus, F_CheckFBStatus, "glCheckFramebufferStatus")
+	MV5(fGenTextures, F_GenTextures, "glGenTextures") MV5(fBindTexture, F_BindTexture, "glBindTexture")
+	MV5(fGenFramebuffers, F_GenFramebuffers, "glGenFramebuffers") MV5(fBindFramebuffer, F_BindFramebuffer, "glBindFramebuffer")
+	MV5(fGetString, F_GetString, "glGetString")
+	typedef void (*F_DepthMask)(unsigned char);
+	typedef void (*F_ColorMask)(unsigned char, unsigned char, unsigned char, unsigned char);
+	typedef void (*F_StencilMask)(GLuintVC);
+	typedef void (*F_DepthRangef)(float, float);
+	typedef unsigned char (*F_IsEnabled)(GLenumVC);
+	typedef void (*F_GetBooleanv)(GLenumVC, unsigned char *);
+	MV5(fDepthMask, F_DepthMask, "glDepthMask") MV5(fColorMask, F_ColorMask, "glColorMask")
+	MV5(fStencilMask, F_StencilMask, "glStencilMask") MV5(fDepthRangef, F_DepthRangef, "glDepthRangef")
+	MV5(fIsEnabled, F_IsEnabled, "glIsEnabled") MV5(fGetBooleanv, F_GetBooleanv, "glGetBooleanv")
+#undef MV5
+	if (!g_mtlDevice || !p_eglCreateImageKHR) { VCLOG(@"[vc-mv5] SKIPPED (no device / eglCreateImageKHR)"); return; }
+	(void)fReadPixels; (void)fFBTexLayer;   // resolved for parity with mv4, but the imported Private array must not be read via GL (see below)
+	const char *exts = (const char *)fGetString(0x1F03);
+	if (!exts || !strstr(exts, "GL_EXT_EGL_image_array")) {
+		VCLOG(@"[vc-mv5] SKIPPED (GL_EXT_EGL_image_array not advertised)"); return;
+	}
+
+	const int SIZE = 512; const float SHIFT = 24.0f, HALF = 12.0f;
+	const float CENTERS[4] = {96, 192, 288, 384};
+	const float xcol[4][3] = {{1,0,0},{0,1,0},{0,0,1},{1,1,0}};
+	const float ycol[4][3] = {{0,1,1},{1,0,1},{1,1,1},{1,0.5f,0}};
+
+	// Saved state.
+	GLintVC prevDrawFbo = 0, prevReadFbo = 0, prevArrayBuf = 0, prevProg = 0, prevVp[4], prevTexArr = 0;
+	fGetIntegerv(0x8CA6, &prevDrawFbo); fGetIntegerv(0x8CAA, &prevReadFbo);
+	fGetIntegerv(0x8894, &prevArrayBuf); fGetIntegerv(0x8B8D, &prevProg);
+	fGetIntegerv(0x0BA2, prevVp); fGetIntegerv(0x8C1D, &prevTexArr);
+	// Inherited render state. This test runs INSIDE the game's context, after
+	// librw initialised its state cache -- unlike the host test (fresh context).
+	// Device run 2026-09-25 failed with layer 0 empty / layer 1 occluder-only:
+	// exactly the picture of glDepthMask(FALSE) leaking in (depth clear skipped,
+	// memoryless depth array starts with garbage per slice, bars never write
+	// depth so the occluder covers them). Log what we found, force a known
+	// state, restore afterwards. Same trap as plan risk L1 (clear hygiene).
+	unsigned char prevDepthMask = 1, prevColorMask[4] = {1,1,1,1};
+	float prevDepthRange[2] = {0, 1};
+	fGetBooleanv(0x0B72 /* GL_DEPTH_WRITEMASK */, &prevDepthMask);
+	fGetBooleanv(0x0C23 /* GL_COLOR_WRITEMASK */, prevColorMask);
+	{ typedef void (*F_GetFloatv)(GLenumVC, float *);
+	  F_GetFloatv fGetFloatv = (F_GetFloatv)g_eglGetProcAddress("glGetFloatv");
+	  if (fGetFloatv) fGetFloatv(0x0B70 /* GL_DEPTH_RANGE */, prevDepthRange); }
+	GLintVC prevStencilWriteMask = -1; fGetIntegerv(0x0B98 /* GL_STENCIL_WRITEMASK */, &prevStencilWriteMask);
+	const unsigned char prevDepthTest = fIsEnabled(0x0B71), prevCull = fIsEnabled(0x0B44),
+	                    prevScissor = fIsEnabled(0x0C11), prevStencil = fIsEnabled(0x0B90),
+	                    prevBlend = fIsEnabled(0x0BE2), prevDiscard = fIsEnabled(0x8C89);
+	VCLOG(@"[vc-mv5] inherited state: depthMask=%d colorMask=%d%d%d%d depthRange=%.1f..%.1f stencilWriteMask=0x%X depthTest=%d cull=%d scissor=%d stencilTest=%d blend=%d rasterizerDiscard=%d",
+	      prevDepthMask, prevColorMask[0], prevColorMask[1], prevColorMask[2], prevColorMask[3],
+	      prevDepthRange[0], prevDepthRange[1], (unsigned)prevStencilWriteMask,
+	      prevDepthTest, prevCull, prevScissor, prevStencil, prevBlend, prevDiscard);
+	fDepthMask(1); fColorMask(1, 1, 1, 1); fStencilMask(0xFFFFFFFFu); fDepthRangef(0.0f, 1.0f);
+	fDisable(0x0B44); fDisable(0x0C11); fDisable(0x0B90); fDisable(0x0BE2); fDisable(0x8C89);
+	(void)fGetError();
+
+	// Private 2D-array MTLTexture on ANGLE's device -> EGLImage (no slice attr) -> GL 2D array.
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                                             width:SIZE height:SIZE mipmapped:NO];
+	td.textureType = MTLTextureType2DArray;
+	td.arrayLength = 2;
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> mtlArray = [g_mtlDevice newTextureWithDescriptor:td];
+	const EGLint imgAttribs[] = { (EGLint)VC_EGL_NONE };
+	void *img = p_eglCreateImageKHR(g_display, (EGLContext)0, VC_EGL_METAL_TEXTURE_ANGLE, VC_OBJ_TO_VOID(mtlArray), imgAttribs);
+	if (!img) { VCLOG(@"[vc-mv5] RESULT=FAIL stage=eglCreateImageKHR (egl 0x%x)", g_eglGetError ? g_eglGetError() : 0); return; }
+	GLuintVC colorTex = 0, depthTex = 0, fbo = 0, readFbo = 0, vbo = 0;
+	fGenTextures(1, &colorTex);
+	fBindTexture(0x8C1A, colorTex);
+	fEGLImageTarget(0x8C1A, img);
+	GLenumVC importErr = fGetError();
+	VCLOG(@"[vc-mv5] import MTLTexture2DArray(Private) as GL_TEXTURE_2D_ARRAY: err=0x%X %s", importErr, importErr ? "FAIL" : "OK");
+	if (importErr) { fDeleteTextures(1, &colorTex); return; }
+	fGenTextures(1, &depthTex);
+	fBindTexture(0x8C1A, depthTex);
+	fTexStorage3D(0x8C1A, 1, 0x88F0 /* GL_DEPTH24_STENCIL8 */, SIZE, SIZE, 2);
+	fGenFramebuffers(1, &fbo); fGenFramebuffers(1, &readFbo);
+	fBindFramebuffer(0x8CA9, fbo);
+	fFBTexMsMv(0x8CA9, 0x8CE0, colorTex, 0, 2, 0, 2);
+	fFBTexMsMv(0x8CA9, 0x821A /* GL_DEPTH_STENCIL_ATTACHMENT */, depthTex, 0, 2, 0, 2);
+	GLenumVC status = fCheckFBStatus(0x8CA9);
+	VCLOG(@"[vc-mv5] fbo (imported colour array + D24S8 array, 2x msaa, 2 views): status=0x%X err=0x%X %s",
+	      status, fGetError(), status == 0x8CD5 ? "COMPLETE" : "FAIL");
+	int totalFail = (status == 0x8CD5) ? 0 : 1;
+
+	if (status == 0x8CD5) {
+		const char *vsSrc =
+			"#version 300 es\n#extension GL_OVR_multiview2 : require\nlayout(num_views = 2) in;\n"
+			"layout(location = 0) in vec2 in_pos;\nlayout(location = 1) in vec4 in_color;\n"
+			"uniform vec2 u_screen;\nuniform float u_shift;\nuniform float u_z;\nout vec4 v_color;\n"
+			"void main() {\n  vec2 p = in_pos + float(gl_ViewID_OVR) * vec2(u_shift, u_shift);\n"
+			"  gl_Position = vec4(p.x / u_screen.x * 2.0 - 1.0, 1.0 - p.y / u_screen.y * 2.0, u_z, 1.0);\n"
+			"  v_color = in_color;\n}\n";
+		const char *fsSrc = "#version 300 es\nprecision highp float;\nin vec4 v_color;\nout vec4 fragColor;\n"
+		                    "void main() { fragColor = v_color; }\n";
+		GLuintVC vs = fCreateShader(0x8B31), fs = fCreateShader(0x8B30);
+		fShaderSource(vs, 1, &vsSrc, NULL); fCompileShader(vs);
+		fShaderSource(fs, 1, &fsSrc, NULL); fCompileShader(fs);
+		GLuintVC prog = fCreateProgram();
+		fAttachShader(prog, vs); fAttachShader(prog, fs); fLinkProgram(prog);
+		GLintVC ok = 0; fGetProgramiv(prog, 0x8B82, &ok);
+		if (!ok) { VCLOG(@"[vc-mv5] RESULT=FAIL stage=link"); totalFail++; }
+		else {
+			static float verts[(8 * 6 + 6) * 6]; int vi = 0;
+			auto quad = [&](float x0, float y0, float x1, float y1, const float *c) {
+				float corn[6][2] = {{x0,y0},{x1,y0},{x0,y1},{x1,y0},{x1,y1},{x0,y1}};
+				for (int v = 0; v < 6; v++) { verts[vi++]=corn[v][0]; verts[vi++]=corn[v][1];
+					verts[vi++]=c[0]; verts[vi++]=c[1]; verts[vi++]=c[2]; verts[vi++]=1; }
+			};
+			for (int b = 0; b < 4; b++) quad(CENTERS[b]-HALF, 0, CENTERS[b]+HALF, (float)SIZE, xcol[b]);
+			for (int b = 0; b < 4; b++) quad(8, CENTERS[b]-HALF, 72, CENTERS[b]+HALF, ycol[b]);
+			const float occ[3] = {0, 0, 0.3f};
+			quad(-64, -64, SIZE + 64, SIZE + 64, occ);
+			fGenBuffers(1, &vbo); fBindBuffer(0x8892, vbo);
+			fBufferData(0x8892, sizeof(verts), verts, 0x88E4);
+			fUseProgram(prog);
+			fUniform2f(fGetUniformLocation(prog, "u_screen"), (float)SIZE, (float)SIZE);
+			fUniform1f(fGetUniformLocation(prog, "u_shift"), SHIFT);
+			GLintVC uZ = fGetUniformLocation(prog, "u_z");
+			fEnableVAA(0); fEnableVAA(1);
+			fVAP(0, 2, 0x1406, 0, 24, (const void *)0);
+			fVAP(1, 4, 0x1406, 0, 24, (const void *)8);
+			fViewport(0, 0, SIZE, SIZE);
+			fEnable(0x0B71); fDepthFunc(0x0201);
+
+			typedef void (*F_SetRateMap)(void *, void *);
+			F_SetRateMap setRateMap = (F_SetRateMap)dlsym(RTLD_DEFAULT, "ANGLEMetalSetRasterizationRateMap");
+			static unsigned char *rb = (unsigned char *)malloc((size_t)SIZE * SIZE * 4);
+			for (int variant = 0; variant < 2; variant++) {
+				const bool fove = variant == 1;
+				id<MTLRasterizationRateMap> map = nil;
+				if (fove) {
+					if (!setRateMap) { VCLOG(@"[vc-mv5] foveated SKIPPED (no identity registry)"); break; }
+					const int zones = 8; float uni[8], fall[8];
+					for (int i = 0; i < zones; i++) { float d = fabsf((float)i - 3.5f) / 3.5f; uni[i] = 1; fall[i] = 1 - 0.75f * d; }
+					MTLRasterizationRateLayerDescriptor *l0 = [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(zones, zones, 1) horizontal:uni vertical:fall];
+					MTLRasterizationRateLayerDescriptor *l1 = [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(zones, zones, 1) horizontal:fall vertical:fall];
+					MTLRasterizationRateMapDescriptor *rd = [[MTLRasterizationRateMapDescriptor alloc] init];
+					rd.screenSize = MTLSizeMake(SIZE, SIZE, 0);
+					[rd setLayer:l0 atIndex:0]; [rd setLayer:l1 atIndex:1];
+					map = [g_mtlDevice newRasterizationRateMapWithDescriptor:rd];
+					setRateMap(VC_OBJ_TO_VOID(mtlArray), VC_OBJ_TO_VOID(map));   // BY IDENTITY on the imported object
+					fBindFramebuffer(0x8CA9, fbo);
+					fFBTexMsMv(0x8CA9, 0x8CE0, colorTex, 0, 2, 0, 2);            // re-attach: rebuild pass desc
+				}
+				fBindFramebuffer(0x8CA9, fbo);
+				// Grey clear, not black: tells "cleared but nothing drawn" (128,128,128)
+				// from "never touched" (0,0,0) in the background line.
+				fClearColor(0.5f, 0.5f, 0.5f, 1); fClearDepthf(1.0f);
+				fClear(0x4000 | 0x0100 | 0x0400);
+				fUniform1f(uZ, 0.3f); fDrawArrays(0x0004, 0, 48);
+				fUniform1f(uZ, 0.8f); fDrawArrays(0x0004, 48, 6);
+				GLenumVC drawErr = fGetError();
+				int fails = 0, checks = 0;
+				// Readback via Metal blit, NOT glReadPixels: ANGLE's readPixels calls
+				// MTLTexture.getBytes on the source, which Metal forbids for Private
+				// storage (ANGLE's own textures are Shared; an imported compositor-style
+				// array is Private). ANGLE's blit-to-buffer read path is AMD-only
+				// (copyTextureToBufferForReadOptimization) -- hard rule for every
+				// imported Private texture, host and device alike (device crash 2026-09-25).
+				if (p_glFinish) p_glFinish();
+				MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+				                                                                            width:SIZE height:SIZE mipmapped:NO];
+				sd.usage = MTLTextureUsageShaderRead;
+				sd.storageMode = MTLStorageModeShared;
+				id<MTLTexture> staging = [g_mtlDevice newTextureWithDescriptor:sd];
+				if (g_cmdQueue == nil) g_cmdQueue = [g_mtlDevice newCommandQueue];
+				for (int layer = 0; layer < 2; layer++) {
+					float shift = layer * SHIFT;
+					{
+						id<MTLCommandBuffer> cb = [g_cmdQueue commandBuffer];
+						id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+						[blit copyFromTexture:mtlArray sourceSlice:layer sourceLevel:0
+						         sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(SIZE, SIZE, 1)
+						            toTexture:staging destinationSlice:0 destinationLevel:0
+						    destinationOrigin:MTLOriginMake(0, 0, 0)];
+						[blit endEncoding];
+						[cb commit];
+						[cb waitUntilCompleted];
+						[staging getBytes:rb bytesPerRow:(NSUInteger)SIZE * 4
+						       fromRegion:MTLRegionMake2D(0, 0, SIZE, SIZE) mipmapLevel:0];
+					}
+					int physW = SIZE, physH = SIZE;
+					if (fove) { MTLSize ps = [map physicalSizeForLayer:layer]; physW = (int)ps.width; physH = (int)ps.height; }
+					{ unsigned char *p = rb + ((physH - 8) * SIZE + 8) * 4;
+					  bool bgOK = p[0] < 20 && p[1] < 20 && p[2] > 55 && p[2] < 100;
+					  checks++; if (!bgOK) fails++;
+					  VCLOG(@"[vc-mv5] %s layer=%d background rgb=(%d,%d,%d) %s (occluder colour expected)",
+					        fove ? "fove" : "plain", layer, p[0], p[1], p[2], bgOK ? "OK" : "FAIL"); }
+					for (int axis = 0; axis < 2; axis++) {
+						float sx = 40.0f + shift;
+						for (int b = 0; b < 4; b++) {
+							float logical = CENTERS[b] + shift, expected, doubleWarp, unshifted;
+							if (axis == 0) {
+								if (fove) { MTLCoordinate2D e = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(logical, sx) forLayer:layer];
+								            MTLCoordinate2D d = [map mapScreenToPhysicalCoordinates:e forLayer:layer];
+								            MTLCoordinate2D u = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(CENTERS[b], sx) forLayer:layer];
+								            expected = e.x; doubleWarp = d.x; unshifted = u.x; }
+								else { expected = logical; doubleWarp = logical; unshifted = CENTERS[b]; }
+							} else {
+								if (fove) { MTLCoordinate2D e = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(sx, SIZE - logical) forLayer:layer];
+								            MTLCoordinate2D d = [map mapScreenToPhysicalCoordinates:e forLayer:layer];
+								            MTLCoordinate2D u = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(sx, SIZE - CENTERS[b]) forLayer:layer];
+								            expected = e.y; doubleWarp = d.y; unshifted = u.y; }
+								else { expected = SIZE - logical; doubleWarp = expected; unshifted = SIZE - CENTERS[b]; }
+							}
+							float measured = -1;
+							if (axis == 0) {
+								float metalRow = fove ? [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(256, SIZE - sx) forLayer:layer].y : (SIZE - sx);
+								measured = vcrt_mv4_scan(rb, SIZE, true, (int)lroundf(metalRow), physW, xcol[b][0], xcol[b][1], xcol[b][2]);
+							} else {
+								float metalCol = fove ? [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(sx, 256) forLayer:layer].x : sx;
+								measured = vcrt_mv4_scan(rb, SIZE, false, (int)lroundf(metalCol), physH, ycol[b][0], ycol[b][1], ycol[b][2]);
+							}
+							checks++;
+							float delta = measured - expected;
+							bool pass = measured >= 0 && fabsf(delta) <= 4.0f;
+							if (!pass) fails++;
+							const char *diag = "";
+							if (!pass && measured < 0) diag = " <- NOT FOUND (depth test lost?)";
+							else if (!pass && fabsf(measured - doubleWarp) <= 4.0f) diag = " <- DOUBLE-WARP";
+							else if (!pass && fabsf(measured - unshifted) <= 4.0f) diag = " <- UNSHIFTED";
+							VCLOG(@"[vc-mv5] %s layer=%d %c-bar[%d] expected=%.1f measured=%.1f delta=%.1f %s%s",
+							      fove ? "fove" : "plain", layer, axis == 0 ? 'x' : 'y', b, expected, measured,
+							      measured >= 0 ? delta : -999.0f, pass ? "OK" : "FAIL", diag);
+						}
+					}
+				}
+				VCLOG(@"[vc-mv5] variant=%s drawErr=0x%X RESULT=%s checks=%d fails=%d",
+				      fove ? "foveated-by-identity" : "plain", drawErr, (fails == 0 && drawErr == 0) ? "PASS" : "FAIL", checks, fails);
+				totalFail += fails + (drawErr ? 1 : 0);
+				if (fove) { setRateMap(VC_OBJ_TO_VOID(mtlArray), NULL); map = nil; }
+			}
+			fDisable(0x0B71);
+			fDisableVAA(0); fDisableVAA(1);
+			fDeleteBuffers(1, &vbo);
+		}
+		fDeleteProgram(prog); fDeleteShader(vs); fDeleteShader(fs);
+	}
+	VCLOG(@"[vc-mv5] OVERALL=%s", totalFail == 0 ? "PASS" : "FAIL");
+
+	fDepthMask(prevDepthMask);
+	fColorMask(prevColorMask[0], prevColorMask[1], prevColorMask[2], prevColorMask[3]);
+	fStencilMask((GLuintVC)prevStencilWriteMask); fDepthRangef(prevDepthRange[0], prevDepthRange[1]);
+	(prevDepthTest ? fEnable : fDisable)(0x0B71); (prevCull ? fEnable : fDisable)(0x0B44);
+	(prevScissor ? fEnable : fDisable)(0x0C11); (prevStencil ? fEnable : fDisable)(0x0B90);
+	(prevBlend ? fEnable : fDisable)(0x0BE2); (prevDiscard ? fEnable : fDisable)(0x8C89);
+	fUseProgram((GLuintVC)prevProg);
+	fBindBuffer(0x8892, (GLuintVC)prevArrayBuf);
+	fBindFramebuffer(0x8CA9, (GLuintVC)prevDrawFbo);
+	fBindFramebuffer(0x8CA8, (GLuintVC)prevReadFbo);
+	fBindTexture(0x8C1A, (GLuintVC)prevTexArr);
+	fViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+	fDeleteFramebuffers(1, &readFbo); fDeleteFramebuffers(1, &fbo);
+	fDeleteTextures(1, &depthTex); fDeleteTextures(1, &colorTex);
+	// The EGLImage is intentionally left alive for this one-shot test (no eglDestroyImage entry resolved here).
+	(void)img;
+}
+
 // Word-boundary match: "GL_OVR_multiview" is a PREFIX of "GL_OVR_multiview2", so a
 // plain strstr reports the wrong one as present.
 static bool
@@ -1913,6 +2250,7 @@ vcrt_log_gl_extensions(void)
 			// draw-and-read-back test add meaning.
 			if (pass) {
 				vcrt_mv4_draw_selftest();
+				vcrt_mv5_import_selftest();
 			}
 		}
 	}
