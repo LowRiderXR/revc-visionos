@@ -794,6 +794,21 @@ vcrt_eyegpu_begin(void)  // called on the proceed path, before any of the frame'
 	g_tqOpen = true; g_tqActiveSlot = g_tqWrite;
 }
 
+// OVR_multiview forbids drawing into a multi-view framebuffer while a GL_TIME_ELAPSED
+// query is active (INVALID_OPERATION, ANGLE validationES.cpp kMultiviewTimerQuery).
+// The eye-GPU timer brackets the whole frame, and the multiview self-tests run inside
+// that bracket on the first frame -- device run 2026-09-25: every self-test draw
+// failed with 0x502 under VC_EYE_GPU=1. Close the open query first; that frame is
+// simply not timed. The same rule hits Stufe 5.1: the one-pass world render cannot be
+// measured with GL_TIME_ELAPSED as long as this validation stands.
+static void
+vcrt_eyegpu_suspend_for_multiview(const char *who)
+{
+	if (!g_tqOpen) return;
+	vcrt_eyegpu_close();
+	VCLOG(@"[vc-eyegpu] %s: closed the frame's GL_TIME_ELAPSED query before multiview draws (spec forbids an active timer query on multi-view framebuffers)", who);
+}
+
 static void vcrt_foveation_poll_dirty(void);   // defined with the stereo target below
 
 extern "C" bool
@@ -1449,6 +1464,7 @@ vcrt_mv4_scan(const unsigned char *px, int stride, bool horizontal, int fixed, i
 static void
 vcrt_mv4_draw_selftest(void)
 {
+	vcrt_eyegpu_suspend_for_multiview("vc-mv4");
 	typedef GLuintVC (*PFN_glCreateShaderVC)(GLenumVC);
 	typedef void (*PFN_glShaderSourceVC)(GLuintVC, GLsizeiVC, const char **, const GLintVC *);
 	typedef void (*PFN_glCompileShaderVC)(GLuintVC);
@@ -1755,6 +1771,62 @@ vcrt_mv4_draw_selftest(void)
 }
 
 // ===========================================================================
+// Stufe 5.0b/1 (multiview-plan.md): multiview program pairs. librw builds, under
+// VC_MULTIVIEW=1, a multiview twin for every shader created with a pair name
+// (gl3shader.cpp). This one-shot summary runs at the first world pass, when all
+// families (librw + custom pipes) exist, and names what failed or never appeared.
+// Expected: the 19 programs that can run in the world pass. Log filter: vc-mv.
+extern "C" int vc_mv_pairs_mode(void);
+extern "C" int vc_mv_pair_count(void);
+extern "C" const char *vc_mv_pair_name(int i);
+extern "C" int vc_mv_pair_ok(int i);
+
+extern "C" void
+vcrt_mv_pairs_report(void)
+{
+	static bool done = false;
+	if (done) return;
+	done = true;
+	static const char *const expected[] = {
+		"default", "default_noAT", "default_fullLight", "default_fullLight_noAT",
+		"skin", "skin_noAT", "skin_fullLight", "skin_fullLight_noAT",
+		"matfx_env", "matfx_env_noAT", "matfx_env_fullLight", "matfx_env_fullLight_noAT",
+		"im2d", "im3d",
+		"neoVehicle", "neoWorld", "neoGloss", "neoRimSkin", "neoRim",
+	};
+	const int nExpected = (int)(sizeof(expected) / sizeof(expected[0]));
+	const int mode = vc_mv_pairs_mode();
+	if (mode == 0) {
+		VCLOG(@"[vc-mv] program pairs: OFF (VC_MULTIVIEW unset) -- mono programs only, nothing changed");
+		return;
+	}
+	if (mode == 2) {
+		VCLOG(@"[vc-mv] program pairs: REQUESTED but GL_OVR_multiview2 is not advertised (set KL_GL_MULTIVIEW=1) -- 0 pairs, mono programs only");
+		return;
+	}
+	NSMutableString *failed = [NSMutableString string], *missing = [NSMutableString string], *unexpected = [NSMutableString string];
+	int linked = 0, nFailed = 0, nMissing = 0, nUnexpected = 0;
+	const int n = vc_mv_pair_count();
+	for (int i = 0; i < n; i++) {
+		const char *name = vc_mv_pair_name(i);
+		bool known = false;
+		for (int e = 0; e < nExpected; e++) if (strcmp(name, expected[e]) == 0) { known = true; break; }
+		if (!known) { nUnexpected++; [unexpected appendFormat:@"%s ", name]; }
+		if (vc_mv_pair_ok(i)) linked++;
+		else { nFailed++; [failed appendFormat:@"%s ", name]; }
+	}
+	for (int e = 0; e < nExpected; e++) {
+		bool seen = false;
+		for (int i = 0; i < n; i++) if (strcmp(vc_mv_pair_name(i), expected[e]) == 0) { seen = true; break; }
+		if (!seen) { nMissing++; [missing appendFormat:@"%s ", expected[e]]; }
+	}
+	const bool pass = (linked == nExpected && nFailed == 0 && nMissing == 0 && nUnexpected == 0);
+	VCLOG(@"[vc-mv] program pairs: %d/%d linked, %d failed [%@], %d missing (expected, never created) [%@], %d unexpected [%@] -> %s",
+	      linked, nExpected, nFailed, failed, nMissing, missing, nUnexpected, unexpected, pass ? "PASS" : "FAIL");
+	if (nFailed) VCLOG(@"[vc-mv] a failed pair means the OVR_multiview2 variant did not compile/link -- the GLSL/MSL error text is in the shader log lines (stderr) above");
+}
+
+// ===========================================================================
 // Stufe 5.0a (multiview-plan.md): layered EGLImage import on DEVICE. Mirrors
 // the host test 1:1 -- a Private MTLTexture2DArray on ANGLE's device, imported
 // WITHOUT the slice attribute, bound as GL_TEXTURE_2D_ARRAY, plus a GL-owned
@@ -1845,6 +1917,7 @@ vcrt_mv5_import_selftest(void)
 	MV5(fIsEnabled, F_IsEnabled, "glIsEnabled") MV5(fGetBooleanv, F_GetBooleanv, "glGetBooleanv")
 #undef MV5
 	if (!g_mtlDevice || !p_eglCreateImageKHR) { VCLOG(@"[vc-mv5] SKIPPED (no device / eglCreateImageKHR)"); return; }
+	vcrt_eyegpu_suspend_for_multiview("vc-mv5");
 	(void)fReadPixels; (void)fFBTexLayer;   // resolved for parity with mv4, but the imported Private array must not be read via GL (see below)
 	const char *exts = (const char *)fGetString(0x1F03);
 	if (!exts || !strstr(exts, "GL_EXT_EGL_image_array")) {

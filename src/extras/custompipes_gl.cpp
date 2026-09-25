@@ -164,7 +164,7 @@ CreateVehiclePipe(void)
 #include "shaders/obj/neoVehicle_vert.inc"
 	const char *vs[] = { shaderDecl, "#define DIRECTIONALS\n", header_vert_src, neoVehicle_vert_src, nil };
 	const char *fs[] = { shaderDecl, header_frag_src, neoVehicle_frag_src, nil };
-	neoVehicleShader = Shader::create(vs, fs);
+	neoVehicleShader = Shader::create(vs, fs, "neoVehicle");
 	assert(neoVehicleShader);
 	}
 
@@ -267,7 +267,7 @@ CreateWorldPipe(void)
 #include "shaders/obj/default_UV2_vert.inc"
 	const char *vs[] = { shaderDecl, header_vert_src, default_UV2_vert_src, nil };
 	const char *fs[] = { shaderDecl, header_frag_src, neoWorldVC_frag_src, nil };
-	neoWorldShader = Shader::create(vs, fs);
+	neoWorldShader = Shader::create(vs, fs, "neoWorld");
 	assert(neoWorldShader);
 	}
 
@@ -367,7 +367,7 @@ CreateGlossPipe(void)
 #include "shaders/obj/neoGloss_vert.inc"
 	const char *vs[] = { shaderDecl, header_vert_src, neoGloss_vert_src, nil };
 	const char *fs[] = { shaderDecl, header_frag_src, neoGloss_frag_src, nil };
-	neoGlossShader = Shader::create(vs, fs);
+	neoGlossShader = Shader::create(vs, fs, "neoGloss");
 	assert(neoGlossShader);
 	}
 
@@ -534,7 +534,7 @@ CreateRimLightPipes(void)
 	const char *vs[] = { shaderDecl, "#define DIRECTIONALS\n", header_vert_src, neoRimSkin_vert_src, nil };
 	const char *fs[] = { shaderDecl, header_frag_src, simple_frag_src, nil };
 #endif
-	neoRimSkinShader = Shader::create(vs, fs);
+	neoRimSkinShader = Shader::create(vs, fs, "neoRimSkin");
 	assert(neoRimSkinShader);
 	}
 
@@ -549,7 +549,7 @@ CreateRimLightPipes(void)
 #else
 	const char *fs[] = { shaderDecl, header_frag_src, simple_frag_src, nil };
 #endif
-	neoRimShader = Shader::create(vs, fs);
+	neoRimShader = Shader::create(vs, fs, "neoRim");
 	assert(neoRimShader);
 	}
 
