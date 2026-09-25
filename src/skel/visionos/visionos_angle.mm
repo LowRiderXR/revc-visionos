@@ -810,6 +810,7 @@ vcrt_eyegpu_suspend_for_multiview(const char *who)
 }
 
 static void vcrt_foveation_poll_dirty(void);   // defined with the stereo target below
+static void vcrt_mv_use_poll(void);           // defined with the multiview self-tests below
 
 extern "C" bool
 vcrt_begin_frame(void)
@@ -979,6 +980,7 @@ vcrt_publish_frame(void)
 	pthread_mutex_unlock(&g_bufMutex);
 
 	vcrt_eyegpu_close();   // end the eye-pass timer opened in vcrt_begin_frame
+	vcrt_mv_use_poll();    // 5.0b/2: twin selections must stay 0 until the multiview FBO exists
 	vcrt_eyegpu_poll();
 
 	// The frame's GL work is recorded into g_buf[back]'s FBO. Enqueue the GPU
@@ -1781,6 +1783,34 @@ extern "C" int vc_mv_pair_count(void);
 extern "C" const char *vc_mv_pair_name(int i);
 extern "C" int vc_mv_pair_ok(int i);
 
+// 5.0b/2: the multiview FBO whose binding (through librw's bindFramebuffer) selects
+// the twin programs. 0 until Stufe 5.1 creates the real one -- so today no draw can
+// ever select a twin, which the per-second use counter below verifies.
+static unsigned int g_mvFbo = 0;
+extern "C" unsigned int vc_multiview_fbo(void) { return g_mvFbo; }
+extern "C" void vc_multiview_fbo_set(unsigned int fbo) { g_mvFbo = fbo; }
+// The one-pass render is active exactly while a multiview FBO is registered
+// (Stufe 5.1). Consumers: eye tag (main.cpp), matrix getters (gl3device.cpp).
+extern "C" int vc_multiview_active(void) { return g_mvFbo != 0; }
+extern "C" void vc_mv_use_counts(unsigned *mono, unsigned *mv, int reset);
+extern "C" int vc_mv_bind_switch_selftest(unsigned int mvFbo);
+
+static void
+vcrt_mv_use_poll(void)   // once per second, only while pairs exist
+{
+	static double lastT = 0;
+	static bool modeChecked = false, on = false;
+	if (!modeChecked) { modeChecked = true; on = (vc_mv_pairs_mode() == 1); }
+	if (!on) return;
+	double now = vc_now_seconds();
+	if (now - lastT < 1.0) return;
+	lastT = now;
+	unsigned mono = 0, mv = 0;
+	vc_mv_use_counts(&mono, &mv, 1);
+	VCLOG(@"[vc-mv] use/s: mono=%u mv=%u mvFbo=%u %s", mono, mv, g_mvFbo,
+	      (g_mvFbo == 0 && mv != 0) ? "<- FAIL: twin selected without a multiview FBO" : "");
+}
+
 extern "C" void
 vcrt_mv_pairs_report(void)
 {
@@ -1989,6 +2019,18 @@ vcrt_mv5_import_selftest(void)
 	VCLOG(@"[vc-mv5] fbo (imported colour array + D24S8 array, 2x msaa, 2 views): status=0x%X err=0x%X %s",
 	      status, fGetError(), status == 0x8CD5 ? "COMPLETE" : "FAIL");
 	int totalFail = (status == 0x8CD5) ? 0 : 1;
+	if (status == 0x8CD5) {
+		// 5.0b/2: does librw's bind-driven program switch pick the twin on this
+		// 2-view FBO and fall back to mono afterwards? Leaves GL bound to the
+		// previous FBO (the draw code below rebinds ours).
+		int sw = vc_mv_bind_switch_selftest(fbo);
+		if (sw & 4)
+			VCLOG(@"[vc-mv] bind-switch self-test: multiview FBO bound -> twin %s; previous FBO rebound -> mono %s -> %s",
+			      (sw & 1) ? "selected" : "NOT selected", (sw & 2) ? "restored" : "NOT restored",
+			      (sw & 3) == 3 ? "PASS" : "FAIL");
+		else
+			VCLOG(@"[vc-mv] bind-switch self-test: skipped (no program pairs -- VC_MULTIVIEW unset?)");
+	}
 
 	if (status == 0x8CD5) {
 		const char *vsSrc =
@@ -2815,6 +2857,16 @@ vcMsaaSamples(void)
 	return g_msaaSamples;
 }
 
+// VC_MULTIVIEW=1 requested (program pairs etc.). Env only; whether the GL side
+// actually offers OVR_multiview is librw's vc_mv_pairs_mode().
+static int
+vcMultiviewRequested(void)
+{
+	static int v = -1;
+	if (v < 0) { const char *e = getenv("VC_MULTIVIEW"); v = (e && e[0] == '1') ? 1 : 0; }
+	return v;
+}
+
 static int
 vcMsaaImplicit(void)
 {
@@ -2822,6 +2874,14 @@ vcMsaaImplicit(void)
 	if (v < 0) {
 		const char *e = getenv("VC_MSAA_IMPLICIT");
 		v = e ? (atoi(e) ? 1 : 0) : 1;   // default: implicit resolve
+		// 5.0b/3: the explicit path (shared multisample FBO + glBlitFramebuffer per eye)
+		// cannot feed a two-layer target (blit out of an array + a Load boundary on a
+		// memoryless attachment). Under VC_MULTIVIEW=1 it is locked out, loudly --
+		// otherwise an env combination exists that renders black without a word.
+		if (v == 0 && vcMultiviewRequested()) {
+			VCLOG(@"[vc-msaa] VC_MSAA_IMPLICIT=0 IGNORED under VC_MULTIVIEW=1: the explicit resolve path is incompatible with a two-layer target -> implicit resolve forced");
+			v = 1;
+		}
 	}
 	return v;
 }

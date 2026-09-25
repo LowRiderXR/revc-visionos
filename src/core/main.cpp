@@ -1524,6 +1524,10 @@ static bool vcStereoCameraOn(void)
 // reads this to apply the per-eye slice projection to sun/moon/clouds/coronas positions.
 static int vcEyeTag = 0;
 extern "C" int vc_in_stereo_eye(void) { return vcEyeTag; }
+// Multiview one-pass (multiview-plan.md 5.0b/3): the single pass must run under tag 2 --
+// the draw-only guards clear on tag != 1, CalcScreenCoors applies the slice projection
+// on tag != 0. False until Stufe 5.1 registers the multiview FBO.
+extern "C" int vc_multiview_active(void);
 
 static bool    vcGameCamSaved = false;
 static CMatrix vcSavedCamMatrix, vcSavedViewMatrix;
@@ -2243,7 +2247,7 @@ Idle(void *arg)
 					       TheCamera.Cams[TheCamera.ActiveCam].Mode, g_vcStereoApplied, ageMs, dtMs);
 				}
 #endif
-				vcEyeTag = eye + 1;   // mark: CalcScreenCoors calls now belong to this eye
+				vcEyeTag = vc_multiview_active() ? 2 : eye + 1;   // mark: CalcScreenCoors calls now belong to this eye (one-pass: tag 2)
 #ifdef LIBRW_VISIONOS
 				// The game normalizes render state at frame END (DefinedState / effect
 				// teardown), not at frame start. In stereo we render the world TWICE per
