@@ -666,10 +666,22 @@ extern "C" void vc_frame_mark(int id)
 		maxTotal = total; maxSeg = 0.0; maxPhase = "-"; maxCpu = cpuMs;
 		for (int i = 0; i < 7; i++) if (segMs[i] > maxSeg) { maxSeg = segMs[i]; maxPhase = segNm[i]; }
 	}
+	// Window averages for A/B runs (Stufe 6): the sampled "last" frame below is one
+	// frame per 10 s and the PEAK is one outlier; a route comparison needs the mean.
+	static double avgN = 0, avgFrame = 0, avgTotal = 0, avgEyes = 0, avgCpu = 0;
+	{
+		double fp = (double)framePeriod * (double)sNum / (double)sDen / 1.0e6;
+		if (fp > 0.0 && fp < 1000.0) { avgN += 1; avgFrame += fp; avgTotal += total; avgEyes += VC_SEG_MS(1,2); avgCpu += cpuMs; }
+	}
 	static double lastLog = 0.0;
 	double nowS = (double)t[5] * (double)sNum / (double)sDen / 1.0e9;
 	if (nowS - lastLog < 10.0) { (void)total; return; }
 	lastLog = nowS;
+	if (avgN > 0) {
+		printf("[vc-frame] avg10s: n=%.0f fps=%.1f FRAME=%.1f render=%.1f eyes=%.1f cpu=%.1f ms\n",
+		       avgN, 1000.0 * avgN / avgFrame, avgFrame / avgN, avgTotal / avgN, avgEyes / avgN, avgCpu / avgN);
+		avgN = avgFrame = avgTotal = avgEyes = avgCpu = 0;
+	}
 	double fxMs = (double)g_fxAccum * (double)sNum / (double)sDen / 1.0e6;   // 2x RenderEffects
 	#define VC_ACC_MS(i) ((double)g_lgAccum[i] * (double)sNum / (double)sDen / 1.0e6)
 	double lgTotal = VC_ACC_MS(VC_LG_TOTAL), lgStream = VC_ACC_MS(VC_LG_STREAM);

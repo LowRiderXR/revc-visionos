@@ -719,6 +719,12 @@ static bool     g_tqPending[VC_TQ_RING] = { false };
 static int      g_tqWrite = 0, g_tqRead = 0, g_tqActiveSlot = -1;
 static bool     g_tqOpen = false;
 static bool     g_eyeGpuOn = false, g_eyeGpuReady = false, g_eyeGpuChecked = false;
+// VC_EYE_GPU=2: frame GPU time from ANGLE's command-buffer probe (KL_MTL_FRAME_GPU_TIME,
+// multiview-stage5.patch) instead of a GL_TIME_ELAPSED query. Same statistics line,
+// works in the two-pass AND the one-pass render -> the Stufe-6 comparison uses ONE tool.
+typedef int (*PFN_ANGLEMetalPopFrameGpuTimeMs)(double *);
+static PFN_ANGLEMetalPopFrameGpuTimeMs p_ANGLEPopFrameGpu = NULL;
+static int      g_eyeGpuMode = 0;   // 0 off, 1 GL query (whole GL frame), 2 command-buffer probe
 static double   g_egSum = 0, g_egMin = 0, g_egMax = 0, g_egLast = 0, g_egLogT = 0;
 static int      g_egN = 0;
 
@@ -728,7 +734,21 @@ vcrt_eyegpu_ensure(void)
 	if (g_eyeGpuChecked) return;
 	g_eyeGpuChecked = true;
 	const char *e = getenv("VC_EYE_GPU");
-	g_eyeGpuOn = (e && e[0] == '1');
+	g_eyeGpuMode = e ? atoi(e) : 0;
+	if (g_eyeGpuMode == 2) {
+		// Make sure ANGLE's probe is on even if only VC_EYE_GPU=2 was set: the flag is
+		// read lazily at the first glFlush (the first publish), which is after this point.
+		setenv("KL_MTL_FRAME_GPU_TIME", "1", 1);
+		p_ANGLEPopFrameGpu = (PFN_ANGLEMetalPopFrameGpuTimeMs)dlsym(RTLD_DEFAULT, "ANGLEMetalPopFrameGpuTimeMs");
+		if (p_ANGLEPopFrameGpu) {
+			g_eyeGpuReady = true;
+			VCLOG(@"[vc-eyegpu] frame GPU time from ANGLE's command-buffer probe (GPUEndTime-GPUStartTime summed per frame, frame = glFlush at publish; no GL query, valid under multiview)");
+		} else {
+			VCLOG(@"[vc-eyegpu] VC_EYE_GPU=2 but ANGLEMetalPopFrameGpuTimeMs not exported -> old ANGLE build? disabled");
+		}
+		return;
+	}
+	g_eyeGpuOn = (g_eyeGpuMode == 1);
 	if (g_eyeGpuOn && getenv("VC_MULTIVIEW") && getenv("VC_MULTIVIEW")[0] == '1') {
 		// OVR_multiview: a live GL_TIME_ELAPSED query makes every multiview draw
 		// INVALID_OPERATION. Stufe 6 measures via Metal command-buffer GPU times instead.
@@ -756,6 +776,23 @@ static void
 vcrt_eyegpu_poll(void)
 {
 	if (!g_eyeGpuReady) return;
+	if (g_eyeGpuMode == 2) {
+		double ms = 0.0;
+		while (p_ANGLEPopFrameGpu && p_ANGLEPopFrameGpu(&ms)) {
+			if (ms <= 0.0) continue;   // frame without command buffers (menu/park) -> not a sample
+			g_egSum += ms; g_egN++; g_egLast = ms;
+			if (g_egN == 1 || ms < g_egMin) g_egMin = ms;
+			if (ms > g_egMax) g_egMax = ms;
+		}
+		double now2 = vc_now_seconds();
+		if (g_egN > 0 && now2 - g_egLogT >= 1.0) {
+			g_egLogT = now2;
+			VCLOG(@"[vc-eyegpu] frame GPU (cmdbuf): avg=%.1f min=%.1f max=%.1f ms last=%.1f (n=%d)",
+			      g_egSum / g_egN, g_egMin, g_egMax, g_egLast, g_egN);
+			g_egSum = 0; g_egN = 0; g_egMin = 0; g_egMax = 0;
+		}
+		return;
+	}
 	while (g_tqPending[g_tqRead]) {
 		GLuintVC avail = 0;
 		p_glGetQueryObjectuiv(g_tq[g_tqRead], VC_GL_QUERY_RESULT_AVAILABLE, &avail);
@@ -793,6 +830,7 @@ vcrt_eyegpu_begin(void)  // called on the proceed path, before any of the frame'
 {
 	vcrt_eyegpu_ensure();
 	if (!g_eyeGpuReady) return;
+	if (g_eyeGpuMode == 2) { vcrt_eyegpu_poll(); return; }   // probe: nothing to open
 	if (g_tqOpen) vcrt_eyegpu_close();   // stale (a reserved frame never published): balance it
 	vcrt_eyegpu_poll();
 	if (g_tqPending[g_tqWrite]) return;  // ring saturated -> skip timing this frame
