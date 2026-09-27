@@ -2231,6 +2231,10 @@ Idle(void *arg)
 				if (vcStereoAlphaFixOn()) CVisibilityPlugins::SaveAlphaBaseline();
 #endif
 			for (int eye = 0; eye < 2; eye++) {
+				// 5.1 one-pass: the multiview FBO carries both views; eye 0's pass is the
+				// only pass (tag 2 below). vc_multiview_active() flips on inside the FIRST
+				// eye pass (stereo_ensure), so it is checked here, not in the loop head.
+				if (eye == 1 && vc_multiview_active()) break;
 				VC_SCENE(VC_SC_EYESET, vc_stereo_eye_pass(eye); )
 				// Set TheCamera to this eye (CPU sky/coronas/lighting read it). GPU world
 				// path is unchanged (eye pass already uploaded the uniform) -> world identical.

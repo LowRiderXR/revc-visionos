@@ -729,6 +729,12 @@ vcrt_eyegpu_ensure(void)
 	g_eyeGpuChecked = true;
 	const char *e = getenv("VC_EYE_GPU");
 	g_eyeGpuOn = (e && e[0] == '1');
+	if (g_eyeGpuOn && getenv("VC_MULTIVIEW") && getenv("VC_MULTIVIEW")[0] == '1') {
+		// OVR_multiview: a live GL_TIME_ELAPSED query makes every multiview draw
+		// INVALID_OPERATION. Stufe 6 measures via Metal command-buffer GPU times instead.
+		VCLOG(@"[vc-eyegpu] DISABLED under VC_MULTIVIEW=1: an active GL_TIME_ELAPSED query forbids multiview draws (spec) -- GPU time comes from the Metal command-buffer probe in Stufe 6");
+		g_eyeGpuOn = false;
+	}
 	if (!g_eyeGpuOn || !g_eglGetProcAddress) return;
 	p_glGenQueries          = (PFN_glGenQueries)g_eglGetProcAddress("glGenQueries");
 	p_glBeginQuery          = (PFN_glBeginQuery)g_eglGetProcAddress("glBeginQuery");
@@ -1786,12 +1792,10 @@ extern "C" int vc_mv_pair_ok(int i);
 // 5.0b/2: the multiview FBO whose binding (through librw's bindFramebuffer) selects
 // the twin programs. 0 until Stufe 5.1 creates the real one -- so today no draw can
 // ever select a twin, which the per-second use counter below verifies.
-static unsigned int g_mvFbo = 0;
-extern "C" unsigned int vc_multiview_fbo(void) { return g_mvFbo; }
-extern "C" void vc_multiview_fbo_set(unsigned int fbo) { g_mvFbo = fbo; }
-// The one-pass render is active exactly while a multiview FBO is registered
-// (Stufe 5.1). Consumers: eye tag (main.cpp), matrix getters (gl3device.cpp).
-extern "C" int vc_multiview_active(void) { return g_mvFbo != 0; }
+// Definitions live with the stereo buffers below (5.1: the FBO is per ring buffer).
+extern "C" unsigned int vc_multiview_fbo(void);
+extern "C" void vc_multiview_fbo_set(unsigned int fbo);
+extern "C" int vc_multiview_active(void);
 extern "C" void vc_mv_use_counts(unsigned *mono, unsigned *mv, int reset);
 extern "C" int vc_mv_bind_switch_selftest(unsigned int mvFbo);
 
@@ -1807,8 +1811,10 @@ vcrt_mv_use_poll(void)   // once per second, only while pairs exist
 	lastT = now;
 	unsigned mono = 0, mv = 0;
 	vc_mv_use_counts(&mono, &mv, 1);
-	VCLOG(@"[vc-mv] use/s: mono=%u mv=%u mvFbo=%u %s", mono, mv, g_mvFbo,
-	      (g_mvFbo == 0 && mv != 0) ? "<- FAIL: twin selected without a multiview FBO" : "");
+	const unsigned mvFbo = vc_multiview_fbo();
+	VCLOG(@"[vc-mv] use/s: mono=%u mv=%u mvFbo=%u %s", mono, mv, mvFbo,
+	      (mvFbo == 0 && mv != 0) ? "<- FAIL: twin selected without a multiview FBO"
+	      : (mvFbo != 0 && mv == 0) ? "<- FAIL: one-pass active but no twin selected" : "");
 }
 
 extern "C" void
@@ -2403,9 +2409,31 @@ typedef struct {
 	void          *img[2];      // per-slice EGLImage
 	GLuintVC       glTex[2];
 	GLuintVC       fbo[2];
+	// 5.1 one-pass: the SAME arrayTex imported once more WITHOUT the slice attribute
+	// (GL_EXT_EGL_image_array) -> GL_TEXTURE_2D_ARRAY over both slices, attached with
+	// glFramebufferTexture[Multisample]MultiviewOVR. Same Metal object, so the rate map
+	// registered by identity on arrayTex applies unchanged.
+	void          *imgArr;
+	GLuintVC       glTexArr;
+	GLuintVC       mvFbo;
 } VCStereoBuffer;
 
 static VCStereoBuffer g_stereoBuf[VC_NUM_BUFFERS];
+static bool     g_mvReady = false;        // 5.1: multiview FBOs built, eye loop runs once
+static GLuintVC g_mvDepthTex = 0;         // D24S8 array (2 layers), shared by all ring buffers
+static unsigned g_mvFboOverride = 0;      // self-test hook (vc_multiview_fbo_set)
+
+// The multiview FBO whose binding selects the twin programs: the CURRENT ring buffer's,
+// so it follows vcrt_begin_frame's choice like vc_stereo_eye_fbo does.
+extern "C" unsigned int vc_multiview_fbo(void)
+{
+	if (g_mvFboOverride) return g_mvFboOverride;
+	return g_mvReady ? g_stereoBuf[g_currentBack].mvFbo : 0;
+}
+extern "C" void vc_multiview_fbo_set(unsigned int fbo) { g_mvFboOverride = fbo; }
+// One-pass render active: eye tag 2 (main.cpp), centre-view getters (gl3device.cpp),
+// eye loop runs once.
+extern "C" int vc_multiview_active(void) { return (g_mvReady || g_mvFboOverride != 0) ? 1 : 0; }
 // VC_STEREO_DEPTH_SPLIT (default 1): one depth renderbuffer PER EYE instead of one
 // shared by every eye FBO of every ring buffer.
 // WHY, measured: with VC_MSAA=0 the per-eye split of the boundary timers showed
@@ -2472,6 +2500,7 @@ static int vcMsaaSamples(void);   // forward: foveation registration depends on 
 // So it is a REAL implicit resolve, not an emulated blit -- the 228 MB and the blit both
 // go away. VC_MSAA_IMPLICIT=0 falls back to the explicit path for the A/B.
 static int vcMsaaImplicit(void);
+static int vcMultiviewRequested(void);   // forward: 5.1 one-pass allocation reads it
 static bool g_msaaImplicitActive = false;   // set only once the FBO is verified COMPLETE
 static bool g_msaaImplicitFailed = false;   // set if any slice rejected it -> explicit path
 static id<MTLRasterizationRateMap> g_foveMap = nil;
@@ -2496,8 +2525,12 @@ vcFoveateOn(void)
 static id<MTLRasterizationRateMap>
 vcrt_build_fove_map(int W, int H)
 {
-	if (![g_mtlDevice supportsRasterizationRateMapWithLayerCount:1]) {
-		VCLOG(@"[vc-fove] device has no rasterization rate map support -> disabled");
+	// 5.1: the one-pass render needs a TWO-layer map (one per view). Same layer
+	// descriptor twice -> identical V curves, so the shared-V rule (Stufe 1) holds by
+	// construction and the display unwarp can keep decoding layer 0 for both eyes.
+	const int layers = g_mvReady ? 2 : 1;
+	if (![g_mtlDevice supportsRasterizationRateMapWithLayerCount:layers]) {
+		VCLOG(@"[vc-fove] device has no rasterization rate map support for %d layer(s) -> disabled", layers);
 		return nil;
 	}
 	float hq[64], vq[64];
@@ -2535,7 +2568,7 @@ vcrt_build_fove_map(int W, int H)
 		VCLOG(@"[vc-fove] build step 2: map descriptor (screen=%dx%d)", W, H);
 		MTLRasterizationRateMapDescriptor *desc = [[MTLRasterizationRateMapDescriptor alloc] init];
 		desc.screenSize = MTLSizeMake(W, H, 0);
-		[desc setLayer:layer atIndex:0];
+		for (int l = 0; l < layers; l++) [desc setLayer:layer atIndex:l];
 		VCLOG(@"[vc-fove] build step 3: newRasterizationRateMapWithDescriptor");
 		map = [g_mtlDevice newRasterizationRateMapWithDescriptor:desc];
 	} @catch (NSException *ex) {
@@ -2545,9 +2578,10 @@ vcrt_build_fove_map(int W, int H)
 	}
 	if (map) {
 		MTLSize ph = [map physicalSizeForLayer:0];
-		VCLOG(@"[vc-fove] rate map built: screen=%dx%d physical=%dx%d (~%.0f%% of fragments)",
-		      W, H, (int)ph.width, (int)ph.height,
-		      100.0 * (double)ph.width * (double)ph.height / ((double)W * (double)H));
+		VCLOG(@"[vc-fove] rate map built: layers=%d screen=%dx%d physical=%dx%d (~%.0f%% of fragments)%s",
+		      layers, W, H, (int)ph.width, (int)ph.height,
+		      100.0 * (double)ph.width * (double)ph.height / ((double)W * (double)H),
+		      layers == 2 ? ([map physicalSizeForLayer:1].height == ph.height ? " layer1 same height (shared V OK)" : " *** layer1 height differs ***") : "");
 	} else {
 		VCLOG(@"[vc-fove] newRasterizationRateMapWithDescriptor returned nil -> foveation off");
 	}
@@ -2644,6 +2678,89 @@ vc_set_foveation_curve(const float *h, int nx, const float *v, int ny)
 	g_foveCurveSet = true; g_foveCurveDirty = true;
 	pthread_mutex_unlock(&g_bufMutex);
 	VCLOG(@"[vc-fove] curve received from Swift: %d x %d zones", nx, ny);
+}
+
+// 5.1 one-pass stereo (multiview-plan.md): one multiview FBO per ring buffer over the
+// compositor array texture. Colour = the array imported as GL_TEXTURE_2D_ARRAY (no
+// slice attribute; GL_EXT_EGL_image_array, 5.0a), depth/stencil = a D24S8 array
+// texture, both attached for 2 views with the implicit-MSAA multiview attach (memoryless
+// samples, resolve as store action). Requires VC_MULTIVIEW=1, the advertised extension
+// (KL_GL_MULTIVIEW=1) and, with MSAA, the implicit path. Any failure leaves g_mvReady
+// false and the two-pass path in place -- loudly.
+extern "C" int vc_mv_pairs_mode(void);
+static void
+vcrt_multiview_alloc(int W, int H)
+{
+	g_mvReady = false;
+	if (!vcMultiviewRequested()) return;
+	if (vc_mv_pairs_mode() != 1) {
+		VCLOG(@"[vc-mv] one-pass OFF: GL_OVR_multiview2 not advertised (set KL_GL_MULTIVIEW=1) -> two eye passes");
+		return;
+	}
+	const int samples = vcMsaaSamples();
+	if (samples > 0 && !g_msaaImplicitActive) {
+		VCLOG(@"[vc-mv] one-pass OFF: MSAA %dx requested but the implicit path is not active -> two eye passes", samples);
+		return;
+	}
+	typedef const unsigned char *(*F_GetString)(GLenumVC);
+	typedef void (*F_FBTexMsMv)(GLenumVC, GLenumVC, GLuintVC, GLintVC, GLsizeiVC, GLintVC, GLsizeiVC);
+	typedef void (*F_FBTexMv)(GLenumVC, GLenumVC, GLuintVC, GLintVC, GLintVC, GLsizeiVC);
+	typedef void (*F_TexStorage3D)(GLenumVC, GLsizeiVC, GLenumVC, GLsizeiVC, GLsizeiVC, GLsizeiVC);
+	F_GetString fGetString = (F_GetString)g_eglGetProcAddress("glGetString");
+	F_FBTexMsMv fMsMv = (F_FBTexMsMv)g_eglGetProcAddress("glFramebufferTextureMultisampleMultiviewOVR");
+	F_FBTexMv fMv = (F_FBTexMv)g_eglGetProcAddress("glFramebufferTextureMultiviewOVR");
+	F_TexStorage3D fTexStorage3D = (F_TexStorage3D)g_eglGetProcAddress("glTexStorage3D");
+	const char *exts = fGetString ? (const char *)fGetString(0x1F03) : NULL;
+	if (!exts || !strstr(exts, "GL_EXT_EGL_image_array") || !fMv || (samples > 0 && !fMsMv) || !fTexStorage3D) {
+		VCLOG(@"[vc-mv] one-pass OFF: missing GL_EXT_EGL_image_array or multiview attach entry points (imageArray=%d mv=%p msmv=%p texStorage3D=%p) -> two eye passes",
+		      (exts && strstr(exts, "GL_EXT_EGL_image_array")) ? 1 : 0, (void *)fMv, (void *)fMsMv, (void *)fTexStorage3D);
+		return;
+	}
+	(void)p_glGetError();
+
+	// Depth/stencil array, one for all ring buffers (transient per pass; memoryless with MSAA).
+	p_glGenTextures(1, &g_mvDepthTex);
+	p_glBindTexture(0x8C1A /* GL_TEXTURE_2D_ARRAY */, g_mvDepthTex);
+	fTexStorage3D(0x8C1A, 1, 0x88F0 /* GL_DEPTH24_STENCIL8 */, W, H, 2);
+	GLenumVC depthErr = p_glGetError();
+
+	bool ok = depthErr == 0;
+	for (int i = 0; ok && i < g_numBuffers; i++) {
+		VCStereoBuffer *b = &g_stereoBuf[i];
+		const EGLint noAttr[] = { (EGLint)VC_EGL_NONE };
+		b->imgArr = p_eglCreateImageKHR(g_display, (EGLContext)0, VC_EGL_METAL_TEXTURE_ANGLE,
+		                                VC_OBJ_TO_VOID(b->arrayTex), noAttr);
+		if (!b->imgArr) {
+			VCLOG(@"[vc-mv] buffer %d FAIL: eglCreateImageKHR (array, no slice attr) egl=0x%x", i, g_eglGetError ? g_eglGetError() : 0);
+			ok = false; break;
+		}
+		p_glGenTextures(1, &b->glTexArr);
+		p_glBindTexture(0x8C1A, b->glTexArr);
+		p_glEGLImageTargetTexture2DOES(0x8C1A, b->imgArr);
+		GLenumVC importErr = p_glGetError();
+		p_glGenFramebuffers(1, &b->mvFbo);
+		p_glBindFramebuffer(VC_GL_FRAMEBUFFER, b->mvFbo);
+		if (samples > 0) {
+			fMsMv(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0, b->glTexArr, 0, samples, 0, 2);
+			fMsMv(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, g_mvDepthTex, 0, samples, 0, 2);
+		} else {
+			fMv(VC_GL_FRAMEBUFFER, VC_GL_COLOR_ATTACHMENT0, b->glTexArr, 0, 0, 2);
+			fMv(VC_GL_FRAMEBUFFER, VC_GL_DEPTH_STENCIL_ATTACHMENT, g_mvDepthTex, 0, 0, 2);
+		}
+		GLenumVC attachErr = p_glGetError();
+		GLenumVC status = p_glCheckFramebufferStatus(VC_GL_FRAMEBUFFER);
+		VCLOG(@"[vc-mv] buffer %d: array import err=0x%x, multiview fbo %u (2 views, %dx MSAA implicit, D24S8 array) attachErr=0x%x status=%s",
+		      i, (unsigned)importErr, b->mvFbo, samples, (unsigned)attachErr, vcrt_fbo_status_name(status));
+		if (importErr || attachErr || status != VC_GL_FRAMEBUFFER_COMPLETE) ok = false;
+	}
+	p_glBindFramebuffer(VC_GL_FRAMEBUFFER, 0);
+	if (!ok) {
+		VCLOG(@"[vc-mv] one-pass OFF: multiview FBO setup failed (depthErr=0x%x) -> two eye passes (see lines above)", (unsigned)depthErr);
+		return;
+	}
+	g_mvReady = true;
+	VCLOG(@"[vc-mv] ONE-PASS ACTIVE: %d multiview FBOs over the compositor arrays (%dx%d, colour imported as GL_TEXTURE_2D_ARRAY, D24S8 array depth, %dx MSAA implicit, 2 views) -- eye loop runs ONCE under tag 2, twins via bind, rate map 2 layers by identity",
+	      g_numBuffers, W, H, samples);
 }
 
 // Lazily create BOTH stereo back buffers. Called from the game thread (GL context
@@ -2769,6 +2886,7 @@ vcrt_stereo_ensure(void)
 		      ? "IMPLICIT (EXT_multisampled_render_to_texture: memoryless tile-memory samples, resolve as store action -- no separate MSAA FBO, no resolve blit)"
 		      : "EXPLICIT (own multisample FBO + glBlitFramebuffer resolve per eye)");
 	vcrt_log_gl_extensions();   // multiview support -- decides whether the one-pass plan exists at all
+	vcrt_multiview_alloc(W, H); // 5.1: one-pass FBOs over the arrays (sets g_mvReady; BEFORE the rate map, which needs the layer count)
 	VCLOG(@"[vc-stereo] array render target ready (%d buffers x 2 slices, %dx%d, %d dedicated depth rbo%s -- VC_STEREO_DEPTH_SPLIT=%d: %s)",
 	      g_numBuffers, W, H, nDepth, nDepth == 1 ? "" : "s", vcStereoDepthSplit(),
 	      vcStereoDepthSplit() ? "one per eye -- no write-after-write between the eye passes"
@@ -3005,6 +3123,8 @@ extern "C" unsigned int
 vc_stereo_eye_fbo(int eye)
 {
 	if (!(g_stereoReady && (eye == 0 || eye == 1))) return 0;
+	// 5.1 one-pass: ONE multiview FBO over both slices; the eye loop calls this once.
+	if (g_mvReady) return g_stereoBuf[g_currentBack].mvFbo;
 	int slot = eye;
 	// Implicit MSAA: the slice FBO IS the multisample render target, and Metal resolves
 	// into the slice when the pass ends. No shared target, no pending resolve, and -- the
