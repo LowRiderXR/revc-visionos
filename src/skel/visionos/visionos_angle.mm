@@ -1850,9 +1850,13 @@ vcrt_mv_use_poll(void)   // once per second, only while pairs exist
 	unsigned mono = 0, mv = 0;
 	vc_mv_use_counts(&mono, &mv, 1);
 	const unsigned mvFbo = vc_multiview_fbo();
-	VCLOG(@"[vc-mv] use/s: mono=%u mv=%u mvFbo=%u %s", mono, mv, mvFbo,
+	// "no twin although one-pass active" is only a failure if a world pass actually ran
+	// this second (menu/loading frames have no world pass -> mv=0 is correct there).
+	extern unsigned g_mvEyePasses_ref(void);
+	const unsigned passes = g_mvEyePasses_ref();
+	VCLOG(@"[vc-mv] use/s: mono=%u mv=%u mvFbo=%u worldPasses=%u %s", mono, mv, mvFbo, passes,
 	      (mvFbo == 0 && mv != 0) ? "<- FAIL: twin selected without a multiview FBO"
-	      : (mvFbo != 0 && mv == 0) ? "<- FAIL: one-pass active but no twin selected" : "");
+	      : (mvFbo != 0 && passes > 0 && mv == 0) ? "<- FAIL: one-pass world pass ran but no twin selected" : "");
 }
 
 extern "C" void
@@ -2458,9 +2462,11 @@ typedef struct {
 
 static VCStereoBuffer g_stereoBuf[VC_NUM_BUFFERS];
 static bool     g_mvReady = false;        // 5.1: multiview FBOs built, eye loop runs once
+static unsigned g_mvEyePasses = 0;        // one-pass world passes since the last use/s line (FAIL heuristic needs it)
 static GLuintVC g_mvDepthTex = 0;         // D24S8 array (2 layers), shared by all ring buffers
 static unsigned g_mvFboOverride = 0;      // self-test hook (vc_multiview_fbo_set)
 
+unsigned g_mvEyePasses_ref(void) { unsigned n = g_mvEyePasses; g_mvEyePasses = 0; return n; }
 // The multiview FBO whose binding selects the twin programs: the CURRENT ring buffer's,
 // so it follows vcrt_begin_frame's choice like vc_stereo_eye_fbo does.
 extern "C" unsigned int vc_multiview_fbo(void)
@@ -3162,7 +3168,7 @@ vc_stereo_eye_fbo(int eye)
 {
 	if (!(g_stereoReady && (eye == 0 || eye == 1))) return 0;
 	// 5.1 one-pass: ONE multiview FBO over both slices; the eye loop calls this once.
-	if (g_mvReady) return g_stereoBuf[g_currentBack].mvFbo;
+	if (g_mvReady) { g_mvEyePasses++; return g_stereoBuf[g_currentBack].mvFbo; }
 	int slot = eye;
 	// Implicit MSAA: the slice FBO IS the multisample render target, and Metal resolves
 	// into the slice when the pass ends. No shared target, no pending resolve, and -- the
