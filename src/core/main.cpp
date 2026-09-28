@@ -1,4 +1,9 @@
 #include "common.h"
+#ifndef LIBRW_VISIONOS
+// The RenderScene stage brackets are a visionOS profiling aid; on the macOS reference
+// build they must compile to the bare code (found by the reference build 2026-09-28).
+#define VC_SCENE(slot, code) do { code } while(0);   // trailing ';' like the visionOS definition (call sites have none)
+#endif
 #include <time.h>
 #include "rpmatfx.h"
 #include "rphanim.h"
