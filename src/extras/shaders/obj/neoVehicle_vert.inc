@@ -48,6 +48,6 @@ const char *neoVehicle_vert_src =
 "	for(int i = 0; i < 5; i++)\n"
 "		v_reflcolor.rgb += DoDirLightSpec(u_specDir[i].xyz, u_specColor[i].rgb, Normal, viewVec, u_specDir[i].w)*specularity*lightStrength;\n"
 
-"	v_fog = DoFog(gl_Position.w);\n"
+"	v_fog = DoFogV(u_view * Vertex, gl_Position.w);\n"
 "}\n"
 ;

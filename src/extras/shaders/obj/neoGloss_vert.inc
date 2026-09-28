@@ -22,6 +22,6 @@ const char *neoGloss_vert_src =
 "	v_normal = 0.5*(1.0 + vec3(0.0, 0.0, 1.0));    // compress\n"
 "	v_light  = 0.5*(1.0 + Light);                  //\n"
 
-"	v_fog = DoFog(gl_Position.w);\n"
+"	v_fog = DoFogV(u_view * Vertex, gl_Position.w);\n"
 "}\n"
 ;

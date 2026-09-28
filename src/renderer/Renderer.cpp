@@ -1,5 +1,8 @@
 #define WITHD3D
 #include "common.h"
+#ifdef LIBRW_VISIONOS
+#include "Timecycle.h"   // VC_LOD_LOG diagnostic
+#endif
 
 #include "main.h"
 #include "Lights.h"
@@ -67,6 +70,70 @@ CVUVECTOR CRenderer::ms_vecCameraPosition;
 CVehicle *CRenderer::m_pFirstPersonVehicle;
 bool CRenderer::m_loadingPriority;
 float CRenderer::ms_lodDistScale = 1.2f;
+#ifdef LIBRW_VISIONOS
+// VC_LOD_FADE=0 (diagnostic, multiview-plan.md 5.5): draw entities in the LOD fade zone
+// fully opaque instead of alpha-fading them in. If the far-building "silhouettes" in
+// rain turn solid with this, they are the stock distance fade seen against a
+// low-contrast sky, not a sky/horizon colour problem.
+static inline bool vcLodFadeOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_LOD_FADE"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0;
+}
+// VC_DIAG_NOBIG=1 (diagnostic): draw NO big buildings (the LOD models). If the far-building
+// silhouettes in rain vanish, they are LOD models -- then the question is why those come
+// out dark (fog / lighting / texture), not the sky. The stock gbDontRenderBigBuildings
+// flag is compiled out under FINAL, hence this switch at the visibility source, which
+// covers every render path (list, fading, new renderer).
+static inline bool vcDiagNoBig(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_DIAG_NOBIG"); e = (s && s[0] == '1') ? 1 : 0; }
+	return e != 0;
+}
+// VC_LOD_LOG=1: once per second, the visible LOD models (big buildings) of the last frame
+// against the fog range -- where do the silhouettes sit? Inside fogStart..farClip they
+// are only partially fogged (dark night LOD + partial fog = dark silhouette, as designed
+// by the engine); beyond farClip they could not be drawn at all; a LOD reported near
+// farClip that still looks darker than the fog means fog is NOT reaching it.
+static inline bool vcLodLogOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_LOD_LOG"); e = (s && s[0] == '1') ? 1 : 0; }
+	return e != 0;
+}
+static int   vcLodVis = 0;
+static unsigned vcVisOverflow = 0;   // entities dropped because ms_aVisibleEntityPtrs was full
+static float vcLodNear = 1e9f, vcLodFar = 0.0f;
+extern "C" unsigned vc_alpha_insert_fail_pop(void);
+extern "C" unsigned vc_alpha_entity_count(void);
+extern "C" unsigned vc_alpha_entity_cap(void);
+static char  vcLodFarName[32] = "";
+static void vcLodNote(CEntity *ent, float dist)
+{
+	vcLodVis++;
+	if(dist < vcLodNear) vcLodNear = dist;
+	if(dist > vcLodFar){ vcLodFar = dist; strncpy(vcLodFarName, CModelInfo::GetModelInfo(ent->m_modelIndex)->GetModelName(), 31); vcLodFarName[31] = 0; }
+}
+extern "C" void vc_lod_log_frame(int visEnt)
+{
+	if(!vcLodLogOn()) return;
+	static uint32 lastMs = 0;
+	uint32 now = CTimer::GetTimeInMilliseconds();
+	if(now - lastMs >= 1000){
+		lastMs = now;
+		printf("[vc-lod] visible LODs=%d nearest=%.0fm farthest=%.0fm (%s) | fogStart=%.0f farClip(fog end)=%.0f lodScale=%.2f | visEnt=%d/%d overflow=%u alphaList=%u/%u insertFail=%u\n",
+		       vcLodVis, vcLodVis ? vcLodNear : 0.0f, vcLodFar, vcLodFarName,
+		       CTimeCycle::GetFogStart(), CTimeCycle::GetFarClip(), CRenderer::ms_lodDistScale,
+		       visEnt, (int)NUMVISIBLEENTITIES, vcVisOverflow,
+		       vc_alpha_entity_count(), vc_alpha_entity_cap(), vc_alpha_insert_fail_pop());
+		vcVisOverflow = 0;
+	}
+	vcLodVis = 0; vcLodNear = 1e9f; vcLodFar = 0.0f;
+}
+#endif
+
 
 // unused
 BlockedRange CRenderer::aBlockedRanges[16];
@@ -426,6 +493,9 @@ CRenderer::RenderOneBuilding(CEntity *ent, float camdist)
 		if(fadefactor > 1.0f)
 			fadefactor = 1.0f;
 		alpha = mi->m_alpha * fadefactor;
+#ifdef LIBRW_VISIONOS
+		if(!vcLodFadeOn()) alpha = 255;   // VC_LOD_FADE=0: no distance fade AND no stream-in fade
+#endif
 
 		if(alpha == 255)
 			WorldRender::AtomicFirstPass(atomic, pass);
@@ -843,6 +913,20 @@ CRenderer::SetupBigBuildingVisibility(CEntity *ent)
 
 	if(!IsAreaVisible(ent->m_area))
 		return VIS_INVISIBLE;
+#ifdef LIBRW_VISIONOS
+	if(vcDiagNoBig())
+		return VIS_INVISIBLE;
+	// Radial far cull (VC_LOD_RADIAL_CULL=0 disables): the GPU far plane is planar, so at the
+	// edge of a ~110 deg view it reaches farClip/cos(55) ~ 1.7x farther than straight ahead.
+	// Big buildings between farClip and that reach were invisible when looked at and popped
+	// in when the head turned. Cull by DISTANCE so what is visible does not depend on gaze.
+	{
+		static int radialCull = -1;
+		if(radialCull < 0){ const char *s = getenv("VC_LOD_RADIAL_CULL"); radialCull = (s && s[0] == '0') ? 0 : 1; }
+		if(radialCull && (ms_vecCameraPosition - ent->GetPosition()).Magnitude() > CTimeCycle::GetFarClip())
+			return VIS_INVISIBLE;
+	}
+#endif
 
 	bool request = true;
 	if(mi->GetModelType() == MITYPE_TIME){
@@ -915,6 +999,9 @@ CRenderer::SetupBigBuildingVisibility(CEntity *ent)
 			ent->bDistanceFade = false;
 			return VIS_INVISIBLE;
 		}
+#ifdef LIBRW_VISIONOS
+		vcLodNote(ent, dist);
+#endif
 		return VIS_VISIBLE;
 	}
 
@@ -969,6 +1056,9 @@ CRenderer::ConstructRenderList(void)
 	// removes the false culls; the modest extra draw cost is the correct trade for VR
 	// peripheral vision. VC_CULL_HEADPOSE=0 (default) keeps stock occlusion behaviour.
 	if(vc_cull_applied()) COcclusion::NumActiveOccluders = 0;
+#endif
+#ifdef LIBRW_VISIONOS
+	vc_lod_log_frame(ms_nNoOfVisibleEntities);   // VC_LOD_LOG=1: report LAST frame's LOD set + list occupancy, reset counters
 #endif
 #ifdef NEW_RENDERER
 	if(!gbNewRenderer)
@@ -1463,7 +1553,12 @@ CRenderer::InsertEntityIntoList(CEntity *ent)
 		ms_aVisibleBuildingPtrs[ms_nNoOfVisibleBuildings++] = ent;
 	else
 #endif
+	{
+#ifdef LIBRW_VISIONOS
+		if(ms_nNoOfVisibleEntities >= NUMVISIBLEENTITIES){ vcVisOverflow++; return; }
+#endif
 		ms_aVisibleEntityPtrs[ms_nNoOfVisibleEntities++] = ent;
+	}
 }
 
 void

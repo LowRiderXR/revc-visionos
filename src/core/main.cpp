@@ -310,12 +310,27 @@ static void vcStereoSplashFadeInCheck(void)
 #endif
 
 // This is certainly a very useful function
+#ifdef LIBRW_VISIONOS
+static void vcStereoRenderHorizonBand(void);
+static bool vcHorizonBandOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_HORIZON_BAND"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0;
+}
+#endif
 void
 DoRWRenderHorizon(void)
 {
 #ifdef LIBRW_VISIONOS
-	if(vcStereoSkyOn())   // skip the head-locking 2D horizon band in stereo
+	if(vcStereoSkyOn()){
+		// The 2D band is head-locked, so it was skipped -- which left far, fully fogged
+		// geometry standing in FOG colour against the dark cloud sprites (the "beige
+		// overlay" on distant buildings in rain). The original hides it behind this band
+		// (fog colour at the horizon, drawn AFTER the clouds). Same band, world-anchored.
+		if(vcHorizonBandOn()) vcStereoRenderHorizonBand();
 		return;
+	}
 #endif
 	CClouds::RenderHorizon();
 }
@@ -1524,6 +1539,195 @@ static bool vcStereoCameraOn(void)
 // reads this to apply the per-eye slice projection to sun/moon/clouds/coronas positions.
 static int vcEyeTag = 0;
 extern "C" int vc_in_stereo_eye(void) { return vcEyeTag; }
+
+// --- 5.5 Familie Himmel: world-anchored sky dome (multiview-plan.md) -------------------
+// The original paints the sky in SCREEN space (CClouds::RenderBackground/RenderHorizon):
+// a gradient from the horizon line (sky-bottom colour) up half a screen (sky-top colour),
+// a thin "fog" strip ((top + 2*bottom)/3) just below the horizon, then a blend to the
+// ground colour (ambient*128). In stereo that band is head-locked, so it was skipped and
+// the eye slices were cleared to ONE mid colour -- which is why far buildings fading to
+// the fog colour stood as silhouettes in rain (mid colour != horizon colour). This dome
+// reproduces the original bands by ELEVATION ANGLE, centred on the camera, radius just
+// inside the far clip, depth test off, before the world: sky-top at the zenith, the
+// gradient over the first VC_SKY_GRAD_DEG degrees above the horizon, fog strip and
+// ground colour below. Drawn through RwIm3D, so in the one-pass render the im3d twin puts
+// it in both views with the right per-eye matrices (parallax ~0 at that radius).
+// VC_SKY_DOME=1 enables it. Default OFF (2026-09-28): first device run in rain showed
+// light-grey rectangles in the sky that follow the head, and the far-building
+// silhouettes did not improve -- the dome failed its own criteria; kept for the A/B
+// (VC_SKY_DOME=1) until the cause is understood (candidates: fog on the dome vertices
+// despite FOGENABLE=FALSE -- w-dependent, would rotate with the view --, or the cloud
+// sprites becoming visible against the darker graded sky).
+static bool vcSkyDomeOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_SKY_DOME"); e = (s && s[0] == '1') ? 1 : 0; }
+	return e != 0;
+}
+// 5.5 Horizontstreifen: the world-anchored counterpart of CClouds::RenderHorizon, drawn at
+// the same point of the frame (after the clouds, before the world). Fog colour at the
+// horizon (that is what distant geometry fogs to, so it vanishes into the band), soft top
+// edge, blend to the ground colour below, ground colour down to the nadir. Depth test off,
+// fog off, radius just inside the far clip. VC_HORIZON_BAND=0 disables (old skip).
+static void vcStereoRenderHorizonBand(void)
+{
+	enum { AZ = 32, NR = 6 };
+	// elevation (deg) and alpha per ring; colours: F = fog colour, G = ground colour
+	const float elev[NR]  = {  1.5f,  0.0f, -0.6f, -6.0f, -25.0f, -90.0f };
+	const float alpha[NR] = {  0.0f, 255.0f, 255.0f, 255.0f, 255.0f, 255.0f };
+	static RwIm3DVertex verts[NR * AZ];
+	static RwImVertexIndex idx[(NR - 1) * AZ * 6];
+	static bool idxInit = false;
+	if(!idxInit){
+		idxInit = true;
+		int n = 0;
+		for(int r = 0; r < NR - 1; r++)
+			for(int a = 0; a < AZ; a++){
+				int a1 = (a + 1) % AZ;
+				int i00 = r * AZ + a, i01 = r * AZ + a1, i10 = (r + 1) * AZ + a, i11 = (r + 1) * AZ + a1;
+				idx[n++] = i00; idx[n++] = i10; idx[n++] = i01;
+				idx[n++] = i01; idx[n++] = i10; idx[n++] = i11;
+			}
+	}
+	const float fr = CTimeCycle::GetFogRed(), fg = CTimeCycle::GetFogGreen(), fb = CTimeCycle::GetFogBlue();
+	const float gr = 128.0f * CTimeCycle::GetAmbientRed(), gg = 128.0f * CTimeCycle::GetAmbientGreen(), gb = 128.0f * CTimeCycle::GetAmbientBlue();
+	float R = CTimeCycle::GetFarClip() * 0.9f;
+	if(R < 50.0f) R = 50.0f;
+	const CVector c = TheCamera.GetPosition();
+	for(int r = 0; r < NR; r++){
+		float e = elev[r], cr, cg, cb;
+		if(e >= -0.6f){ cr = fr; cg = fg; cb = fb; }
+		else if(e >= -6.0f){ float t = (-0.6f - e) / 5.4f; cr = fr + (gr - fr) * t; cg = fg + (gg - fg) * t; cb = fb + (gb - fb) * t; }
+		else { cr = gr; cg = gg; cb = gb; }
+		uint8 ur = (uint8)Clamp(cr, 0.0f, 255.0f), ug = (uint8)Clamp(cg, 0.0f, 255.0f), ub = (uint8)Clamp(cb, 0.0f, 255.0f);
+		uint8 ua = (uint8)alpha[r];
+		float el = DEGTORAD(e), ce = Cos(el), se = Sin(el);
+		for(int a = 0; a < AZ; a++){
+			float az = (float)a / (float)AZ * TWOPI;
+			RwIm3DVertex *v = &verts[r * AZ + a];
+			RwIm3DVertexSetPos(v, c.x + Cos(az) * ce * R, c.y + Sin(az) * ce * R, c.z + se * R);
+			RwIm3DVertexSetRGBA(v, ur, ug, ub, ua);
+		}
+	}
+	void *zw, *zt, *fog, *va, *cull, *src, *dst;
+	RwRenderStateGet(rwRENDERSTATEZWRITEENABLE, &zw);
+	RwRenderStateGet(rwRENDERSTATEZTESTENABLE, &zt);
+	RwRenderStateGet(rwRENDERSTATEFOGENABLE, &fog);
+	RwRenderStateGet(rwRENDERSTATEVERTEXALPHAENABLE, &va);
+	RwRenderStateGet(rwRENDERSTATECULLMODE, &cull);
+	RwRenderStateGet(rwRENDERSTATESRCBLEND, &src);
+	RwRenderStateGet(rwRENDERSTATEDESTBLEND, &dst);
+	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
+	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
+	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
+	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, nil);
+	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+	if(RwIm3DTransform(verts, NR * AZ, nil, rwIM3D_VERTEXXYZ|rwIM3D_VERTEXRGBA)){
+		RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST, idx, (NR - 1) * AZ * 6);
+		RwIm3DEnd();
+	}
+	RwRenderStateSet(rwRENDERSTATECULLMODE, cull);
+	RwRenderStateSet(rwRENDERSTATESRCBLEND, src);
+	RwRenderStateSet(rwRENDERSTATEDESTBLEND, dst);
+	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, va);
+	RwRenderStateSet(rwRENDERSTATEFOGENABLE, fog);
+	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, zt);
+	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, zw);
+	// VC_LOD_LOG=1: the colours behind all this, once per second.
+	{
+		static uint32 lastMs = 0;
+		static int logOn = -1;
+		if(logOn < 0){ const char *s = getenv("VC_LOD_LOG"); logOn = (s && s[0] == '1') ? 1 : 0; }
+		uint32 now = CTimer::GetTimeInMilliseconds();
+		if(logOn && now - lastMs >= 1000){
+			lastMs = now;
+			printf("[vc-sky] fog=(%d,%d,%d) skyTop=(%d,%d,%d) skyBottom=(%d,%d,%d) ground=(%.0f,%.0f,%.0f) coverage=%.2f fogginess=%.2f farClip=%.0f band R=%.0f\n",
+			       (int)fr, (int)fg, (int)fb, CTimeCycle::GetSkyTopRed(), CTimeCycle::GetSkyTopGreen(), CTimeCycle::GetSkyTopBlue(),
+			       CTimeCycle::GetSkyBottomRed(), CTimeCycle::GetSkyBottomGreen(), CTimeCycle::GetSkyBottomBlue(),
+			       gr, gg, gb, CWeather::CloudCoverage, CWeather::Foggyness, CTimeCycle::GetFarClip(), R);
+		}
+	}
+}
+
+static void vcStereoRenderSkyDome(void)
+{
+	enum { AZ = 32, NR = 10 };
+	static float gradDeg = -1.0f;
+	if(gradDeg < 0.0f){ const char *s = getenv("VC_SKY_GRAD_DEG"); gradDeg = s ? (float)atof(s) : 25.0f;
+	                    if(gradDeg < 5.0f) gradDeg = 5.0f; if(gradDeg > 80.0f) gradDeg = 80.0f; }
+	const float elev[NR] = { 90.0f, 60.0f, gradDeg, gradDeg * 0.5f, gradDeg * 0.2f, 0.0f, -0.6f, -6.0f, -25.0f, -90.0f };
+
+	static RwIm3DVertex verts[NR * AZ];
+	static RwImVertexIndex idx[(NR - 1) * AZ * 6];
+	static bool idxInit = false;
+	if(!idxInit){
+		idxInit = true;
+		int n = 0;
+		for(int r = 0; r < NR - 1; r++)
+			for(int a = 0; a < AZ; a++){
+				int a1 = (a + 1) % AZ;
+				int i00 = r * AZ + a, i01 = r * AZ + a1, i10 = (r + 1) * AZ + a, i11 = (r + 1) * AZ + a1;
+				idx[n++] = i00; idx[n++] = i10; idx[n++] = i01;
+				idx[n++] = i01; idx[n++] = i10; idx[n++] = i11;
+			}
+	}
+
+	const float tr = CTimeCycle::GetSkyTopRed(),    tg = CTimeCycle::GetSkyTopGreen(),    tb = CTimeCycle::GetSkyTopBlue();
+	const float br = CTimeCycle::GetSkyBottomRed(), bg = CTimeCycle::GetSkyBottomGreen(), bb = CTimeCycle::GetSkyBottomBlue();
+	const float fr = (tr + 2.0f * br) / 3.0f, fg = (tg + 2.0f * bg) / 3.0f, fb = (tb + 2.0f * bb) / 3.0f;   // horizon "fog" strip, as the original
+	const float gr = 128.0f * CTimeCycle::GetAmbientRed(), gg = 128.0f * CTimeCycle::GetAmbientGreen(), gb = 128.0f * CTimeCycle::GetAmbientBlue();
+	auto ringColour = [&](float e, float *r, float *g, float *b) {
+		if(e >= gradDeg){ *r = tr; *g = tg; *b = tb; return; }
+		if(e >= 0.0f){ float t = e / gradDeg; *r = br + (tr - br) * t; *g = bg + (tg - bg) * t; *b = bb + (tb - bb) * t; return; }
+		if(e >= -0.6f){ *r = fr; *g = fg; *b = fb; return; }
+		if(e >= -6.0f){ float t = (-0.6f - e) / 5.4f; *r = fr + (gr - fr) * t; *g = fg + (gg - fg) * t; *b = fb + (gb - fb) * t; return; }
+		*r = gr; *g = gg; *b = gb;
+	};
+
+	float R = CTimeCycle::GetFarClip() * 0.9f;
+	if(R < 50.0f) R = 50.0f;
+	const CVector c = TheCamera.GetPosition();
+	for(int r = 0; r < NR; r++){
+		float cr, cg, cb; ringColour(elev[r], &cr, &cg, &cb);
+		uint8 ur = (uint8)Clamp(cr, 0.0f, 255.0f), ug = (uint8)Clamp(cg, 0.0f, 255.0f), ub = (uint8)Clamp(cb, 0.0f, 255.0f);
+		float el = DEGTORAD(elev[r]), ce = Cos(el), se = Sin(el);
+		for(int a = 0; a < AZ; a++){
+			float az = (float)a / (float)AZ * TWOPI;
+			RwIm3DVertex *v = &verts[r * AZ + a];
+			RwIm3DVertexSetPos(v, c.x + Cos(az) * ce * R, c.y + Sin(az) * ce * R, c.z + se * R);
+			RwIm3DVertexSetRGBA(v, ur, ug, ub, 255);
+		}
+	}
+
+	// Save + restore EVERY state touched. First device run (2026-09-28): leaving
+	// VERTEXALPHAENABLE=FALSE behind turned the cloud and star sprites drawn right
+	// after this into opaque rectangles (the "light-grey rectangles in the sky").
+	void *zw, *zt, *fog, *va, *cull;
+	RwRenderStateGet(rwRENDERSTATEZWRITEENABLE, &zw);
+	RwRenderStateGet(rwRENDERSTATEZTESTENABLE, &zt);
+	RwRenderStateGet(rwRENDERSTATEFOGENABLE, &fog);
+	RwRenderStateGet(rwRENDERSTATEVERTEXALPHAENABLE, &va);
+	RwRenderStateGet(rwRENDERSTATECULLMODE, &cull);
+	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, nil);
+	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+	// Flags: position + colour, NO UVs (1 would be rwIM3D_VERTEXUV -- the first version
+	// claimed texture coordinates it never set).
+	if(RwIm3DTransform(verts, NR * AZ, nil, rwIM3D_VERTEXXYZ|rwIM3D_VERTEXRGBA)){
+		RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST, idx, (NR - 1) * AZ * 6);
+		RwIm3DEnd();
+	}
+	RwRenderStateSet(rwRENDERSTATECULLMODE, cull);
+	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, va);
+	RwRenderStateSet(rwRENDERSTATEFOGENABLE, fog);
+	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, zt);
+	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, zw);
+}
 // Multiview one-pass (multiview-plan.md 5.0b/3): the single pass must run under tag 2 --
 // the draw-only guards clear on tag != 1, CalcScreenCoors applies the slice projection
 // on tag != 0. False until Stufe 5.1 registers the multiview FBO.
@@ -2222,6 +2426,19 @@ Idle(void *arg)
 				float r = (CTimeCycle::GetSkyTopRed()   + CTimeCycle::GetSkyBottomRed())   * 0.5f / 255.0f;
 				float g = (CTimeCycle::GetSkyTopGreen() + CTimeCycle::GetSkyBottomGreen()) * 0.5f / 255.0f;
 				float b = (CTimeCycle::GetSkyTopBlue()  + CTimeCycle::GetSkyBottomBlue())  * 0.5f / 255.0f;
+				// VC_SKY_CLEAR=fog (diagnostic, 5.5): clear to the timecycle FOG colour instead
+				// of the sky mid colour. Distant geometry fogs towards exactly this colour, so
+				// if the far-building silhouettes in rain vanish with it, they are the fogged
+				// geometry standing against a sky that is not fog-coloured.
+				{
+					static int skyClearMode = -1;
+					if (skyClearMode < 0) { const char *e = getenv("VC_SKY_CLEAR"); skyClearMode = (e && strcmp(e, "fog") == 0) ? 1 : 0; }
+					if (skyClearMode == 1) {
+						r = CTimeCycle::GetFogRed()   / 255.0f;
+						g = CTimeCycle::GetFogGreen() / 255.0f;
+						b = CTimeCycle::GetFogBlue()  / 255.0f;
+					}
+				}
 				vc_set_stereo_sky_clear(r, g, b);
 			}
 			if (vcStereoCameraOn()) vcStereoSaveGameCamera();
@@ -2236,6 +2453,8 @@ Idle(void *arg)
 				// eye pass (stereo_ensure), so it is checked here, not in the loop head.
 				if (eye == 1 && vc_multiview_active()) break;
 				VC_SCENE(VC_SC_EYESET, vc_stereo_eye_pass(eye); )
+				// 5.5: world-anchored sky bands over the flat clear, before the world.
+				if (vcStereoSkyOn() && vcSkyDomeOn()) vcStereoRenderSkyDome();
 				// Set TheCamera to this eye (CPU sky/coronas/lighting read it). GPU world
 				// path is unchanged (eye pass already uploaded the uniform) -> world identical.
 				if (vcStereoCameraOn()) vcStereoSetGameCamera(eye);

@@ -31,6 +31,20 @@ RwV3d *CVisibilityPlugins::ms_pCameraPosn;
 float CVisibilityPlugins::ms_cullCompsDist;
 float CVisibilityPlugins::ms_vehicleLod0Dist;
 float CVisibilityPlugins::ms_vehicleLod1Dist;
+
+#ifdef LIBRW_VISIONOS
+// VC_LOD_FADE=0 (diagnostic, multiview-plan.md 5.5): draw entities in the LOD fade zone
+// fully opaque instead of alpha-fading them in. If the far-building "silhouettes" in
+// rain turn solid with this, they are the stock distance fade seen against a
+// low-contrast sky, not a sky/horizon colour problem.
+static inline bool vcLodFadeOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_LOD_FADE"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0;
+}
+#endif
+
 float CVisibilityPlugins::ms_vehicleFadeDist;
 float CVisibilityPlugins::ms_bigVehicleLod0Dist;
 float CVisibilityPlugins::ms_bigVehicleLod1Dist;
@@ -38,6 +52,17 @@ float CVisibilityPlugins::ms_pedLod1Dist;
 float CVisibilityPlugins::ms_pedFadeDist;
 
 #define RENDERCALLBACK AtomicDefaultRenderCallBack
+
+#ifdef LIBRW_VISIONOS
+// Alpha entity list capacity for the wide-FOV head-pose cull (see Initialise): 12x = 2400.
+// Also the snapshot capacity of the stereo alpha baseline.
+#define VC_ALPHAENTITY_MULT 12
+#define VC_ALPHAENTITY_CAP (NUMALPHAENTITYLIST * VC_ALPHAENTITY_MULT)
+#elif defined(ASPECT_RATIO_SCALE)
+#define VC_ALPHAENTITY_CAP (NUMALPHAENTITYLIST * 3)
+#else
+#define VC_ALPHAENTITY_CAP (NUMALPHAENTITYLIST)
+#endif
 
 void
 CVisibilityPlugins::Initialise(void)
@@ -50,7 +75,14 @@ CVisibilityPlugins::Initialise(void)
 	m_alphaBoatAtomicList.head.item.sort = 0.0f;
 	m_alphaBoatAtomicList.tail.item.sort = 100000000.0f;
 
-#ifdef ASPECT_RATIO_SCALE
+#if defined(LIBRW_VISIONOS)
+	// The head-pose cull admits the compositor FOV (~100+ deg x margin), not the game's
+	// 70 deg: with ASPECT_RATIO_SCALE's 3x (600) the list filled up when looking down a
+	// dense avenue, InsertSorted returned nil and SetupBigBuildingVisibility silently
+	// dropped every LOD/drawLast building -> "far buildings vanish when looking straight
+	// at them, reappear when turning the head" (device, rain, 2026-09-28).
+	m_alphaEntityList.Init(NUMALPHAENTITYLIST * VC_ALPHAENTITY_MULT);
+#elif defined(ASPECT_RATIO_SCALE)
 	// default 150 is not enough for bigger FOVs
 	m_alphaEntityList.Init(NUMALPHAENTITYLIST * 3);
 #else
@@ -93,6 +125,20 @@ CVisibilityPlugins::InitAlphaEntityList(void)
 #endif
 }
 
+#ifdef LIBRW_VISIONOS
+// Diagnostics for the [vc-lod] line: silent drops (list full) and occupancy per frame.
+static unsigned g_vcAlphaInsertFail = 0;
+extern "C" unsigned vc_alpha_insert_fail_pop(void) { unsigned n = g_vcAlphaInsertFail; g_vcAlphaInsertFail = 0; return n; }
+extern "C" unsigned vc_alpha_entity_count(void)
+{
+	unsigned n = 0;
+	for(CLink<CVisibilityPlugins::AlphaObjectInfo> *l = CVisibilityPlugins::m_alphaEntityList.head.next;
+	    l != &CVisibilityPlugins::m_alphaEntityList.tail; l = l->next) n++;
+	return n;
+}
+extern "C" unsigned vc_alpha_entity_cap(void) { return VC_ALPHAENTITY_CAP; }
+#endif
+
 bool
 CVisibilityPlugins::InsertEntityIntoSortedList(CEntity *e, float dist)
 {
@@ -109,7 +155,11 @@ CVisibilityPlugins::InsertEntityIntoSortedList(CEntity *e, float dist)
 #endif
 	if(e->bUnderwater && m_alphaUnderwaterEntityList.InsertSorted(item))
 		return true;
-	return !!m_alphaEntityList.InsertSorted(item);
+	bool ok = !!m_alphaEntityList.InsertSorted(item);
+#ifdef LIBRW_VISIONOS
+	if(!ok) g_vcAlphaInsertFail++;
+#endif
+	return ok;
 }
 
 void
@@ -130,11 +180,6 @@ CVisibilityPlugins::InitAlphaAtomicList(void)
 // passes. The list is ascending by distance, so it was the FARTHEST alpha objects that
 // dropped, and since the count drifts frame to frame the dropped set changed with it:
 // alpha geometry popping in and out. Keep this expression in lockstep with Initialise().
-#ifdef ASPECT_RATIO_SCALE
-	#define VC_ALPHAENTITY_CAP (NUMALPHAENTITYLIST * 3)
-#else
-	#define VC_ALPHAENTITY_CAP (NUMALPHAENTITYLIST)
-#endif
 
 static CVisibilityPlugins::AlphaObjectInfo s_entitySave[VC_ALPHAENTITY_CAP];
 static CVisibilityPlugins::AlphaObjectInfo s_underwaterSave[NUMALPHAUNTERWATERENTITYLIST];
@@ -429,6 +474,9 @@ CVisibilityPlugins::RenderFadingAtomic(RpAtomic *atomic, float camdist)
 	if(fadefactor > 1.0f)
 		fadefactor = 1.0f;
 	alpha = mi->m_alpha * fadefactor;
+#ifdef LIBRW_VISIONOS
+	if(!vcLodFadeOn()) alpha = 255;   // VC_LOD_FADE=0 diagnostic (distance + stream-in fade), see Renderer.cpp
+#endif
 	if(alpha == 255)
 		RENDERCALLBACK(atomic);
 	else{

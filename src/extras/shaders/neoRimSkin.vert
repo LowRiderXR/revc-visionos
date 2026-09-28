@@ -42,5 +42,5 @@ main(void)
 	v_color = clamp(v_color, 0.0, 1.0);
 	v_color *= u_matColor;
 
-	v_fog = DoFog(gl_Position.VC_SKINFOG);   // z original; visionOS injects w (neoRim.vert already uses w)
+	v_fog = DoFogV(u_view * Vertex, gl_Position.VC_SKINFOG);   // z original; visionOS injects w (neoRim.vert already uses w); radial via u_fogMode
 }

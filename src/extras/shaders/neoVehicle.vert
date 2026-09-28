@@ -47,5 +47,5 @@ main(void)
 	for(int i = 0; i < 5; i++)
 		v_reflcolor.rgb += DoDirLightSpec(u_specDir[i].xyz, u_specColor[i].rgb, Normal, viewVec, u_specDir[i].w)*specularity*lightStrength;
 
-	v_fog = DoFog(gl_Position.w);
+	v_fog = DoFogV(u_view * Vertex, gl_Position.w);
 }
