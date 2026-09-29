@@ -1563,10 +1563,13 @@ extern "C" int vc_in_stereo_eye(void) { return vcEyeTag; }
 // (VC_SKY_DOME=1) until the cause is understood (candidates: fog on the dome vertices
 // despite FOGENABLE=FALSE -- w-dependent, would rotate with the view --, or the cloud
 // sprites becoming visible against the darker graded sky).
+// 2026-09-29: default ON for the user's long play session (visual trial: sky gradient
+// at dawn/dusk/night instead of the flat clear colour; watch for ring/segment banding and
+// the cloud sprites in front of it). VC_SKY_DOME=0 switches back to the flat sky.
 static bool vcSkyDomeOn(void)
 {
 	static int e = -1;
-	if(e < 0){ const char *s = getenv("VC_SKY_DOME"); e = (s && s[0] == '1') ? 1 : 0; }
+	if(e < 0){ const char *s = getenv("VC_SKY_DOME"); e = (s && s[0] == '0') ? 0 : 1; }
 	return e != 0;
 }
 // 5.5 Horizontstreifen: the world-anchored counterpart of CClouds::RenderHorizon, drawn at
