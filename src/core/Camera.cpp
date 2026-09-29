@@ -630,6 +630,29 @@ CCamera::Process(void)
 		LODDistMultiplier = 1.0f;
 	GenerationDistMultiplier = LODDistMultiplier;
 	LODDistMultiplier *= CRenderer::ms_lodDistScale;
+#ifdef LIBRW_VISIONOS
+	// Measurement overrides (multiview-plan.md, Danach-Liste 2 "Zeichendistanz"):
+	//  VC_LOD_SCALE=<f>  replaces the menu draw-distance scale (menu clamp 0.925..1.8)
+	//                    -> buildings/props/ped fade (everything on LODDistMultiplier).
+	//  VC_GEN_SCALE=<f>  multiplies GenerationDistMultiplier -> traffic/ped spawn+despawn
+	//                    ranges, car generators, vehicle detail/visibility (70/90/100 m),
+	//                    wheel LOD (20 m hi-detail). Separate, so costs can be attributed.
+	{
+		static float lodOv = -1.0f, genOv = -1.0f;
+		static bool init = false;
+		if(!init){
+			init = true;
+			const char *l = getenv("VC_LOD_SCALE"), *g = getenv("VC_GEN_SCALE");
+			lodOv = l ? (float)atof(l) : -1.0f;
+			genOv = g ? (float)atof(g) : -1.0f;
+			if(lodOv > 0.0f || genOv > 0.0f)
+				printf("[vc-dist] overrides: LOD scale=%s (menu %.2f) GEN scale=%s | base 70/FOV=%.2f\n",
+				       l ? l : "menu", CRenderer::ms_lodDistScale, g ? g : "1", GenerationDistMultiplier);
+		}
+		if(lodOv > 0.0f) LODDistMultiplier = GenerationDistMultiplier * lodOv;
+		if(genOv > 0.0f) GenerationDistMultiplier *= genOv;
+	}
+#endif
 
 	CDraw::SetNearClipZ(RwCameraGetNearClipPlane(m_pRwCamera));
 	CDraw::SetFarClipZ(RwCameraGetFarClipPlane(m_pRwCamera));

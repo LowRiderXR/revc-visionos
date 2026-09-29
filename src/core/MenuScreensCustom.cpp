@@ -31,6 +31,11 @@
 #include "CarCtrl.h"
 #include "Population.h"
 
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_device_is_m2(void);      // visionos.cpp: device class for per-device defaults
+extern "C" float vc_lod_scale_max(void);
+#endif
+
 // Menu screens array is at the bottom of the file.
 
 #ifdef PC_MENU
@@ -144,9 +149,12 @@ void RestoreDefGraphics(int8 action) {
 		// HIGH costs 12 fps in the dense centre through ANGLE's per-draw CPU cost; LOW brings
 		// back the island-transition stalls). Reuse the option's own change handler so the
 		// streaming side effects match what the menu does.
-		if (!FrontEndMenuManager.m_bGameNotLoaded)
-			IslandLoadingAfterChange(FrontEndMenuManager.m_PrefsIslandLoading, FrontEndMenuManager.ISLAND_LOADING_MEDIUM);
-		FrontEndMenuManager.m_PrefsIslandLoading = FrontEndMenuManager.ISLAND_LOADING_MEDIUM;
+		{
+			const int8 def = vc_device_is_m2() ? (int8)FrontEndMenuManager.ISLAND_LOADING_MEDIUM : (int8)FrontEndMenuManager.ISLAND_LOADING_HIGH;
+			if (!FrontEndMenuManager.m_bGameNotLoaded)
+				IslandLoadingAfterChange(FrontEndMenuManager.m_PrefsIslandLoading, def);
+			FrontEndMenuManager.m_PrefsIslandLoading = def;
+		}
 	#else
 	    	if (!FrontEndMenuManager.m_bGameNotLoaded) {
 	    		FrontEndMenuManager.m_PrefsIslandLoading = FrontEndMenuManager.ISLAND_LOADING_LOW;
@@ -206,8 +214,12 @@ void RestoreDefDisplay(int8 action) {
 	#endif
 	#ifdef GRAPHICS_MENU_OPTIONS // otherwise Frontend will handle those
 		FrontEndMenuManager.m_PrefsBrightness = 256;
+#ifdef LIBRW_VISIONOS
+		FrontEndMenuManager.m_PrefsLOD = vc_lod_scale_max();   // device maximum (M5 2.2 measured, M2 1.8 assumed)
+#else
 		FrontEndMenuManager.m_PrefsLOD = 1.2f;
-		CRenderer::ms_lodDistScale = 1.2f;
+#endif
+		CRenderer::ms_lodDistScale = FrontEndMenuManager.m_PrefsLOD;
 		FrontEndMenuManager.m_PrefsShowSubtitles = false;
 		FrontEndMenuManager.m_PrefsShowLegends = true;
 		FrontEndMenuManager.m_PrefsRadarMode = 0;

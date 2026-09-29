@@ -304,6 +304,26 @@ extern "C" void vc_get_projection_matrix(float m[16])
 // on always (throttled 10 s -- first line of defence for a future perf problem);
 // the finer probes ([vc-pose-age], [vc-pose-latency], [vc-begin], [vc-publish])
 // are gated behind this so normal runs are quiet.
+// Device class for the per-device standards (multiview-plan.md, Gerätestandards 2026-09-29).
+// The launcher classifies the Metal device name and hands the result down as VC_DEVICE_M2
+// (1 = first Vision Pro / M2, 0 = M5 or newer). Unset -> treated as M2, the conservative
+// side: the M2 values (1.8 / Mittel) are assumptions, the M5 values are measured
+// (V3/V4/V5: 2.2 + Hoch hold 90/100 fps with Multiview + MSAA 4, Release, no validation).
+extern "C" int vc_device_is_m2(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("VC_DEVICE_M2");
+		v = (e && e[0] == '0') ? 0 : 1;
+		printf("[vc-device] class=%s -> draw-distance max %.1f, island loading default %s%s\n",
+		       v ? "M2 (assumed values)" : "M5 or newer (measured)", v ? 1.8f : 2.2f, v ? "MEDIUM" : "HIGH",
+		       e ? "" : "  (VC_DEVICE_M2 unset -> conservative M2 class)");
+	}
+	return v;
+}
+// Upper end of the "Distanz-Darstellung" slider: stock reVC clamps at 1.8; the M5 carries 2.2.
+extern "C" float vc_lod_scale_max(void) { return vc_device_is_m2() ? 1.8f : 2.2f; }
+
 extern "C" int vc_perf_log(void)
 {
 	static int v = -1;

@@ -6,6 +6,17 @@
 #include "crossplatform.h"
 #include "platform.h"
 #include "Frontend.h"
+
+#ifdef LIBRW_VISIONOS
+// Per-device standards (visionos.cpp): slider ceiling and default of "Distanz-Darstellung".
+extern "C" int vc_device_is_m2(void);
+extern "C" float vc_lod_scale_max(void);
+#define VC_LOD_MAX     vc_lod_scale_max()
+#define VC_LOD_DEFAULT vc_lod_scale_max()   // default = device maximum (measured on M5, assumed on M2)
+#else
+#define VC_LOD_MAX     1.8f
+#define VC_LOD_DEFAULT 1.2f
+#endif
 #include "Font.h"
 #include "Pad.h"
 #include "Text.h"
@@ -577,7 +588,10 @@ CMenuManager::CMenuManager()
 	// budget in the dense centre -> 72 fps vs 84 with MEDIUM. MEDIUM keeps the far island as
 	// its LOD model (no stall on the island transition either; only LOW reloads). HIGH stays a
 	// menu choice for players who prefer it. Note: the option applies on Enter only.
-	m_PrefsIslandLoading = ISLAND_LOADING_MEDIUM;
+	// 2026-09-29, V5 (Release, no validation, 2.2, rain, 100 Hz display): HIGH held 100 fps,
+	// the -12 fps had been the validation layer -> HIGH is the M5 default (user rule: "if HIGH
+	// holds with Multiview + MSAA 4 on the M5 it is the standard"); M2 stays MEDIUM (assumed).
+	m_PrefsIslandLoading = vc_device_is_m2() ? ISLAND_LOADING_MEDIUM : ISLAND_LOADING_HIGH;
 #else
 	m_PrefsIslandLoading = ISLAND_LOADING_LOW;
 #endif
@@ -774,10 +788,10 @@ CMenuManager::CheckSliderMovement(int value)
 		break;
 	case MENUACTION_DRAWDIST:
 		if(value > 0)
-			m_PrefsLOD += ((1.8f - 0.925f) / MENUSLIDER_LOGICAL_BARS);
+			m_PrefsLOD += ((VC_LOD_MAX - 0.925f) / MENUSLIDER_LOGICAL_BARS);
 		else
-			m_PrefsLOD -= ((1.8f - 0.925f) / MENUSLIDER_LOGICAL_BARS);
-		m_PrefsLOD = Clamp(m_PrefsLOD, 0.925f, 1.8f);
+			m_PrefsLOD -= ((VC_LOD_MAX - 0.925f) / MENUSLIDER_LOGICAL_BARS);
+		m_PrefsLOD = Clamp(m_PrefsLOD, 0.925f, VC_LOD_MAX);
 		CRenderer::ms_lodDistScale = m_PrefsLOD;
 		break;
 
@@ -1607,7 +1621,7 @@ CMenuManager::DrawStandardMenus(bool activeScreen)
 							ProcessSlider(m_PrefsBrightness / 384.0f, SLIDER_Y(70.0f), HOVEROPTION_INCREASE_BRIGHTNESS, HOVEROPTION_DECREASE_BRIGHTNESS, SCREEN_WIDTH, true);
 							break;
 						case MENUACTION_DRAWDIST:
-							ProcessSlider((m_PrefsLOD - 0.925f) / 0.875f, SLIDER_Y(99.0f), HOVEROPTION_INCREASE_DRAWDIST, HOVEROPTION_DECREASE_DRAWDIST, SCREEN_WIDTH, true);
+							ProcessSlider((m_PrefsLOD - 0.925f) / (VC_LOD_MAX - 0.925f), SLIDER_Y(99.0f), HOVEROPTION_INCREASE_DRAWDIST, HOVEROPTION_DECREASE_DRAWDIST, SCREEN_WIDTH, true);
 							break;
 						case MENUACTION_MUSICVOLUME:
 							if(m_nPrefsAudio3DProviderIndex != NO_AUDIO_PROVIDER)
@@ -4994,7 +5008,7 @@ CMenuManager::ProcessUserInput(uint8 goDown, uint8 goUp, uint8 optionSelected, u
 					SaveSettings();
 				} else if (m_nCurrScreen == MENUPAGE_DISPLAY_SETTINGS) {
 					m_PrefsBrightness = 256;
-					m_PrefsLOD = 1.2f;
+					m_PrefsLOD = VC_LOD_DEFAULT;
 #ifdef LEGACY_MENU_OPTIONS
 					m_PrefsVsync = true;
 #endif
