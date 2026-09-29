@@ -149,6 +149,26 @@ vcgl_init_angle(void **outGetProcAddress)
 	}
 	VCLOG(@"eglInitialize OK, EGL %d.%d", major, minor);
 
+	// Measurement context (2026-09-29, draw-cost question): when the app is launched from
+	// Xcode, the scheme's Diagnostics defaults inject Metal API Validation (MTL_DEBUG_LAYER)
+	// and the GPU-capture wrapper (METAL_DEVICE_WRAPPER_TYPE) into the process. Both wrap
+	// EVERY Metal call ANGLE replays at pass end -- i.e. they sit inside the ~3.5 us/draw
+	// "readback" segment. A launch from the Home screen has neither. Print what this
+	// process actually got, plus the optimization level the game code was compiled with
+	// (the Run scheme builds the Debug configuration: GCC_OPTIMIZATION_LEVEL 0 for reVCCore).
+	{
+		const char *dbg = getenv("MTL_DEBUG_LAYER"), *shv = getenv("MTL_SHADER_VALIDATION"),
+		           *wrap = getenv("METAL_DEVICE_WRAPPER_TYPE"), *cap = getenv("MTL_CAPTURE_ENABLED");
+#ifdef __OPTIMIZE__
+		const char *opt = "optimized (-O1 or higher)";
+#else
+		const char *opt = "-O0 (NOT optimized)";
+#endif
+		VCLOG(@"[vc-ctx] game code %s | Metal env: MTL_DEBUG_LAYER=%s MTL_SHADER_VALIDATION=%s METAL_DEVICE_WRAPPER_TYPE=%s MTL_CAPTURE_ENABLED=%s%s",
+		      opt, dbg ? dbg : "-", shv ? shv : "-", wrap ? wrap : "-", cap ? cap : "-",
+		      (dbg || wrap) ? "  <- validation/capture layer present: per-Metal-call overhead, measurements are not the Home-screen numbers" : "");
+	}
+
 	const char *vendor  = eglQueryString(g_display, VC_EGL_VENDOR);
 	const char *version = eglQueryString(g_display, VC_EGL_VERSION);
 	VCLOG(@"EGL vendor='%s' version='%s'", vendor ? vendor : "?", version ? version : "?");
