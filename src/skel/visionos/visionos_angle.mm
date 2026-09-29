@@ -3284,3 +3284,31 @@ vcrt_stereo_publish_probe(int idx)
 }
 
 #endif // LIBRW_VISIONOS
+
+// Device thermal state for the measurement logs ([vc-frame] avg10s thermal=...). Consecutive
+// full-load runs warm the headset; once the state leaves "nominal", GPU clocks drop and the
+// command-buffer GPU times inflate with unchanged draws/tris -- such runs are not comparable.
+extern "C" const char *
+vc_thermal_state(void)
+{
+	switch ([[NSProcessInfo processInfo] thermalState]) {
+	case NSProcessInfoThermalStateNominal:  return "nominal";
+	case NSProcessInfoThermalStateFair:     return "fair";
+	case NSProcessInfoThermalStateSerious:  return "serious";
+	case NSProcessInfoThermalStateCritical: return "critical";
+	}
+	return "?";
+}
+
+// Process memory footprint (the number the jetsam limit is judged on) for the same log
+// line: a run whose GPU times inflate at unchanged draws/tris, or a run that ends in a
+// crash, is checked against memory growth first.
+#include <mach/mach.h>
+extern "C" double
+vc_mem_footprint_mb(void)
+{
+	task_vm_info_data_t info;
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return -1.0;
+	return (double)info.phys_footprint / (1024.0 * 1024.0);
+}

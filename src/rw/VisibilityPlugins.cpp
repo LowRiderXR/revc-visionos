@@ -271,9 +271,63 @@ CVisibilityPlugins::InsertAtomicIntoBoatSortedList(RpAtomic *a, float dist)
 // probably have to fix fading for this so material alpha isn't overwritten
 #define VEHICLE_LODDIST_MULTIPLIER (TheCamera.GenerationDistMultiplier)
 
+#ifdef LIBRW_VISIONOS
+// Vehicle distance factors (multiview-plan.md, Danach-Liste 2, run F). Both sit on top of
+// GenerationDistMultiplier (GDM), which the menu's draw-distance slider does NOT touch -- so
+// these are the only handles on vehicles. DEFAULT ON since 2026-09-29: run F measured them
+// as free (GPU/CPU/draws within run-to-run noise of the baseline) and the user accepted the
+// picture (round wheels to ~60 m was the visible complaint). Env overrides remain; =1 = stock.
+//  VC_VEH_DIST=<f>   scales the normal-vehicle detail/visibility distances 70/90/100 m × GDM
+//                    (hi-detail / cull in VehicleVisibilityCB / fade). Default 1.33 draws cars
+//                    out to the traffic despawn limit (120 m × GDM, CarCtrl
+//                    ONSCREEN_DESPAWN_RANGE), so a car fades with its despawn instead of
+//                    vanishing at 90 m while it still exists. Big vehicles, boats, peds untouched.
+//  VC_WHEEL_LOD=<f>  divides the distance fed to the wheel LOD pick. The stock switch to the
+//                    low-detail (octagonal) wheel is at 20 m × GDM (default.ide wheel_*: 20/70);
+//                    default 3 keeps the hi-detail wheel to 60 m × GDM.
+#define VC_VEH_DIST_DEFAULT  1.33f
+#define VC_WHEEL_LOD_DEFAULT 3.0f
+static float
+vcVehDistScale(void)
+{
+	static float s = -1.0f;
+	if(s < 0.0f){ const char *e = getenv("VC_VEH_DIST"); s = e ? (float)atof(e) : VC_VEH_DIST_DEFAULT; if(s <= 0.0f) s = 1.0f; }
+	return s;
+}
+
+static float
+vcWheelLodScale(void)
+{
+	static float s = -1.0f;
+	if(s < 0.0f){ const char *e = getenv("VC_WHEEL_LOD"); s = e ? (float)atof(e) : VC_WHEEL_LOD_DEFAULT; if(s <= 0.0f) s = 1.0f; }
+	return s;
+}
+
+static void
+vcVehDistLogOnce(void)
+{
+	static bool done = false;
+	if(done) return;
+	if(TheCamera.GenerationDistMultiplier <= 0.0f) return;   // camera not set up yet; log with a real GDM
+	done = true;
+	if(vcVehDistScale() != 1.0f || vcWheelLodScale() != 1.0f)
+		printf("[vc-dist] vehicle factors: sight x%.2f (cull %.0f m x GDM, hi-detail %.0f m) wheel x%.2f (hi-detail wheel %.0f m x GDM) | GDM=%.2f\n",
+		       vcVehDistScale(), 90.0f * vcVehDistScale(), 70.0f * vcVehDistScale(),
+		       vcWheelLodScale(), 20.0f * vcWheelLodScale(), TheCamera.GenerationDistMultiplier);
+}
+#define VC_VEH_DIST_SCALE vcVehDistScale()
+#define VC_WHEEL_LOD_SCALE vcWheelLodScale()
+#else
+#define VC_VEH_DIST_SCALE 1.0f
+#define VC_WHEEL_LOD_SCALE 1.0f
+#endif
+
 void
 CVisibilityPlugins::SetRenderWareCamera(RwCamera *camera)
 {
+#ifdef LIBRW_VISIONOS
+	vcVehDistLogOnce();
+#endif
 	ms_pCamera = camera;
 	ms_pCameraPosn = RwMatrixGetPos(RwFrameGetMatrix(RwCameraGetFrame(camera)));
 
@@ -283,9 +337,9 @@ CVisibilityPlugins::SetRenderWareCamera(RwCamera *camera)
 	else
 		ms_cullCompsDist = sq(TheCamera.LODDistMultiplier * 20.0f);
 
-	ms_vehicleLod0Dist = sq(70.0f * VEHICLE_LODDIST_MULTIPLIER);
-	ms_vehicleLod1Dist = sq(90.0f * VEHICLE_LODDIST_MULTIPLIER);
-	ms_vehicleFadeDist = sq(100.0f * VEHICLE_LODDIST_MULTIPLIER);
+	ms_vehicleLod0Dist = sq(70.0f * VEHICLE_LODDIST_MULTIPLIER * VC_VEH_DIST_SCALE);
+	ms_vehicleLod1Dist = sq(90.0f * VEHICLE_LODDIST_MULTIPLIER * VC_VEH_DIST_SCALE);
+	ms_vehicleFadeDist = sq(100.0f * VEHICLE_LODDIST_MULTIPLIER * VC_VEH_DIST_SCALE);
 	ms_bigVehicleLod0Dist = sq(60.0f * VEHICLE_LODDIST_MULTIPLIER);
 	ms_bigVehicleLod1Dist = sq(150.0f * VEHICLE_LODDIST_MULTIPLIER);
 	ms_pedLod1Dist = sq(60.0f * TheCamera.LODDistMultiplier);
@@ -398,7 +452,10 @@ CVisibilityPlugins::RenderWheelAtomicCB(RpAtomic *atomic)
 
 	mi = GetAtomicModelInfo(atomic);
 	len = Sqrt(DistToCameraSq);
-	lodatm = mi->GetAtomicFromDistance(len * TheCamera.LODDistMultiplier / VEHICLE_LODDIST_MULTIPLIER);
+	// The menu scale cancels here on purpose (× LODDistMultiplier / GDM against lodDist ×
+	// LODDistMultiplier inside GetAtomicFromDistance): wheels switch at 20 m × GDM regardless
+	// of the slider. VC_WHEEL_LOD (visionOS measurement factor) stretches that distance.
+	lodatm = mi->GetAtomicFromDistance(len * TheCamera.LODDistMultiplier / (VEHICLE_LODDIST_MULTIPLIER * VC_WHEEL_LOD_SCALE));
 	if(lodatm){
 		if(RpAtomicGetGeometry(lodatm) != RpAtomicGetGeometry(atomic))
 			RpAtomicSetGeometry(atomic, RpAtomicGetGeometry(lodatm), rpATOMICSAMEBOUNDINGSPHERE);

@@ -140,13 +140,13 @@ void RestoreDefGraphics(int8 action) {
 	#endif
 	#ifdef NO_ISLAND_LOADING
 	#ifdef LIBRW_VISIONOS
-		// visionOS default is HIGH, not LOW: keeping both islands resident removes the
-		// synchronous island streaming that caused reproducible stutters while driving
-		// (device-confirmed). Reuse the option's own change handler so the streaming side
-		// effects match what the menu does.
+		// visionOS default is MEDIUM (see Frontend.cpp LoadSettings for the measurement:
+		// HIGH costs 12 fps in the dense centre through ANGLE's per-draw CPU cost; LOW brings
+		// back the island-transition stalls). Reuse the option's own change handler so the
+		// streaming side effects match what the menu does.
 		if (!FrontEndMenuManager.m_bGameNotLoaded)
-			IslandLoadingAfterChange(FrontEndMenuManager.m_PrefsIslandLoading, FrontEndMenuManager.ISLAND_LOADING_HIGH);
-		FrontEndMenuManager.m_PrefsIslandLoading = FrontEndMenuManager.ISLAND_LOADING_HIGH;
+			IslandLoadingAfterChange(FrontEndMenuManager.m_PrefsIslandLoading, FrontEndMenuManager.ISLAND_LOADING_MEDIUM);
+		FrontEndMenuManager.m_PrefsIslandLoading = FrontEndMenuManager.ISLAND_LOADING_MEDIUM;
 	#else
 	    	if (!FrontEndMenuManager.m_bGameNotLoaded) {
 	    		FrontEndMenuManager.m_PrefsIslandLoading = FrontEndMenuManager.ISLAND_LOADING_LOW;

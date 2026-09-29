@@ -123,9 +123,11 @@ extern "C" void vc_lod_log_frame(int visEnt)
 	uint32 now = CTimer::GetTimeInMilliseconds();
 	if(now - lastMs >= 1000){
 		lastMs = now;
-		printf("[vc-lod] visible LODs=%d nearest=%.0fm farthest=%.0fm (%s) | fogStart=%.0f farClip(fog end)=%.0f lodScale=%.2f | visEnt=%d/%d overflow=%u alphaList=%u/%u insertFail=%u\n",
+		printf("[vc-lod] visible LODs=%d nearest=%.0fm farthest=%.0fm (%s) | fogStart=%.0f farClip(fog end)=%.0f lodScale=%.2f (effective %.2f) | visEnt=%d/%d overflow=%u alphaList=%u/%u insertFail=%u\n",
 		       vcLodVis, vcLodVis ? vcLodNear : 0.0f, vcLodFar, vcLodFarName,
 		       CTimeCycle::GetFogStart(), CTimeCycle::GetFarClip(), CRenderer::ms_lodDistScale,
+		       // effective = LODDistMultiplier / GenerationDistMultiplier: shows VC_LOD_SCALE overrides
+		       TheCamera.GenerationDistMultiplier > 0.0f ? TheCamera.LODDistMultiplier / TheCamera.GenerationDistMultiplier : 0.0f,
 		       visEnt, (int)NUMVISIBLEENTITIES, vcVisOverflow,
 		       vc_alpha_entity_count(), vc_alpha_entity_cap(), vc_alpha_insert_fail_pop());
 		vcVisOverflow = 0;

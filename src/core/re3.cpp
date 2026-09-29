@@ -484,6 +484,26 @@ void SaveINIControllerSettings()
 	ini.write(cfg);
 }
 
+#if defined(LIBRW_VISIONOS) && defined(NO_ISLAND_LOADING) && defined(CUSTOM_FRONTEND_OPTIONS)
+// VC_ISLAND_LOADING=0|1|2 (Niedrig/Mittel/Hoch) forces the "Kartenspeichernutzung" option for a
+// measurement run (multiview-plan.md, Danach-Liste 2, Lauf K) WITHOUT touching the saved
+// setting: the forced value replaces the ini value at load, and SaveINISettings skips the key
+// while the override is active, so the ini keeps what the player chose. -1 = no override.
+static int vcIslandLoadingOverride(void)
+{
+	static int v = -2;
+	if (v == -2) {
+		const char *e = getenv("VC_ISLAND_LOADING");
+		v = (e && e[0] >= '0' && e[0] <= '2' && e[1] == '\0') ? e[0] - '0' : -1;
+	}
+	return v;
+}
+static bool vcIsIslandLoadingOption(const CMenuScreenCustom::CMenuEntry &option)
+{
+	return option.m_CFO->save && strcmp(option.m_CFO->save, "IslandLoading") == 0;
+}
+#endif
+
 bool LoadINISettings()
 {
 	if (!ini.read(cfg))
@@ -586,6 +606,16 @@ bool LoadINISettings()
 				else
 					ReadIniIfExists(option.m_CFO->saveCat, option.m_CFO->save, (int8*)option.m_CFO->value);
 
+#if defined(LIBRW_VISIONOS) && defined(NO_ISLAND_LOADING) && defined(CUSTOM_FRONTEND_OPTIONS)
+				if (vcIslandLoadingOverride() >= 0 && vcIsIslandLoadingOption(option)) {
+					static const char *const names[] = { "LOW", "MEDIUM", "HIGH" };
+					int8 saved = *(int8*)option.m_CFO->value;
+					printf("[vc-dist] island loading forced: %s (saved setting %s kept in ini)\n",
+					       names[vcIslandLoadingOverride()], (saved >= 0 && saved <= 2) ? names[saved] : "?");
+					*(int8*)option.m_CFO->value = (int8)vcIslandLoadingOverride();
+				}
+#endif
+
 				if (option.m_Action == MENUACTION_CFO_SELECT) {
 					option.m_CFOSelect->lastSavedValue = option.m_CFOSelect->displayedValue = *(int8*)option.m_CFO->value;
 				}
@@ -684,6 +714,10 @@ void SaveINISettings()
 				break;
 				
 			if (option.m_Action < MENUACTION_NOTHING && option.m_CFO->save) {
+#if defined(LIBRW_VISIONOS) && defined(NO_ISLAND_LOADING) && defined(CUSTOM_FRONTEND_OPTIONS)
+				if (vcIslandLoadingOverride() >= 0 && vcIsIslandLoadingOption(option))
+					continue;   // forced for this run only; keep the player's saved value
+#endif
 				if (option.m_Action == MENUACTION_CFO_SLIDER)
 					StoreIni(option.m_CFO->saveCat, option.m_CFO->save, *(float*)option.m_CFO->value);
 				else

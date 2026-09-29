@@ -569,12 +569,15 @@ CMenuManager::CMenuManager()
 
 #ifdef NO_ISLAND_LOADING
 #ifdef LIBRW_VISIONOS
-	// visionOS default HIGH: keeping both islands resident removes the synchronous island
-	// streaming (RequestIslands + LoadAllRequestedModels) that caused reproducible stutters
-	// while driving -- device-confirmed. Costs memory, of which we have plenty (the streaming
-	// budget alone is ~2 GB, see CStreaming::Init), and a per-frame scan of both big-building
-	// lists, which is a fraction of a millisecond against a 100 ms+ streaming stall.
-	m_PrefsIslandLoading = ISLAND_LOADING_HIGH;
+	// visionOS default MEDIUM (was HIGH until 2026-09-29). HIGH keeps both islands resident
+	// and removes the synchronous island streaming stalls while driving (device-confirmed),
+	// but the draw-distance measurement (multiview-plan.md, Danach-Liste 2, run K) showed its
+	// price: both big-building lists are scanned every frame, visEnt 538 vs 390, +430 draws,
+	// and ANGLE's per-draw replay cost (~3.5 us/draw) puts the render thread over the 90 Hz
+	// budget in the dense centre -> 72 fps vs 84 with MEDIUM. MEDIUM keeps the far island as
+	// its LOD model (no stall on the island transition either; only LOW reloads). HIGH stays a
+	// menu choice for players who prefer it. Note: the option applies on Enter only.
+	m_PrefsIslandLoading = ISLAND_LOADING_MEDIUM;
 #else
 	m_PrefsIslandLoading = ISLAND_LOADING_LOW;
 #endif

@@ -249,6 +249,8 @@ extern "C" int vc_matrix_override_active(void)
 static uint64_t g_lastConsumedPoseSetTime = 0;
 extern "C" uint64_t vc_last_consumed_pose_time(void) { return g_lastConsumedPoseSetTime; }
 extern "C" int vc_perf_log(void);   // defined below; gates verbose perf logs
+extern "C" const char *vc_thermal_state(void);   // visionos_angle.mm: NSProcessInfo thermal state (measurement context)
+extern "C" double vc_mem_footprint_mb(void);     // visionos_angle.mm: task phys_footprint (memory pressure / leak check)
 
 // [vc-stereo] diagnostic: how old (ms) is the most recently PUSHED head pose right now
 // (push->now), and how long (ms) since this was last called (game-thread frame spacing --
@@ -678,8 +680,12 @@ extern "C" void vc_frame_mark(int id)
 	if (nowS - lastLog < 10.0) { (void)total; return; }
 	lastLog = nowS;
 	if (avgN > 0) {
-		printf("[vc-frame] avg10s: n=%.0f fps=%.1f FRAME=%.1f render=%.1f eyes=%.1f cpu=%.1f ms\n",
-		       avgN, 1000.0 * avgN / avgFrame, avgFrame / avgN, avgTotal / avgN, avgEyes / avgN, avgCpu / avgN);
+		// thermal= is the device's NSProcessInfo thermal state: GPU timings from consecutive
+		// measurement runs are only comparable while it stays "nominal" (clock throttling
+		// inflates command-buffer durations without any change in draws/tris).
+		printf("[vc-frame] avg10s: n=%.0f fps=%.1f FRAME=%.1f render=%.1f eyes=%.1f cpu=%.1f ms thermal=%s mem=%.0fMB\n",
+		       avgN, 1000.0 * avgN / avgFrame, avgFrame / avgN, avgTotal / avgN, avgEyes / avgN, avgCpu / avgN,
+		       vc_thermal_state(), vc_mem_footprint_mb());
 		avgN = avgFrame = avgTotal = avgEyes = avgCpu = 0;
 	}
 	double fxMs = (double)g_fxAccum * (double)sNum / (double)sDen / 1.0e6;   // 2x RenderEffects
