@@ -20,6 +20,180 @@
 
 #ifdef LIBRW_VISIONOS
 extern "C" int vc_render_mode(void);   // gl3device: 1 = stereo VR, 0 = cinema
+#ifdef LIBRW_VISIONOS
+extern "C" int vc_get_eye_view_mv(int eye, float m[16]);   // one-pass: per-eye views the GPU twins use
+extern "C" int vc_get_eye_proj(float m[16]);
+extern "C" void vc_im3d_pull(float delta);   // librw gl3immed: per-eye view-space depth pull for the next im3d draws
+
+// S1 Koronas (multiview-plan.md, Sprite-Familie S1, Entscheidung B): in stereo the corona
+// disc is no longer a CPU-projected 2D sprite (projected ONCE with the centre camera and
+// therefore drawn at the same place in both eyes = optical infinity, "headlights sit
+// offset"), but a WORLD-SPACE billboard drawn through im3d. The GPU projects its four
+// vertices with the same per-eye matrices as the world geometry -> correct disparity, no
+// CPU knowledge of the eyes needed. Size mapping is exact: the game computes the sprite
+// half-size in pixels as outh*size*fog with outh = focal/zorig, so the WORLD half-size at
+// the true position is simply wpx/outh (= size*fog; the game's FOV-zoom factor cancels).
+// The depth pull of the 2D path ("z -= nearDist", sun at 0.95*far) is NOT done by moving
+// the quad along the centre-camera ray -- first device run (2026-09-30) showed why: a
+// point pulled 1.5 m toward the head centre at 2 m distance gets the disparity of a
+// 0.5 m object, floats in front of the lamp and swings on head turns. Instead the pull
+// happens in the im3d vertex shader per eye (u_im3dPull: homothety about the eye in
+// view space keeps each eye's screen position, changes only depth).
+// Kept from the 2D path: the 20/z radian roll, the near fade (< 2.3 m), additive blend,
+// ZTEST per LOScheck.
+// VC_WORLD_CORONA=0 restores the 2D sprite path (A/B).
+static bool vcWorldCoronaOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_WORLD_CORONA"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0 && vc_render_mode() == 1;
+}
+// Known original behaviour (checked against the macOS reference build 2026-09-30): the
+// coronas of the VERTICAL traffic lights are half hidden by their housing, the horizontal
+// ones are not. Same in the flat game -- not a stereo defect, not fixed here.
+
+// Probe VC_CORONA_DIAG=1: once per second, for the nearest corona drawn this frame, the
+// per-eye screen x of the quad centre (what the GPU will draw), the disparity that the 2D
+// sprite lacked, and the pixel-size identity (world half-size back-projected must equal
+// the game's pixel half-size, tolerance <= 1 px).
+struct VcCoronaDiag { float z, zTrue, wpx, worldHalf, x2d, pullSent; CVector pos; bool valid, ztest; };
+static VcCoronaDiag vcCoronaNearest;
+static int vcCoronaDrawn;
+static float vcCoronaAxLen = 0.0f, vcCoronaAyLen = 0.0f, vcCoronaAxAyDot = 0.0f;   // raw axis check (before normalisation)
+
+static void
+vcRenderCoronaWorldQuad(const CVector &coors, float zorig, float zdraw, float outh,
+	float wpx, float hpx, uint8 r, uint8 g, uint8 b, int16 intens, float rotation, uint8 a,
+	bool nearFade, float x2d)
+{
+	if(zorig <= 0.001f || outh <= 0.0f || zdraw <= 0.001f) return;
+	// near fade of RenderOneXLUSprite_Rotate_Aspect
+	if(nearFade && zdraw < 2.3f){
+		if(zdraw < 1.3f) return;
+		int f = (zdraw - 1.3f)/(2.3f-1.3f) * 255;
+		r = f*r >> 8; g = f*g >> 8; b = f*b >> 8; intens = f*intens >> 8;
+	}
+	// the quad sits at the TRUE position; the depth pull is a per-eye shader operation
+	const CVector &centre = coors;
+	// billboard axes = the world directions that map to view +x / +y, i.e. exactly the
+	// screen axes CalcScreenCoors uses. m_viewMatrix is a world->view transform whose
+	// COLUMNS are the view-space images of the world axes, stored in CMatrix slot order
+	// Right (col 0, multiplies in.x), Forward (col 1, in.y), Up (col 2, in.z). The world
+	// direction mapping to view +x is therefore row 0 = (Right.x, Forward.x, Up.x).
+	// Device run 2 (2026-09-30) had Forward/Up swapped here -> non-orthonormal axes ->
+	// the disc became a tilted streak that turned with the head. Normalised + re-
+	// orthogonalised below so a scaled or slightly skewed view matrix cannot do that again.
+	const CMatrix &V = TheCamera.m_viewMatrix;
+	CVector vx(V.GetRight().x, V.GetForward().x, V.GetUp().x);   // view +x in world (screen right)
+	CVector vy(V.GetRight().y, V.GetForward().y, V.GetUp().y);   // view +y in world (screen down)
+	// Device run 6 (2026-09-30, screenshot with the head ROLLED): a screen-aligned billboard
+	// rolls with the head -- the wide TYPE_STREAK headlight flares then lie tilted against
+	// the world while the HUD stays level with them. The flat game never rolls its camera,
+	// so "screen-horizontal" there equals "world-horizontal". Reproduce that: build the
+	// billboard from the WORLD up axis (GTA: z), i.e. an upright billboard whose horizontal
+	// axis is the true horizon regardless of head roll. Fallback to the screen axes only when
+	// looking (almost) straight up/down, where the horizon is undefined.
+	CVector fwd = coors - TheCamera.GetPosition();
+	float fl = fwd.Magnitude(); if(fl < 1e-4f) return;
+	fwd *= 1.0f / fl;
+	CVector ax = CrossProduct(fwd, CVector(0.0f, 0.0f, 1.0f));   // world-horizontal, perpendicular to the line of sight
+	CVector ay;
+	if(ax.Magnitude() > 0.05f){
+		ax.Normalise();
+		ay = CrossProduct(ax, fwd);                                // in the vertical plane through the line of sight
+		ay.Normalise();
+		// keep the texture orientation of the 2D sprite: x along screen right, y along screen down
+		if(DotProduct(ax, vx) < 0.0f) ax = -ax;
+		if(DotProduct(ay, vy) < 0.0f) ay = -ay;
+	}else{
+		ax = vx; ay = vy;
+		float lx = ax.Magnitude(), ly = ay.Magnitude();
+		if(lx < 1e-4f || ly < 1e-4f) return;
+		ax *= 1.0f / lx; ay -= ax * DotProduct(ax, ay);
+		float l = ay.Magnitude(); if(l < 1e-4f) return;
+		ay *= 1.0f / l;
+	}
+	vcCoronaAxLen = ax.Magnitude(); vcCoronaAyLen = ay.Magnitude(); vcCoronaAxAyDot = DotProduct(ax, ay);
+	// pixel half-size -> world half-size at the true depth: wpx/outh (outh = focal/zorig)
+	float w = wpx / outh, h = hpx / outh;
+	float c = Cos(rotation), sn = Sin(rotation);
+	// same corner order/uv as the 2D sprite: 0 (-w,-h) 1 (-w,+h) 2 (+w,+h) 3 (+w,-h)
+	float sx[4] = { w*(-c-sn), w*(-c+sn), w*(+c+sn), w*(+c-sn) };
+	float sy[4] = { h*(-c+sn), h*(+c+sn), h*(+c-sn), h*(-c-sn) };
+	float us[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+	float vs[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
+	static RwIm3DVertex verts[4];
+	static RwImVertexIndex idx[6] = { 0, 1, 2, 0, 2, 3 };
+	for(int i = 0; i < 4; i++){
+		CVector pv = centre + ax * sx[i] + ay * sy[i];
+		RwIm3DVertexSetPos(&verts[i], pv.x, pv.y, pv.z);
+		RwIm3DVertexSetRGBA(&verts[i], r*intens>>8, g*intens>>8, b*intens>>8, a);
+		RwIm3DVertexSetU(&verts[i], us[i]);
+		RwIm3DVertexSetV(&verts[i], vs[i]);
+	}
+	// per-eye depth pull: view z becomes zdraw instead of zorig, screen position unchanged
+	// (the game's nearDist pull, and 0.95*far for the sun).
+	float pull = zdraw / zorig - 1.0f;
+	if(pull < -0.95f) pull = -0.95f;   // never collapse onto the eye
+	vc_im3d_pull(pull);
+	if(RwIm3DTransform(verts, 4, nil, rwIM3D_VERTEXXYZ|rwIM3D_VERTEXRGBA|rwIM3D_VERTEXUV)){
+		RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST, idx, 6);
+		RwIm3DEnd();
+	}
+	vc_im3d_pull(0.0f);
+	vcCoronaDrawn++;
+	if(!vcCoronaNearest.valid || zdraw < vcCoronaNearest.z){
+		vcCoronaNearest.valid = true; vcCoronaNearest.z = zdraw; vcCoronaNearest.zTrue = zorig; vcCoronaNearest.wpx = wpx;
+		vcCoronaNearest.worldHalf = w; vcCoronaNearest.pos = centre; vcCoronaNearest.x2d = x2d;
+		vcCoronaNearest.pullSent = pull;
+		void *zt = nil; RwRenderStateGet(rwRENDERSTATEZTESTENABLE, &zt); vcCoronaNearest.ztest = zt != nil;
+	}
+}
+
+static void
+vcCoronaDiagFlush(void)
+{
+	static int diagOn = -1;
+	if(diagOn < 0){ const char *e = getenv("VC_CORONA_DIAG"); diagOn = (e && e[0] == '1') ? 1 : 0; }
+	if(!diagOn){ vcCoronaNearest.valid = false; vcCoronaDrawn = 0; return; }
+	static float lastT = 0.0f;
+	float nowT = CTimer::GetTimeInMilliseconds() * 0.001f;
+	if(nowT - lastT >= 1.0f){
+		lastT = nowT;
+		if(!vcCoronaNearest.valid){
+			printf("[vc-corona] drawn=%d (none this frame)\n", vcCoronaDrawn);
+		}else{
+			float v0[16], v1[16], p[16];
+			if(vc_get_eye_view_mv(0, v0) && vc_get_eye_view_mv(1, v1) && vc_get_eye_proj(p)){
+				const CVector &q = vcCoronaNearest.pos;
+				auto screenX = [&](const float *v) -> float {
+					float lx = v[0]*q.x + v[4]*q.y + v[8]*q.z  + v[12];
+					float ly = v[1]*q.x + v[5]*q.y + v[9]*q.z  + v[13];
+					float lz = v[2]*q.x + v[6]*q.y + v[10]*q.z + v[14];
+					float cx = p[0]*lx + p[4]*ly + p[8]*lz + p[12];
+					float cw = p[3]*lx + p[7]*ly + p[11]*lz + p[15];
+					return (cw > 0.0001f) ? (cx/cw * 0.5f + 0.5f) * SCREEN_WIDTH : -1.0f;
+				};
+				float x0 = screenX(v0), x1 = screenX(v1);
+				float degPerPx = (p[0] > 0.0001f) ? (2.0f * Atan(1.0f / p[0]) * 180.0f / PI) / SCREEN_WIDTH : 0.0f;
+				// size: world half-size back through the slice focal (0.5*p5*H) at the TRUE
+				// depth; equals the game's pixel size when the game FOV is at its default
+				// (the ratio is the game's FOV-zoom factor, which the VR view does not apply)
+				float focal = 0.5f * p[5] * SCREEN_HEIGHT;
+				float wpxBack = vcCoronaNearest.worldHalf * focal / vcCoronaNearest.zTrue;
+				printf("[vc-corona] drawn=%d nearest dist=%.1fm (drawn depth %.1fm, pull x%.2f) | quad centre per eye x0=%.0f x1=%.0f -> disparity %.0f px = %.2f deg (2D sprite would sit at x=%.0f in both) | size: game %.1f px, quad %.1f px | axes |ax|=%.3f |ay|=%.3f ax.ay=%.3f (want 1/1/0) | pullSent=%.3f ztest=%d\n",
+				       vcCoronaDrawn, vcCoronaNearest.zTrue, vcCoronaNearest.z, vcCoronaNearest.z / vcCoronaNearest.zTrue, x0, x1, x0 - x1, (x0 - x1) * degPerPx,
+				       vcCoronaNearest.x2d, vcCoronaNearest.wpx, wpxBack, vcCoronaAxLen, vcCoronaAyLen, vcCoronaAxAyDot,
+				       vcCoronaNearest.pullSent, vcCoronaNearest.ztest ? 1 : 0);
+			}else{
+				printf("[vc-corona] drawn=%d nearest dist=%.1fm (two-pass: per-eye matrices come from the eye pass itself, no diagnostics)\n",
+				       vcCoronaDrawn, vcCoronaNearest.z);
+			}
+		}
+	}
+	vcCoronaNearest.valid = false; vcCoronaDrawn = 0;
+}
+#endif
 #endif
 
 struct FlareDef
@@ -262,6 +436,19 @@ CCoronas::Render(void)
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
 	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDONE);
 	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDONE);
+#ifdef LIBRW_VISIONOS
+	// S1: the world quads go through the im3d shader, which fogs per vertex -- the 2D
+	// sprites never were fogged (the game dims them via fogscale instead). Fog off and
+	// no back-face cull for the billboards; both restored at the end of Render.
+	void *vcSavedFog = nil, *vcSavedCull = nil;
+	const bool vcWorldCorona = vcWorldCoronaOn();
+	if(vcWorldCorona){
+		RwRenderStateGet(rwRENDERSTATEFOGENABLE, &vcSavedFog);
+		RwRenderStateGet(rwRENDERSTATECULLMODE, &vcSavedCull);
+		RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+		RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+	}
+#endif
 
 	for(i = 0; i < NUMCORONAS; i++){
 		for(j = 5; j > 0; j--){
@@ -329,13 +516,36 @@ CCoronas::Render(void)
 					RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
 
 				// render corona itself
+#ifdef LIBRW_VISIONOS
 				if(aCoronas[i].texture){
+#else
+				if(aCoronas[i].texture){
+#endif
 					float fogscale = CWeather::Foggyness*Min(spriteCoors.z, 40.0f)/40.0f + 1.0f;
 					if(CCoronas::aCoronas[i].id == SUN_CORE)
 						spriteCoors.z = 0.95f * RwCameraGetFarClipPlane(Scene.camera);
 					RwRenderStateSet(rwRENDERSTATETEXTURERASTER, RwTextureGetRaster(aCoronas[i].texture));
 					spriteCoors.z -= aCoronas[i].nearDist;
-
+#ifdef LIBRW_VISIONOS
+					if(vcWorldCorona){
+						// S1: world-space billboard instead of the 2D sprite (see helper)
+						const float zorig = 1.0f / recipz;
+						if(aCoronas[i].texture == gpCoronaTexture[8]){
+							float f = 1.0f - aCoronas[i].someAngle*2.0f/PI;
+							float wscale = 6.0f*sq(sq(sq(f))) + 0.5f;
+							float hscale = Max(0.35f - (wscale - 0.5f) * 0.06f, 0.15f);
+							vcRenderCoronaWorldQuad(aCoronas[i].coors, zorig, spriteCoors.z, spriteh,
+								spritew * aCoronas[i].size * wscale, spriteh * aCoronas[i].size * fogscale * hscale,
+								aCoronas[i].red / fogscale, aCoronas[i].green / fogscale, aCoronas[i].blue / fogscale,
+								totalFade, 0.0f, 255, false, spriteCoors.x);
+						}else{
+							vcRenderCoronaWorldQuad(aCoronas[i].coors, zorig, spriteCoors.z, spriteh,
+								spritew * aCoronas[i].size * fogscale, spriteh * aCoronas[i].size * fogscale,
+								aCoronas[i].red / fogscale, aCoronas[i].green / fogscale, aCoronas[i].blue / fogscale,
+								totalFade, 20.0f * recipz, 255, true, spriteCoors.x);
+						}
+					}else
+#endif
 					if(aCoronas[i].texture == gpCoronaTexture[8]){
 						// what's this?
 						float f = 1.0f - aCoronas[i].someAngle*2.0f/PI;
@@ -412,6 +622,13 @@ CCoronas::Render(void)
 	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDONE);
 	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDONE);
 	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, nil);
+#ifdef LIBRW_VISIONOS
+	if(vcWorldCorona){
+		RwRenderStateSet(rwRENDERSTATEFOGENABLE, vcSavedFog);
+		RwRenderStateSet(rwRENDERSTATECULLMODE, vcSavedCull);
+		vcCoronaDiagFlush();
+	}
+#endif
 
 	// streaks
 	for(i = 0; i < NUMCORONAS; i++){

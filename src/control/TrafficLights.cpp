@@ -15,6 +15,19 @@
 #include "Weather.h"
 #include "World.h"
 
+// BrightLights in VR (multiview-plan.md, 2026-09-30): the lit hexagon of a traffic light
+// sits at the raw 2dfx position, which on the STACKED models (lamps one above the other:
+// trafficlight1, MTraffic2, MTraffic4) lies in/under the housing opening and is cut by the
+// visor from close by in stereo. A non-zero front vector tells CBrightLights::Render to push
+// the hexagon toward the camera; the vector itself is only the flag. MTraffic1 (lamps side
+// by side, on the housing face) keeps the stock zero -> stock placement. Device acceptance:
+// pushing all four stood off too far on MTraffic1, the stacked ones were "perfekt".
+#ifdef LIBRW_VISIONOS
+#define VC_TL_PUSH(ent) ((ent)->GetForward())
+#else
+#define VC_TL_PUSH(ent) CVector(0.0f, 0.0f, 0.0f)
+#endif
+
 bool CTrafficLights::bGreenLightsCheat;
 
 void
@@ -112,8 +125,8 @@ CTrafficLights::DisplayActualLight(CEntity *ent)
 				CCoronas::TYPE_STAR, CCoronas::FLARE_NONE, CCoronas::REFLECTION_ON,
 				CCoronas::LOSCHECK_OFF, CCoronas::STREAK_OFF, 0.0f);
 
-		CBrightLights::RegisterOne(pos1, ent->GetUp(), ent->GetRight(), CVector(0.0f, 0.0f, 0.0f), id + BRIGHTLIGHT_TRAFFIC_GREEN);
-		CBrightLights::RegisterOne(pos2, ent->GetUp(), -ent->GetRight(), CVector(0.0f, 0.0f, 0.0f), id + BRIGHTLIGHT_TRAFFIC_GREEN);
+		CBrightLights::RegisterOne(pos1, ent->GetUp(), ent->GetRight(), VC_TL_PUSH(ent), id + BRIGHTLIGHT_TRAFFIC_GREEN);
+		CBrightLights::RegisterOne(pos2, ent->GetUp(), -ent->GetRight(), VC_TL_PUSH(ent), id + BRIGHTLIGHT_TRAFFIC_GREEN);
 	}
 	else if (MI_TRAFFICLIGHTS_VERTICAL == m) {
 		CBaseModelInfo* mi = CModelInfo::GetModelInfo(ent->GetModelIndex());
@@ -160,7 +173,7 @@ CTrafficLights::DisplayActualLight(CEntity *ent)
 			break;
 		}
 
-		CBrightLights::RegisterOne(pos1, ent->GetUp(), ent->GetRight(), CVector(0.0f, 0.0f, 0.0f), id + BRIGHTLIGHT_TRAFFIC_GREEN);
+		CBrightLights::RegisterOne(pos1, ent->GetUp(), ent->GetRight(), VC_TL_PUSH(ent), id + BRIGHTLIGHT_TRAFFIC_GREEN);
 
 		if (CWeather::TrafficLightBrightness > 0.5f)
 			CPointLights::AddLight(CPointLights::LIGHT_POINT,
@@ -258,8 +271,11 @@ CTrafficLights::DisplayActualLight(CEntity *ent)
 
 		CVector pos = (pos1 + pos2) / 2;
 		if (id >= 0) {
-			CBrightLights::RegisterOne(pos1, ent->GetUp(), ent->GetRight(), CVector(0.0f, 0.0f, 0.0f), id + BRIGHTLIGHT_TRAFFIC_GREEN);
-			CBrightLights::RegisterOne(pos2, ent->GetUp(), ent->GetRight(), CVector(0.0f, 0.0f, 0.0f), id + BRIGHTLIGHT_TRAFFIC_GREEN);
+			// MTraffic1 (MIAMI) has its lamps side by side and sits on the housing face:
+			// stock placement. MTraffic2 (TWOVERTICAL) is stacked like the other two.
+			CVector vcPush = (MI_TRAFFICLIGHTS_TWOVERTICAL == m) ? VC_TL_PUSH(ent) : CVector(0.0f, 0.0f, 0.0f);
+			CBrightLights::RegisterOne(pos1, ent->GetUp(), ent->GetRight(), vcPush, id + BRIGHTLIGHT_TRAFFIC_GREEN);
+			CBrightLights::RegisterOne(pos2, ent->GetUp(), ent->GetRight(), vcPush, id + BRIGHTLIGHT_TRAFFIC_GREEN);
 		}
 
 		if (CWeather::TrafficLightBrightness > 0.5f)

@@ -1017,6 +1017,53 @@ static RwImVertexIndex CubeIndices[12*3] = {
 	6, 0, 4,  6, 2, 0,  6, 5, 7,  6, 4, 5
 };
 
+#ifdef LIBRW_VISIONOS
+// BrightLights in VR (multiview-plan.md, 2026-09-30). The stock lit bodies are built for a
+// flat screen at distance: a white CUBE 0.4x0.2x0.2 m straddling the lamp (+-0.1 m along
+// the car's forward axis) and a HEXAGON at the raw 2dfx position of a traffic light, which
+// on the vertical model MTraffic4 lies 7-8 cm INSIDE the housing opening. In stereo from
+// close by the cube reads as a box sticking out of the headlight, and the hexagon is cut
+// by the visor and side walls. Both are drawn here instead as: a flat QUAD in the lamp's
+// side/up plane, pushed 3 cm toward the camera (car, no z-fight with the lamp glass), and
+// the hexagon pushed 9 cm out of the housing toward the camera -- ONLY for lights that were
+// registered with a forward axis (TrafficLights.cpp does that for MTraffic4 alone; the
+// horizontal models sit on their housing face already and stood off too far with a push,
+// device acceptance 2026-09-30). "Toward the camera" rather than the plane normal, because
+// the camera side is what must be clear. Culling is off for these draws (a flat quad has a
+// back). Values fixed after device acceptance (car "recht gut", MTraffic4 "perfekt").
+#define VC_BL_CAR_OFF     0.03f
+#define VC_BL_TRAFFIC_OFF 0.09f
+static RwImVertexIndex vcQuadIndices[2*3] = { 0, 1, 2,  1, 3, 2 };
+
+// unit vector along n, flipped so it points toward the camera from pos
+static CVector
+vcTowardCamera(CVector n, const CVector &pos)
+{
+	float l = n.Magnitude();
+	if(l < 1e-4f) return CVector(0.0f, 0.0f, 0.0f);
+	n *= 1.0f / l;
+	if(DotProduct(n, TheCamera.GetPosition() - pos) < 0.0f) n = -n;
+	return n;
+}
+
+// flat car lamp: corners (-s,+u) (+s,+u) (-s,-u) (+s,-u) = entries 0,1,4,5 of the stock arrays
+static void
+vcBrightLightQuad(const CBrightLight &bl, const float *sideArr, const float *upArr, int r, int g, int b, int a)
+{
+	static const int corner[4] = { 0, 1, 4, 5 };
+	CVector n = vcTowardCamera(bl.m_front, bl.m_pos);
+	for(int j = 0; j < 4; j++){
+		CVector pos = sideArr[corner[j]]*bl.m_side + upArr[corner[j]]*bl.m_up + n*VC_BL_CAR_OFF + bl.m_pos;
+		RwIm3DVertexSetRGBA(&TempBufferRenderVertices[TempBufferVerticesStored+j], r, g, b, a);
+		RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored+j], pos.x, pos.y, pos.z);
+	}
+	for(int j = 0; j < 2*3; j++)
+		TempBufferRenderIndexList[TempBufferIndicesStored+j] = vcQuadIndices[j] + TempBufferVerticesStored;
+	TempBufferVerticesStored += 4;
+	TempBufferIndicesStored += 2*3;
+}
+#endif
+
 void
 CBrightLights::Render(void)
 {
@@ -1031,6 +1078,11 @@ CBrightLights::Render(void)
 	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
 	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
 	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, nil);
+#ifdef LIBRW_VISIONOS
+	void *vcSavedCull = nil;
+	RwRenderStateGet(rwRENDERSTATECULLMODE, &vcSavedCull);
+	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+#endif
 
 	TempBufferVerticesStored = 0;
 	TempBufferIndicesStored = 0;
@@ -1093,10 +1145,20 @@ CBrightLights::Render(void)
 		case BRIGHTLIGHT_TRAFFIC_GREEN:
 		case BRIGHTLIGHT_TRAFFIC_YELLOW:
 		case BRIGHTLIGHT_TRAFFIC_RED:
+			{
+			CVector vcOut(0.0f, 0.0f, 0.0f);
+#ifdef LIBRW_VISIONOS
+			// out of the housing toward the camera, along the hexagon's plane normal
+			// (up x side) -- the direction that worked in the first device version. Only
+			// for lights registered with a non-zero front (the FLAG set in TrafficLights.cpp
+			// for the stacked models); zero front = stock placement.
+			if(aBrightLights[i].m_front.MagnitudeSqr() > 1e-6f)
+				vcOut = vcTowardCamera(CrossProduct(aBrightLights[i].m_up, aBrightLights[i].m_side), aBrightLights[i].m_pos) * VC_BL_TRAFFIC_OFF;
+#endif
 			for(j = 0; j < 6; j++){
 				pos = TrafficLightsSide[j]*aBrightLights[i].m_side +
 					TrafficLightsUp[j]*aBrightLights[i].m_up +
-					aBrightLights[i].m_pos;
+					aBrightLights[i].m_pos + vcOut;
 				RwIm3DVertexSetRGBA(&TempBufferRenderVertices[TempBufferVerticesStored+j], r, g, b, a);
 				RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored+j], pos.x, pos.y, pos.z);
 			}
@@ -1104,10 +1166,14 @@ CBrightLights::Render(void)
 				TempBufferRenderIndexList[TempBufferIndicesStored+j] = TrafficLightIndices[j] + TempBufferVerticesStored;
 			TempBufferVerticesStored += 6;
 			TempBufferIndicesStored += 4*3;
+			}
 			break;
 
 		case BRIGHTLIGHT_FRONT_LONG:
 		case BRIGHTLIGHT_REAR_LONG:
+#ifdef LIBRW_VISIONOS
+			vcBrightLightQuad(aBrightLights[i], LongCarHeadLightsSide, LongCarHeadLightsUp, r, g, b, a); break;
+#endif
 			for(j = 0; j < 8; j++){
 				pos = LongCarHeadLightsSide[j]*aBrightLights[i].m_side +
 					LongCarHeadLightsUp[j]*aBrightLights[i].m_up +
@@ -1124,6 +1190,9 @@ CBrightLights::Render(void)
 
 		case BRIGHTLIGHT_FRONT_SMALL:
 		case BRIGHTLIGHT_REAR_SMALL:
+#ifdef LIBRW_VISIONOS
+			vcBrightLightQuad(aBrightLights[i], SmallCarHeadLightsSide, SmallCarHeadLightsUp, r, g, b, a); break;
+#endif
 			for(j = 0; j < 8; j++){
 				pos = SmallCarHeadLightsSide[j]*aBrightLights[i].m_side +
 					SmallCarHeadLightsUp[j]*aBrightLights[i].m_up +
@@ -1140,6 +1209,9 @@ CBrightLights::Render(void)
 
 		case BRIGHTLIGHT_FRONT_BIG:
 		case BRIGHTLIGHT_REAR_BIG:
+#ifdef LIBRW_VISIONOS
+			vcBrightLightQuad(aBrightLights[i], BigCarHeadLightsSide, BigCarHeadLightsUp, r, g, b, a); break;
+#endif
 			for (j = 0; j < 8; j++) {
 				pos = BigCarHeadLightsSide[j] * aBrightLights[i].m_side +
 					BigCarHeadLightsUp[j] * aBrightLights[i].m_up +
@@ -1156,6 +1228,9 @@ CBrightLights::Render(void)
 
 		case BRIGHTLIGHT_FRONT_TALL:
 		case BRIGHTLIGHT_REAR_TALL:
+#ifdef LIBRW_VISIONOS
+			vcBrightLightQuad(aBrightLights[i], TallCarHeadLightsSide, TallCarHeadLightsUp, r, g, b, a); break;
+#endif
 			for(j = 0; j < 8; j++){
 				pos = TallCarHeadLightsSide[j]*aBrightLights[i].m_side +
 					TallCarHeadLightsUp[j]*aBrightLights[i].m_up +
@@ -1190,6 +1265,7 @@ CBrightLights::Render(void)
 	RenderOutGeometryBuffer();
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
 #ifdef LIBRW_VISIONOS
+	RwRenderStateSet(rwRENDERSTATECULLMODE, vcSavedCull);
 	// Stereo: filled once per frame (CAutomobile/CBike::PreRender). Preserve on eye 0 so
 	// eye 1 still has the lights; reset on last eye (2) + mono (0). See Shadows.cpp guard.
 	if(vc_in_stereo_eye() != 1)
