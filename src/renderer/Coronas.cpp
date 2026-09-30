@@ -516,11 +516,7 @@ CCoronas::Render(void)
 					RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
 
 				// render corona itself
-#ifdef LIBRW_VISIONOS
 				if(aCoronas[i].texture){
-#else
-				if(aCoronas[i].texture){
-#endif
 					float fogscale = CWeather::Foggyness*Min(spriteCoors.z, 40.0f)/40.0f + 1.0f;
 					if(CCoronas::aCoronas[i].id == SUN_CORE)
 						spriteCoors.z = 0.95f * RwCameraGetFarClipPlane(Scene.camera);
