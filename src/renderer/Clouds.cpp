@@ -13,10 +13,153 @@
 #include "Timer.h"
 #include "Timecycle.h"
 #include "Renderer.h"
+#include "Draw.h"
 #include "Clouds.h"
 
 #define SMALLSTRIPHEIGHT 4.0f
 #define HORIZSTRIPHEIGHT 48.0f
+
+#ifdef LIBRW_VISIONOS
+// ---- S6: sky sprites as world-space upright billboards (multiview-plan.md) ----------
+// The stock path projects every sky sprite (moon, R* stars, low clouds, fluffy clouds,
+// their sun highlights, rainbow) to SCREEN space and draws a screen-aligned quad whose
+// roll is corrected by ms_cameraRoll. In the headset that is wrong twice: the quad rolls
+// with the head (ms_cameraRoll is the stale flat-camera roll -- RenderBackground does not
+// run in stereo), and a fixed screen-size quad is not what a world quad looks like
+// off-axis under the wide eye projection, so clouds "swim" during head turns.
+// Same cure as the S1 coronas: an UPRIGHT world billboard at the sprite's world position
+// (horizontal axis = true horizon, from world up and the line of sight; fallback to the
+// view axes when looking straight up/down), drawn through RwIm3D so the multiview twin
+// puts it in both views with the right per-eye matrices. The game's sprite "size" factor
+// (szx*55 etc.) IS the world half-size in metres (szx = focal/z), so the quad needs no
+// screen maths at all; CalcScreenCoors is kept only for the near cull and the sun-distance
+// highlight logic. Sprites beyond the far clip (low clouds at 800 m) are pulled inside
+// with the per-eye view-space homothety of the im3d shader (u_im3dPull, see Coronas.cpp):
+// screen position and size stay, only depth changes. Fog off + cull none around the draws
+// (additive quads would otherwise ADD the fog colour = the grey rectangles seen with the
+// first sky dome). Batched per texture like the stock sprite buffer.
+// VC_WORLD_CLOUDS=0 restores the 2D path (A/B).
+extern "C" int vc_render_mode(void);   // 1 = stereo VR
+extern "C" void vc_im3d_pull(float delta);
+
+static bool vcWorldCloudsOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_WORLD_CLOUDS"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0 && vc_render_mode() == 1;
+}
+
+#define VC_WS_MAX 64
+static RwIm3DVertex vcWsVerts[VC_WS_MAX*4];
+static RwImVertexIndex vcWsIdx[VC_WS_MAX*6];
+static int vcWsCount = 0;
+static float vcWsMaxZ = 0.0f;
+
+// upright billboard axes at pos: ax = world-horizontal screen-right, ay = screen-down
+// (sign-aligned to the view axes so texture orientation matches the 2D sprite)
+static bool
+vcWsAxes(const CVector &pos, CVector &ax, CVector &ay)
+{
+	const CMatrix &V = TheCamera.m_viewMatrix;
+	CVector vx(V.GetRight().x, V.GetForward().x, V.GetUp().x);   // view +x in world
+	CVector vy(V.GetRight().y, V.GetForward().y, V.GetUp().y);   // view +y in world (screen down)
+	CVector fwd = pos - TheCamera.GetPosition();
+	float fl = fwd.Magnitude(); if(fl < 1e-4f) return false;
+	fwd *= 1.0f / fl;
+	ax = CrossProduct(fwd, CVector(0.0f, 0.0f, 1.0f));
+	if(ax.Magnitude() > 0.05f){
+		ax.Normalise();
+		ay = CrossProduct(ax, fwd);
+		ay.Normalise();
+		if(DotProduct(ax, vx) < 0.0f) ax = -ax;
+		if(DotProduct(ay, vy) < 0.0f) ay = -ay;
+	}else{
+		ax = vx; ay = vy;
+		float lx = ax.Magnitude(), ly = ay.Magnitude();
+		if(lx < 1e-4f || ly < 1e-4f) return false;
+		ax *= 1.0f / lx; ay -= ax * DotProduct(ax, ay);
+		float l = ay.Magnitude(); if(l < 1e-4f) return false;
+		ay *= 1.0f / l;
+	}
+	return true;
+}
+
+static void vcWsFlush(void);
+
+// one sprite: world position, view depth (for the far pull), half sizes in metres,
+// rotation as the 2D path, two colours blended per corner exactly like
+// RenderBufferedOneXLUSprite_Rotate_2Colours (cx/cy = gradient direction; for a flat colour
+// pass the same colour twice -- cx=cy=0 gives the 50/50 mix)
+static void
+vcWsAdd(const CVector &pos, float zview, float halfW, float halfH, float rotation,
+	int r1, int g1, int b1, int r2, int g2, int b2, float cx, float cy, int a)
+{
+	if(vcWsCount >= VC_WS_MAX) vcWsFlush();
+	CVector ax, ay;
+	if(!vcWsAxes(pos, ax, ay)) return;
+	float c = Cos(rotation), sn = Sin(rotation);
+	// corner order/uv of the 2D sprite: 0 (-w,-h) 1 (-w,+h) 2 (+w,+h) 3 (+w,-h)
+	float sx[4] = { halfW*(-c-sn), halfW*(-c+sn), halfW*(+c+sn), halfW*(+c-sn) };
+	float sy[4] = { halfH*(-c+sn), halfH*(+c+sn), halfH*(+c-sn), halfH*(-c-sn) };
+	float cf[4] = { (cx*(-c-sn) + cy*(-c+sn))*0.5f + 0.5f, (cx*(-c+sn) + cy*( c+sn))*0.5f + 0.5f,
+	                (cx*( c+sn) + cy*( c-sn))*0.5f + 0.5f, (cx*( c-sn) + cy*(-c-sn))*0.5f + 0.5f };
+	static const float us[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+	static const float vs[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
+	RwIm3DVertex *v = &vcWsVerts[vcWsCount*4];
+	for(int i = 0; i < 4; i++){
+		float f = Clamp(cf[i], 0.0f, 1.0f);
+		CVector p = pos + ax*sx[i] + ay*sy[i];
+		RwIm3DVertexSetPos(&v[i], p.x, p.y, p.z);
+		RwIm3DVertexSetRGBA(&v[i], (int)(r1*f + r2*(1.0f-f)), (int)(g1*f + g2*(1.0f-f)), (int)(b1*f + b2*(1.0f-f)), a);
+		RwIm3DVertexSetU(&v[i], us[i]);
+		RwIm3DVertexSetV(&v[i], vs[i]);
+	}
+	static const RwImVertexIndex q[6] = { 0, 1, 2, 0, 2, 3 };
+	for(int i = 0; i < 6; i++)
+		vcWsIdx[vcWsCount*6 + i] = q[i] + vcWsCount*4;
+	if(zview > vcWsMaxZ) vcWsMaxZ = zview;
+	vcWsCount++;
+}
+
+static void
+vcWsFlush(void)
+{
+	if(vcWsCount == 0) return;
+	// far pull for the whole batch: one homothety about the eye keeps every quad's screen
+	// position/size; depth ordering is irrelevant here (ZTEST off for the sky)
+	float farLimit = 0.9f * CDraw::GetFarClipZ();
+	float pull = 0.0f;
+	if(vcWsMaxZ > farLimit && vcWsMaxZ > 0.0f) pull = farLimit / vcWsMaxZ - 1.0f;
+	if(pull < -0.95f) pull = -0.95f;
+	void *savedFog = nil, *savedCull = nil;
+	RwRenderStateGet(rwRENDERSTATEFOGENABLE, &savedFog);
+	RwRenderStateGet(rwRENDERSTATECULLMODE, &savedCull);
+	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+	vc_im3d_pull(pull);
+	if(RwIm3DTransform(vcWsVerts, vcWsCount*4, nil, rwIM3D_VERTEXXYZ|rwIM3D_VERTEXRGBA|rwIM3D_VERTEXUV)){
+		RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST, vcWsIdx, vcWsCount*6);
+		RwIm3DEnd();
+	}
+	vc_im3d_pull(0.0f);
+	RwRenderStateSet(rwRENDERSTATEFOGENABLE, savedFog);
+	RwRenderStateSet(rwRENDERSTATECULLMODE, savedCull);
+	vcWsCount = 0;
+	vcWsMaxZ = 0.0f;
+}
+
+// angle of the sun as seen from a sprite, measured in the billboard plane exactly like the
+// 2D path measures it on screen (x right, y down): replaces GetATanOfXY(screen - SunScreen)
+static float
+vcWsSunAngle(const CVector &pos)
+{
+	CVector ax, ay;
+	if(!vcWsAxes(pos, ax, ay)) return 0.0f;
+	CVector sunWorld = TheCamera.GetPosition() + CTimeCycle::GetSunDirection() * 2000.0f;
+	CVector d = pos - sunWorld;
+	return CGeneral::GetATanOfXY(DotProduct(d, ax), DotProduct(d, ay));
+}
+#endif
 
 RwTexture *gpCloudTex[5];
 
@@ -133,6 +276,9 @@ CClouds::Render(void)
 
 	float minute = CClock::GetHours()*60 + CClock::GetMinutes() + CClock::GetSeconds()/60.0f;
 	RwV3d campos = TheCamera.GetPosition();
+#ifdef LIBRW_VISIONOS
+	const bool vcWorld = vcWorldCloudsOn();   // S6: world billboards instead of screen sprites
+#endif
 
 	// Moon
 	float moonfadeout = Abs(minute - 180.0f);	// fully visible at 3AM
@@ -143,10 +289,19 @@ CClouds::Render(void)
 		RwV3dAdd(&worldpos, &campos, &pos);
 		if(CSprite::CalcScreenCoors(worldpos, &screenpos, &szx, &szy, false)){
 			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, RwTextureGetRaster(gpCoronaTexture[2]));
+#ifdef LIBRW_VISIONOS
+			if(vcWorld){
+				float half = CCoronas::MoonSize*2.0f + 4.0f;
+				vcWsAdd(worldpos, screenpos.z, half, half, 0.0f, brightness, brightness, brightness, brightness, brightness, brightness, 0.0f, 0.0f, 255);
+				vcWsFlush();
+			}else
+#endif
+			{
 			szx *= CCoronas::MoonSize*2.0f + 4.0f;
 			szy *= CCoronas::MoonSize*2.0f + 4.0f;
 			CSprite::RenderOneXLUSprite(screenpos.x, screenpos.y, screenpos.z,
 				szx, szy, brightness, brightness, brightness, 255, 1.0f/screenpos.z, 255);
+			}
 		}
 	}
 
@@ -174,6 +329,12 @@ CClouds::Render(void)
 			worldpos.z += 80.0f*StarCoorsY[i%9];
 			if(CSprite::CalcScreenCoors(worldpos, &screenpos, &szx, &szy, false)){
 				float sz = 0.8f*StarSizes[i%9];
+#ifdef LIBRW_VISIONOS
+				if(vcWorld){
+					vcWsAdd(worldpos, screenpos.z, sz, sz, 0.0f, brightness, brightness, brightness, brightness, brightness, brightness, 0.0f, 0.0f, 255);
+					continue;
+				}
+#endif
 				CSprite::RenderBufferedOneXLUSprite(screenpos.x, screenpos.y, screenpos.z,
 					szx*sz, szy*sz, brightness, brightness, brightness, 255, 1.0f/screenpos.z, 255);
 			}
@@ -187,9 +348,18 @@ CClouds::Render(void)
 		worldpos.y -= 90.0f;
 		if(CSprite::CalcScreenCoors(worldpos, &screenpos, &szx, &szy, false)){
 			brightness *= (CGeneral::GetRandomNumber()&127) / 640.0f + 0.5f;
+#ifdef LIBRW_VISIONOS
+			if(vcWorld){
+				vcWsAdd(worldpos, screenpos.z, 5.0f, 5.0f, 0.0f, brightness, brightness, brightness, brightness, brightness, brightness, 0.0f, 0.0f, 255);
+				vcWsFlush();   // R + * share the texture: one batch
+			}else
+#endif
 			CSprite::RenderOneXLUSprite(screenpos.x, screenpos.y, screenpos.z,
 				szx*5.0f, szy*5.0f, brightness, brightness, brightness, 255, 1.0f/screenpos.z, 255);
 		}
+#ifdef LIBRW_VISIONOS
+		vcWsFlush();   // in case the * was culled but the R was not
+#endif
 	}
 
 	// Low clouds
@@ -204,11 +374,19 @@ CClouds::Render(void)
 			worldpos.x = campos.x + pos.x;
 			worldpos.y = campos.y + pos.y;
 			worldpos.z = 40.0f + pos.z;
-			if(CSprite::CalcScreenCoors(worldpos, &screenpos, &szx, &szy, false))
+			if(CSprite::CalcScreenCoors(worldpos, &screenpos, &szx, &szy, false)){
+#ifdef LIBRW_VISIONOS
+				// upright billboard: the horizon roll correction (ms_cameraRoll) is inherent
+				if(vcWorld){ vcWsAdd(worldpos, screenpos.z, 320.0f, 40.0f, 0.0f, r, g, b, r, g, b, 0.0f, 0.0f, 255); continue; }
+#endif
 				CSprite::RenderBufferedOneXLUSprite_Rotate_Dimension(screenpos.x, screenpos.y, screenpos.z,
 					szx*320.0f, szy*40.0f, r, g, b, 255, 1.0f/screenpos.z, ms_cameraRoll, 255);
+			}
 		}
 		CSprite::FlushSpriteBuffer();
+#ifdef LIBRW_VISIONOS
+		vcWsFlush();
+#endif
 	}
 
 	// Fluffy clouds
@@ -249,6 +427,15 @@ CClouds::Render(void)
 						CCoronas::SunBlockedByClouds = true;
 				}else
 					hilight = 0.0f;
+#ifdef LIBRW_VISIONOS
+				if(vcWorld){
+					// own spin only; the head/camera roll is handled by the upright axes
+					vcWsAdd(worldpos, screenpos.z, 55.0f, 55.0f, (uint16)IndividualRotation/65336.0f * 6.28f,
+						tr, tg, tb, br, bg, bb, 0.0f, -1.0f, fluffyalpha);
+					bCloudOnScreen[i] = true;
+					continue;
+				}
+#endif
 				CSprite::RenderBufferedOneXLUSprite_Rotate_2Colours(screenpos.x, screenpos.y, screenpos.z,
 					szx*55.0f, szy*55.0f,
 					tr, tg, tb, br, bg, bb, 0.0f, -1.0f,
@@ -260,6 +447,9 @@ CClouds::Render(void)
 				bCloudOnScreen[i] = false;
 		}
 		CSprite::FlushSpriteBuffer();
+#ifdef LIBRW_VISIONOS
+		vcWsFlush();
+#endif
 
 		// Highlights
 		RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDONE);
@@ -273,6 +463,15 @@ CClouds::Render(void)
 			worldpos.z = pos.z;
 			if(bCloudOnScreen[i] && CSprite::CalcScreenCoors(worldpos, &screenpos, &szx, &szy, false)){
 				if(sundist < SCREEN_WIDTH/3){
+#ifdef LIBRW_VISIONOS
+					if(vcWorld){
+						// sun direction measured in the billboard plane instead of on screen
+						int hr = 200*hilight;
+						vcWsAdd(worldpos, screenpos.z, 30.0f, 30.0f, 1.7f - vcWsSunAngle(worldpos),
+							hr, 0, 0, hr, 0, 0, 0.0f, 0.0f, 255);
+						continue;
+					}
+#endif
 					CSprite::RenderBufferedOneXLUSprite_Rotate_Aspect(screenpos.x, screenpos.y, screenpos.z,
 						szx*30.0f, szy*30.0f,
 						200*hilight, 0, 0, 255, 1.0f/screenpos.z,
@@ -281,6 +480,9 @@ CClouds::Render(void)
 			}
 		}
 		CSprite::FlushSpriteBuffer();
+#ifdef LIBRW_VISIONOS
+		vcWsFlush();
+#endif
 	}
 
 	// Rainbow
@@ -289,14 +491,24 @@ CClouds::Render(void)
 		for(i = 0; i < 6; i++){
 			RwV3d pos = { i*1.5f, 100.0f, 5.0f };
 			RwV3dAdd(&worldpos, &campos, &pos);
-			if(CSprite::CalcScreenCoors(worldpos, &screenpos, &szx, &szy, false))
+			if(CSprite::CalcScreenCoors(worldpos, &screenpos, &szx, &szy, false)){
+#ifdef LIBRW_VISIONOS
+				if(vcWorld){
+					int rr = BowRed[i]*CWeather::Rainbow, rg = BowGreen[i]*CWeather::Rainbow, rb = BowBlue[i]*CWeather::Rainbow;
+					vcWsAdd(worldpos, screenpos.z, 2.0f, 50.0f, 0.0f, rr, rg, rb, rr, rg, rb, 0.0f, 0.0f, 255);
+					continue;
+				}
+#endif
 				CSprite::RenderBufferedOneXLUSprite(screenpos.x, screenpos.y, screenpos.z,
 					2.0f*szx, 50.0*szy,
 					BowRed[i]*CWeather::Rainbow, BowGreen[i]*CWeather::Rainbow, BowBlue[i]*CWeather::Rainbow,
 					255, 1.0f/screenpos.z, 255);
-
+			}
 		}
 		CSprite::FlushSpriteBuffer();
+#ifdef LIBRW_VISIONOS
+		vcWsFlush();
+#endif
 	}
 
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
