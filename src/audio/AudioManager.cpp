@@ -13,6 +13,11 @@
 #include "ZoneCull.h"
 #include "debugmenu.h"
 
+#ifdef LIBRW_VISIONOS
+extern "C" void vc_audio_stop_reason(const char *why);   // sampman_oal.cpp probe (VC_AUDIO_DIAG=1)
+extern "C" int  vc_audio_diag(void);
+#endif
+
 #ifdef DEBUGMENU
 SETTWEAKPATH("Audio");
 TWEAKBOOLN(AudioManager.m_bIsSurround, "Surround/Reverb");
@@ -334,6 +339,10 @@ cAudioManager::ResetTimers(uint32 time)
 	if (m_bIsInitialised) {
 		m_bTimerJustReset = TRUE;
 		m_nTimer = time;
+#ifdef LIBRW_VISIONOS
+		if (vc_audio_diag())
+			printf("[vc-audio-diag] ResetTimers: request queues + active sample list cleared (channels keep playing -> next assignment stops them as init-reuse)\n");
+#endif
 		ClearRequestedQueue();
 		if (m_nActiveQueue) {
 			m_nActiveQueue = 0;
@@ -541,6 +550,9 @@ cAudioManager::ServiceSoundEffects()
 #endif
 	m_bReduceReleasingPriority = (m_FrameCounter++ % 5) == 0;
 	if (m_bIsPaused && !m_bWasPaused) {
+#ifdef LIBRW_VISIONOS
+		vc_audio_stop_reason("pause-transition (ServiceSoundEffects stops all channels)");
+#endif
 #ifdef GTA_PS2
 		if (m_bIsSurround) {
 			for (uint32 i = 0; i < NUM_CHANNELS_DTS_GENERIC; i++)
@@ -574,6 +586,9 @@ cAudioManager::ServiceSoundEffects()
 			m_nActiveQueue = 0;
 		}
 		ClearActiveSamples();
+#ifdef LIBRW_VISIONOS
+		vc_audio_stop_reason("?");
+#endif
 	}
 	m_nActiveQueue = m_nActiveQueue == 1 ? 0 : 1;
 #ifdef AUDIO_REVERB
@@ -1235,7 +1250,13 @@ cAudioManager::ProcessActiveQueues()
 	}
 	for (uint8 i = 0; i < m_nActiveSamples; i++) {
 		if (m_asActiveSamples[i].m_nSampleIndex != NO_SAMPLE && !m_asActiveSamples[i].m_bIsBeingPlayed) {
+#ifdef LIBRW_VISIONOS
+			vc_audio_stop_reason("not-requested (ProcessActiveQueues: active sample not in this frame's request queue)");
+#endif
 			SampleManager.StopChannel(i);
+#ifdef LIBRW_VISIONOS
+			vc_audio_stop_reason("?");
+#endif
 			m_asActiveSamples[i].m_nSampleIndex = NO_SAMPLE;
 			m_asActiveSamples[i].m_nEntityIndex = AEHANDLE_NONE;
 		}

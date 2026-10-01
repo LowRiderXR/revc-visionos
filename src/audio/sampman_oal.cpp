@@ -1573,10 +1573,23 @@ cSampleManager::SetChannelReverbFlag(uint32 nChannel, bool8 nReverbFlag)
 	}
 }
 
+#ifdef LIBRW_VISIONOS
+// probe state/helpers defined next to StartChannel/StopChannel below
+static int32 g_vcChanSfx[NUM_CHANNELS];
+static void vcAudioLogStop(uint32 nChannel, const char *site);
+extern "C" void vc_audio_stop_reason(const char *why);
+#endif
+
 bool8
 cSampleManager::InitialiseChannel(uint32 nChannel, uint32 nSfx, uint8 nBank)
 {
 	ASSERT( nChannel < NUM_CHANNELS );
+#ifdef LIBRW_VISIONOS
+	// the "really!!!" stop below logs through StopChannel with this reason; the channel's
+	// previous sample is still in g_vcChanSfx at that point (assigned after the stop)
+	if ( GetChannelUsedFlag(nChannel) )
+		vc_audio_stop_reason("init-reuse (new sample assigned to a channel still playing)");
+#endif
 	
 	uintptr addr;
 	
@@ -1622,7 +1635,11 @@ cSampleManager::InitialiseChannel(uint32 nChannel, uint32 nSfx, uint8 nBank)
 		TRACE("Stopping channel %d - really!!!", nChannel);
 		StopChannel(nChannel);
 	}
-	
+#ifdef LIBRW_VISIONOS
+	vc_audio_stop_reason("?");
+	g_vcChanSfx[nChannel] = (int32)nSfx;
+#endif
+
 	aChannel[nChannel].Reset();
 	if ( aChannel[nChannel].HasSource() )
 	{	
@@ -1740,19 +1757,62 @@ cSampleManager::GetChannelUsedFlag(uint32 nChannel)
 	return aChannel[nChannel].IsUsed();
 }
 
+#ifdef LIBRW_VISIONOS
+// Probe VC_AUDIO_DIAG=1 (multiview-plan.md "Titelbildschirm / Chime"): who stops a channel
+// that is still PLAYING, and when, relative to the start of the menu chime (SFX_INFO_LEFT/
+// RIGHT). Callers in AudioManager.cpp tag their stop loops via vc_audio_stop_reason().
+#include <mach/mach_time.h>
+static const char *g_vcAudioStopReason = "?";
+static double g_vcChimeStartMs = -1.0;
+static double vcAudioNowMs(void)
+{
+	static mach_timebase_info_data_t tb = {0, 0};
+	if (tb.denom == 0) mach_timebase_info(&tb);
+	return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6;
+}
+extern "C" int vc_audio_diag(void)
+{
+	static int e = -1;
+	if (e < 0){ const char *s = getenv("VC_AUDIO_DIAG"); e = (s && s[0] == '1') ? 1 : 0; }
+	return e;
+}
+static inline int vcAudioDiag(void) { return vc_audio_diag(); }
+extern "C" void vc_audio_stop_reason(const char *why) { g_vcAudioStopReason = why ? why : "?"; }
+static void vcAudioLogStop(uint32 nChannel, const char *site)
+{
+	if (!vcAudioDiag() || !aChannel[nChannel].IsUsed()) return;
+	double now = vcAudioNowMs();
+	int32 sfx = g_vcChanSfx[nChannel];
+	bool chime = sfx == SFX_INFO_LEFT || sfx == SFX_INFO_RIGHT;
+	printf("[vc-audio-diag] STOP playing ch=%u sfx=%d%s site=%s reason=%s t=%.1f\n",
+	       nChannel, (int)sfx, chime ? " (CHIME)" : "", site, g_vcAudioStopReason, now);
+	if (chime && g_vcChimeStartMs >= 0.0)
+		printf("[vc-audio-diag]   -> chime cut %.1f ms after its start\n", now - g_vcChimeStartMs);
+}
+#endif
+
 void
 cSampleManager::StartChannel(uint32 nChannel)
 {
 	ASSERT( nChannel < NUM_CHANNELS );
-	
+
 	aChannel[nChannel].Start();
+#ifdef LIBRW_VISIONOS
+	if (vcAudioDiag() && (g_vcChanSfx[nChannel] == SFX_INFO_LEFT || g_vcChanSfx[nChannel] == SFX_INFO_RIGHT)) {
+		g_vcChimeStartMs = vcAudioNowMs();
+		printf("[vc-audio-diag] CHIME start ch=%u sfx=%d t=%.1f playing=%d\n", nChannel, (int)g_vcChanSfx[nChannel],
+		       g_vcChimeStartMs, aChannel[nChannel].IsUsed() ? 1 : 0);
+	}
+#endif
 }
 
 void
 cSampleManager::StopChannel(uint32 nChannel)
 {
 	ASSERT( nChannel < NUM_CHANNELS );
-	
+#ifdef LIBRW_VISIONOS
+	vcAudioLogStop(nChannel, "StopChannel");
+#endif
 	aChannel[nChannel].Stop();
 }
 

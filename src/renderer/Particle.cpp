@@ -240,16 +240,10 @@ float fParticleScaleLimit       = 0.5f;
 
 #ifdef LIBRW_VISIONOS
 // Particle time base (multiview-plan.md "Springbrunnen"): emission of particle objects
-// and sprite expansion are per-frame quantities authored for 30 fps. At the headset's
-// 90-100 fps both run ~3x -- 3x the live particles, 3x the growth. Default ON: scale
-// both by CTimer::GetTimeStepFix(). VC_PARTICLE_TIMEBASE=0 restores stock (A/B).
-extern "C" int vc_particle_timebase(void)
-{
-	static int e = -1;
-	if(e < 0){ const char *s = getenv("VC_PARTICLE_TIMEBASE"); e = (s && s[0] == '0') ? 0 : 1; }
-	return e;
-}
-static inline bool vcParticleTimeBase(void) { return vc_particle_timebase() != 0; }
+// (ParticleObject.cpp) and sprite expansion (Update below) are per-frame quantities
+// authored for 30 fps. At the headset's 90-100 fps both ran ~3x -- 3x the live particles,
+// 3x the growth. Both are scaled by CTimer::GetTimeStepFix() now; accepted on device
+// 2026-10-01 ("Springbrunnen deutlich besser, Rauch und Feuer gut"), no switch.
 #endif
 
 bool clearWaterDrop;
@@ -1435,8 +1429,8 @@ void CParticle::Update()
 				// 90-100 fps sprites grow 3x faster -- the fountain's SPLASH mist reached
 				// metres within a second and filled the screen (spr=199/1283 MP outlier).
 				// Scale by GetTimeStepFix() (= frame time / 30-fps frame) so growth per
-				// SECOND matches the original. VC_PARTICLE_TIMEBASE=0 restores stock (A/B).
-				const float fix = vcParticleTimeBase() ? CTimer::GetTimeStepFix() : 1.0f;
+				// SECOND matches the original.
+				const float fix = CTimer::GetTimeStepFix();
 #else
 				const float fix = 1.0f;
 #endif

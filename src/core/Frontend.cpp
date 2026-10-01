@@ -662,6 +662,8 @@ CMenuManager::Initialise(void)
 	// !m_bWasPaused) and stops ALL channels -- including the chime that just started.
 	// Set the pause first and run the transition through one Service, then play.
 	// Front-end sounds are processed while paused (menu ticks work), so the chime plays.
+	// Proven on device 2026-10-01 with the VC_AUDIO_DIAG probe: stock order -> chime stopped
+	// 20 ms after start (reason pause-transition); this order -> no stop at all.
 	CTimer::StartUserPause();
 	DMAudio.Service();
 #endif

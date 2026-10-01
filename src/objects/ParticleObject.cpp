@@ -10,10 +10,6 @@
 #include "DMAudio.h"
 #include "screendroplets.h"
 
-#ifdef LIBRW_VISIONOS
-extern "C" int vc_particle_timebase(void);   // Particle.cpp: 30-fps time base for emission/expansion
-#endif
-
 #ifdef COMPATIBLE_SAVES
 #define PARTICLE_OBJECT_SIZEOF 0x84
 #else
@@ -504,16 +500,9 @@ void CParticleObject::UpdateClose(void)
 	// for 30 fps -- the fountain (skipFrames 1) emitted 8 SPLASH particles per frame, i.e.
 	// ~800 live at 100 fps instead of ~240. Count 30-fps-frame equivalents instead:
 	// m_nFrameCounter accumulates GetTimeStepFix() in 1/16 steps (same field, saved as
-	// before), emission when >= skipFrames. VC_PARTICLE_TIMEBASE=0 = stock per-frame.
-	bool vcEmit;
-	if ( vc_particle_timebase() )
-	{
-		this->m_nFrameCounter += (uint16)Max(1.0f, CTimer::GetTimeStepFix() * 16.0f + 0.5f);
-		vcEmit = this->m_nFrameCounter >= this->m_nSkipFrames * 16;
-	}
-	else
-		vcEmit = ++this->m_nFrameCounter >= this->m_nSkipFrames;
-	if ( vcEmit )
+	// before), emission when >= skipFrames. Accepted on device 2026-10-01.
+	this->m_nFrameCounter += (uint16)Max(1.0f, CTimer::GetTimeStepFix() * 16.0f + 0.5f);
+	if ( this->m_nFrameCounter >= this->m_nSkipFrames * 16 )
 #else
 	if ( ++this->m_nFrameCounter >= this->m_nSkipFrames )
 #endif
