@@ -20,6 +20,21 @@
 #include "ZoneCull.h"
 #include "SpecialFX.h"
 #include "Replay.h"
+#ifdef LIBRW_VISIONOS
+#include "WorldSprite.h"
+// Rain streaks (multiview-plan.md S2/Regen): each streak is a 22 x 18 m diamond spanned by
+// TheCamera's up/right axes -- screen-aligned. In stereo TheCamera carries the head pose,
+// so every streak tilts and rolls with the head ("bewegen sich mit Kopfrotation"). Span
+// them from the WORLD up axis and the horizontal right axis of the line of sight instead
+// (same axes as the billboards). VC_WORLD_RAIN=0 restores the camera axes (A/B).
+extern "C" int vc_render_mode(void);
+static bool vcWorldRainOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_WORLD_RAIN"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0 && vc_render_mode() == 1;
+}
+#endif
 
 int32 CWeather::SoundHandle = -1;
 
@@ -498,6 +513,29 @@ void CWeather::AddRain()
 	int numSplashes = 2.0f * Rain;
 	CVector pos, dir;
 	for(int i = 0; i < numDrops; i++){
+#ifdef LIBRW_VISIONOS
+		// Stereo: the stock drops are RAINDROP_2D -- SCREEN-space sprites that fall down the
+		// screen, i.e. a head-locked layer ("Regen im Hintergrund bewegt sich mit dem Kopf").
+		// Spawn the game's unused 3D type RAINDROP_SMALL instead (thin 1:20 streak, own
+		// texture, ZCHECK_FIRST -> ground height at creation, splashes on impact via the
+		// rain block in CParticle::Update): three per drop slot like the 2D path, in a
+		// volume 2-16 m ahead / +-10 m aside / 1.5-9 m above the head, falling ~12 m/s.
+		// Drawn as world billboards (S2). VC_WORLD_RAIN=0 restores the 2D drops.
+		if(vcWorldRainOn()){
+			CVector camPos = TheCamera.GetPosition();
+			CVector fwdH = TheCamera.GetForward(); fwdH.z = 0.0f;
+			if(fwdH.Magnitude() < 0.01f) fwdH = CVector(0.0f, 1.0f, 0.0f);
+			fwdH.Normalise();
+			CVector rightH(fwdH.y, -fwdH.x, 0.0f);
+			for(int k = 0; k < 3; k++){
+				CVector p = camPos + fwdH * CGeneral::GetRandomNumberInRange(2.0f, 16.0f)
+				                   + rightH * CGeneral::GetRandomNumberInRange(-10.0f, 10.0f);
+				p.z += CGeneral::GetRandomNumberInRange(1.5f, 9.0f);
+				CVector v(0.0f, 0.0f, -CGeneral::GetRandomNumberInRange(0.2f, 0.3f));   // per 50-Hz step = 10-15 m/s
+				CParticle::AddParticle(PARTICLE_RAINDROP_SMALL, p, v, nil, CGeneral::GetRandomNumberInRange(0.4f, 0.8f), 0, 0, 0, 0);
+			}
+		}else{
+#endif
 		pos.x = CGeneral::GetRandomNumberInRange(0, (int)SCREEN_WIDTH);
 		pos.y = CGeneral::GetRandomNumberInRange(0, (int)SCREEN_HEIGHT/5);
 		pos.z = 0.0f;
@@ -521,6 +559,9 @@ void CWeather::AddRain()
 		dir.y = CGeneral::GetRandomNumberInRange(30.0f, 40.0f);
 		dir.z = 0.0f;
 		CParticle::AddParticle(PARTICLE_RAINDROP_2D, pos, dir, nil, CGeneral::GetRandomNumberInRange(0.1f, 0.75f), 0, 0, (int)Rain&3, 0);
+#ifdef LIBRW_VISIONOS
+		}
+#endif
 
 		float dist = CGeneral::GetRandomNumberInRange(0.0f, Max(10.0f*Rain, 40.0f)/2.0f);
 		float angle;
@@ -554,6 +595,18 @@ void RenderOneRainStreak(CVector pos, CVector unused, int intensity, bool scale,
 	static float RandomTex;
 	static float RandomTexX;
 	static float RandomTexY;
+	// streak axes: stock = camera up/right (screen-aligned); visionOS stereo = world up +
+	// horizontal right of the line of sight, so the streak stays vertical and still under
+	// head roll/pitch
+	CVector vcUp = TheCamera.GetUp();
+	CVector vcRight = TheCamera.GetRight();
+#ifdef LIBRW_VISIONOS
+	if (vcWorldRainOn()) {
+		CVector ax, ay;
+		if (vcWsAxes(pos, ax, ay)) vcRight = ax;
+		vcUp = CVector(0.0f, 0.0f, 1.0f);
+	}
+#endif
 	TempBufferRenderIndexList[TempBufferIndicesStored + 0] = TempBufferVerticesStored + 0;
 	TempBufferRenderIndexList[TempBufferIndicesStored + 1] = TempBufferVerticesStored + 2;
 	TempBufferRenderIndexList[TempBufferIndicesStored + 2] = TempBufferVerticesStored + 1;
@@ -567,15 +620,15 @@ void RenderOneRainStreak(CVector pos, CVector unused, int intensity, bool scale,
 	TempBufferRenderIndexList[TempBufferIndicesStored + 10] = TempBufferVerticesStored + 3;
 	TempBufferRenderIndexList[TempBufferIndicesStored + 11] = TempBufferVerticesStored + 4;
 	RwIm3DVertexSetRGBA(&TempBufferRenderVertices[TempBufferVerticesStored + 0], 0, 0, 0, 0);
-	RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored + 0], pos.x + 11.0f * TheCamera.GetUp().x, pos.y + 11.0f * TheCamera.GetUp().y, pos.z + 11.0f * TheCamera.GetUp().z);
+	RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored + 0], pos.x + 11.0f * vcUp.x, pos.y + 11.0f * vcUp.y, pos.z + 11.0f * vcUp.z);
 	RwIm3DVertexSetRGBA(&TempBufferRenderVertices[TempBufferVerticesStored + 1], 0, 0, 0, 0);
-	RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored + 1], pos.x - 9.0f * TheCamera.GetRight().x, pos.y - 9.0f * TheCamera.GetRight().y, pos.z - 9.0f * TheCamera.GetRight().z);
+	RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored + 1], pos.x - 9.0f * vcRight.x, pos.y - 9.0f * vcRight.y, pos.z - 9.0f * vcRight.z);
 	RwIm3DVertexSetRGBA(&TempBufferRenderVertices[TempBufferVerticesStored + 2], RAIN_COLOUR_R * intensity / 256, RAIN_COLOUR_G * intensity / 256, RAIN_COLOUR_B * intensity / 256, RAIN_ALPHA);
 	RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored + 2], pos.x, pos.y, pos.z);
 	RwIm3DVertexSetRGBA(&TempBufferRenderVertices[TempBufferVerticesStored + 3], 0, 0, 0, 0);
-	RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored + 3], pos.x + 9.0f * TheCamera.GetRight().x, pos.y + 9.0f * TheCamera.GetRight().y, pos.z + 9.0f * TheCamera.GetRight().z);
+	RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored + 3], pos.x + 9.0f * vcRight.x, pos.y + 9.0f * vcRight.y, pos.z + 9.0f * vcRight.z);
 	RwIm3DVertexSetRGBA(&TempBufferRenderVertices[TempBufferVerticesStored + 4], 0, 0, 0, 0); 
-	RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored + 4], pos.x - 11.0f * TheCamera.GetUp().x, pos.y - 11.0f * TheCamera.GetUp().y, pos.z - 11.0f * TheCamera.GetUp().z);
+	RwIm3DVertexSetPos(&TempBufferRenderVertices[TempBufferVerticesStored + 4], pos.x - 11.0f * vcUp.x, pos.y - 11.0f * vcUp.y, pos.z - 11.0f * vcUp.z);
 	float u = STREAK_U;
 	float v = STREAK_V;
 	if (scale) {

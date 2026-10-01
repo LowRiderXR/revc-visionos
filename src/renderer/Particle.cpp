@@ -21,6 +21,9 @@
 #include "soundlist.h"
 #include "SaveBuf.h"
 #include "debugmenu.h"
+#ifdef LIBRW_VISIONOS
+#include "WorldSprite.h"
+#endif
 
 #define MAX_PARTICLES_ON_SCREEN   (750)
 
@@ -244,6 +247,24 @@ float fParticleScaleLimit       = 0.5f;
 // authored for 30 fps. At the headset's 90-100 fps both ran ~3x -- 3x the live particles,
 // 3x the growth. Both are scaled by CTimer::GetTimeStepFix() now; accepted on device
 // 2026-10-01 ("Springbrunnen deutlich besser, Rauch und Feuer gut"), no switch.
+
+// S2 (multiview-plan.md): the 3D particles (muzzle flash, smoke, blood, sparks, water
+// spray) are drawn as world-space upright billboards (WorldSprite.cpp) instead of
+// screen-aligned 2D sprites -- same cure as the coronas (S1) and the sky (S6): no eye
+// offset, no roll with the head, correct shape off-axis. The 2D families (DRAWTOP2D:
+// screen raindrops, heat haze) and the hydrant post effect are unchanged. World half size
+// = m_fSize * (w / w0): w0 is CalcScreenCoors' pixels-per-metre, w the game's jittered /
+// stretched value, so the ratio keeps every size rule of the 2D path. Trail lengths come
+// in pixels and are divided by h0. VC_WORLD_PARTICLES=0 restores the 2D path (A/B).
+extern "C" int vc_render_mode(void);   // 1 = stereo VR
+static bool vcWorldParticlesOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_WORLD_PARTICLES"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0 && vc_render_mode() == 1;
+}
+// colour channel as the 2D sprite functions compute it: colour * intensity >> 8
+#define VC_PCOL(ch) (((int)particle->m_Color.ch * (int)particle->m_nColorIntensity) >> 8)
 #endif
 
 bool clearWaterDrop;
@@ -1817,6 +1838,7 @@ void CParticle::Render()
 	PUSH_RENDERGROUP("CParticle::Render");
 #ifdef LIBRW_VISIONOS
 	vc_sprite_gate(1);   // count sprite PIXELS from here on (see vc_sprite_area)
+	const bool vcWorld = vcWorldParticlesOn();   // S2: world billboards for the 3D particles
 #endif
 
 	RwRenderStateSet(rwRENDERSTATETEXTUREADDRESS, (void *)rwTEXTUREADDRESSWRAP);
@@ -1860,6 +1882,9 @@ void CParticle::Render()
 				|| (flags & DRAW_DARK) != (psystem->Flags & DRAW_DARK) )
 			{
 				CSprite::FlushSpriteBuffer();
+#ifdef LIBRW_VISIONOS
+				vcWsFlush();   // S2: flush the world-quad batch wherever the 2D buffer is flushed
+#endif
 				
 				if ( psystem->Flags & DRAW_OPAQUE )
 				{
@@ -1885,6 +1910,9 @@ void CParticle::Render()
 				if ( curFrame != prevFrame )
 				{
 					CSprite::FlushSpriteBuffer();
+#ifdef LIBRW_VISIONOS
+				vcWsFlush();   // S2: flush the world-quad batch wherever the 2D buffer is flushed
+#endif
 					RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void *)curFrame);
 					prevFrame = curFrame;
 				}
@@ -1907,6 +1935,9 @@ void CParticle::Render()
 				if ( prevFrame != curFrame )
 				{
 					CSprite::FlushSpriteBuffer();
+#ifdef LIBRW_VISIONOS
+				vcWsFlush();   // S2: flush the world-quad batch wherever the 2D buffer is flushed
+#endif
 					RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void *)curFrame);
 					prevFrame = curFrame;
 				}
@@ -2089,6 +2120,9 @@ void CParticle::Render()
 
 				if ( CSprite::CalcScreenCoors(particle->m_vecPosition, &coors, &w, &h, true) )
 				{
+#ifdef LIBRW_VISIONOS
+					const float w0 = w, h0 = h;   // pixels per metre before the per-type jitter/stretch
+#endif
 					
 					if ( i == PARTICLE_ENGINE_STEAM
 						|| i == PARTICLE_ENGINE_SMOKE
@@ -2174,6 +2208,15 @@ void CParticle::Render()
 						{
 							if ( particle->m_nRotation != 0 && i != PARTICLE_BEASTIE )
 							{					
+#ifdef LIBRW_VISIONOS
+								if ( vcWorld )
+									vcWsAdd(particle->m_vecPosition, coors.z,
+										particle->m_fSize * w / w0, particle->m_fSize * h / h0,
+										DEGTORAD((float)particle->m_nRotation),
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue),
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue), 0.0f, 0.0f, particle->m_nAlpha);
+								else
+#endif
 								CSprite::RenderBufferedOneXLUSprite_Rotate_Dimension(coors.x, coors.y, coors.z,
 										particle->m_fSize * w, particle->m_fSize * h,
 										particle->m_Color.red,
@@ -2221,6 +2264,16 @@ void CParticle::Render()
 										fTrailLength = fNewTrailLength;
 								}
 								
+#ifdef LIBRW_VISIONOS
+								if ( vcWorld )
+									vcWsAdd(particle->m_vecPosition, coors.z,
+										particle->m_fSize * w / w0,
+										(particle->m_fSize * h + fTrailLength * psystem->m_fTrailLengthMultiplier) / h0,
+										fRotation,
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue),
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue), 0.0f, 0.0f, particle->m_nAlpha);
+								else
+#endif
 								CSprite::RenderBufferedOneXLUSprite_Rotate_Dimension(coors.x, coors.y, coors.z,
 										particle->m_fSize * w,
 										particle->m_fSize * h + fTrailLength * psystem->m_fTrailLengthMultiplier,
@@ -2267,6 +2320,16 @@ void CParticle::Render()
 									fTrailLength = 0.0f;
 								}
 								
+#ifdef LIBRW_VISIONOS
+								if ( vcWorld )
+									vcWsAdd(particle->m_vecPosition, coors.z,
+										particle->m_fSize * w / w0,
+										(particle->m_fSize * h + fTrailLength * psystem->m_fTrailLengthMultiplier) / h0,
+										fRotation,
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue),
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue), 0.0f, 0.0f, particle->m_nAlpha);
+								else
+#endif
 								CSprite::RenderBufferedOneXLUSprite_Rotate_Dimension(coors.x, coors.y, coors.z,
 										particle->m_fSize * w,
 										particle->m_fSize * h + fTrailLength * psystem->m_fTrailLengthMultiplier,
@@ -2282,6 +2345,16 @@ void CParticle::Render()
 							{
 								float fTrailLength = fabsf(particle->m_vecVelocity.z * 10.0f);
 	
+#ifdef LIBRW_VISIONOS
+								if ( vcWorld )
+									vcWsAdd(particle->m_vecPosition, coors.z,
+										particle->m_fSize * w / w0,
+										(particle->m_fSize + fTrailLength * psystem->m_fTrailLengthMultiplier) * h / h0,
+										0.0f,
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue),
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue), 0.0f, 0.0f, particle->m_nAlpha);
+								else
+#endif
 								CSprite::RenderBufferedOneXLUSprite(coors.x, coors.y, coors.z,
 										particle->m_fSize * w,
 										(particle->m_fSize + fTrailLength * psystem->m_fTrailLengthMultiplier) * h,
@@ -2294,6 +2367,14 @@ void CParticle::Render()
 							}
 							else if ( i == PARTICLE_RAINDROP_SMALL )
 							{
+#ifdef LIBRW_VISIONOS
+								if ( vcWorld )
+									vcWsAdd(particle->m_vecPosition, coors.z,
+										particle->m_fSize * w * 0.05f / w0, particle->m_fSize * h / h0, 0.0f,
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue),
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue), 0.0f, 0.0f, particle->m_nAlpha);
+								else
+#endif
 								CSprite::RenderBufferedOneXLUSprite(coors.x, coors.y, coors.z,
 										particle->m_fSize * w * 0.05f,
 										particle->m_fSize * h,
@@ -2306,7 +2387,15 @@ void CParticle::Render()
 							}
 							/*else if ( i == PARTICLE_BOAT_WAKE )*/
 							else
-							{							
+							{
+#ifdef LIBRW_VISIONOS
+								if ( vcWorld )
+									vcWsAdd(particle->m_vecPosition, coors.z,
+										particle->m_fSize * w / w0, particle->m_fSize * h / h0, 0.0f,
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue),
+										VC_PCOL(red), VC_PCOL(green), VC_PCOL(blue), 0.0f, 0.0f, particle->m_nAlpha);
+								else
+#endif
 								CSprite::RenderBufferedOneXLUSprite(coors.x, coors.y, coors.z,
 										particle->m_fSize * w,
 										particle->m_fSize * h,
@@ -2326,6 +2415,9 @@ void CParticle::Render()
 		}
 
 		CSprite::FlushSpriteBuffer();
+#ifdef LIBRW_VISIONOS
+				vcWsFlush();   // S2: flush the world-quad batch wherever the 2D buffer is flushed
+#endif
 
 	}
 	

@@ -48,6 +48,14 @@ static bool vcWorldCoronaOn(void)
 	if(e < 0){ const char *s = getenv("VC_WORLD_CORONA"); e = (s && s[0] == '0') ? 0 : 1; }
 	return e != 0 && vc_render_mode() == 1;
 }
+// Wet-road reflections (RenderReflections) as world quads; separate A/B switch so they can be
+// isolated from the coronas: VC_WORLD_REFLECT=0 = stock 2D sprites (needs the corona path on).
+static bool vcWorldReflectOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_WORLD_REFLECT"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0 && vcWorldCoronaOn();
+}
 // Known original behaviour (checked against the macOS reference build 2026-09-30): the
 // coronas of the VERTICAL traffic lights are half hidden by their housing, the horizontal
 // ones are not. Same in the flat game -- not a stereo defect, not fixed here.
@@ -687,7 +695,7 @@ CCoronas::RenderReflections(void)
 #ifdef LIBRW_VISIONOS
 		void *vcReflSavedCull = nil;
 		RwRenderStateGet(rwRENDERSTATECULLMODE, &vcReflSavedCull);
-		if(vcWorldCoronaOn()) RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);   // world quads have a back
+		if(vcWorldReflectOn()) RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);   // world quads have a back
 #endif
 
 		for(i = 0; i < NUMCORONAS; i++){
@@ -734,7 +742,7 @@ CCoronas::RenderReflections(void)
 						// S1 (wet-road reflections): same upright world billboard as the
 						// coronas, at the MIRRORED position below the road; no depth pull
 						// (ZTEST is off here, as in the 2D path), no near fade, no roll.
-						if(vcWorldCoronaOn()){
+						if(vcWorldReflectOn()){
 							vcRenderCoronaWorldQuad(coors, spriteCoors.z, spriteCoors.z, spriteh,
 								spritew * aCoronas[i].size * 0.75f, spriteh * aCoronas[i].size * 2.0f,
 								(intensity * CCoronas::aCoronas[i].red)>>8,
