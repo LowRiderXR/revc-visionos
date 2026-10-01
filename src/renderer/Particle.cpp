@@ -238,6 +238,20 @@ int32 nParticleCreationInterval = 1;
 float PARTICLE_WIND_TEST_SCALE  = 0.002f;
 float fParticleScaleLimit       = 0.5f;
 
+#ifdef LIBRW_VISIONOS
+// Particle time base (multiview-plan.md "Springbrunnen"): emission of particle objects
+// and sprite expansion are per-frame quantities authored for 30 fps. At the headset's
+// 90-100 fps both run ~3x -- 3x the live particles, 3x the growth. Default ON: scale
+// both by CTimer::GetTimeStepFix(). VC_PARTICLE_TIMEBASE=0 restores stock (A/B).
+extern "C" int vc_particle_timebase(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_PARTICLE_TIMEBASE"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e;
+}
+static inline bool vcParticleTimeBase(void) { return vc_particle_timebase() != 0; }
+#endif
+
 bool clearWaterDrop;
 int32 numWaterDropOnScreen;
 
@@ -1415,24 +1429,35 @@ void CParticle::Update()
 			{
 				float size;
 
+#ifdef LIBRW_VISIONOS
+				// Time base (multiview-plan.md "Springbrunnen"): the expansion rate is authored
+				// PER FRAME for the 30 fps the game was tuned at (PS2, PC frame limiter). At
+				// 90-100 fps sprites grow 3x faster -- the fountain's SPLASH mist reached
+				// metres within a second and filled the screen (spr=199/1283 MP outlier).
+				// Scale by GetTimeStepFix() (= frame time / 30-fps frame) so growth per
+				// SECOND matches the original. VC_PARTICLE_TIMEBASE=0 restores stock (A/B).
+				const float fix = vcParticleTimeBase() ? CTimer::GetTimeStepFix() : 1.0f;
+#else
+				const float fix = 1.0f;
+#endif
 				if ( particle->m_fExpansionRate > 0.0f )
 				{
 					float speed = Max(vecWind.Magnitude(), vecMoveStep.Magnitude());
-					
+
 					if ( psystem->m_Type == PARTICLE_EXHAUST_FUMES || psystem->m_Type == PARTICLE_ENGINE_STEAM )
 						speed *= 2.0f;
-					
+
 					if ( ( psystem->m_Type == PARTICLE_BOAT_SPLASH || psystem->m_Type == PARTICLE_CAR_SPLASH )
 							&& particle->m_fSize > 1.2f )
 					{
-						size = particle->m_fSize - (1.0f + speed) * particle->m_fExpansionRate;
-						particle->m_vecVelocity.z -= 0.15f;
+						size = particle->m_fSize - (1.0f + speed) * particle->m_fExpansionRate * fix;
+						particle->m_vecVelocity.z -= 0.15f * fix;
 					}
 					else
-						size = particle->m_fSize + (1.0f + speed) * particle->m_fExpansionRate;
+						size = particle->m_fSize + (1.0f + speed) * particle->m_fExpansionRate * fix;
 				}
 				else
-					size = particle->m_fSize + particle->m_fExpansionRate;
+					size = particle->m_fSize + particle->m_fExpansionRate * fix;
 				
 				if ( psystem->m_Type == PARTICLE_WATERDROP )
 					size = (size - Abs(vecMoveStep.x) * 0.000150000007f) + (Abs(vecMoveStep.z) * 0.0500000007f); //TODO:

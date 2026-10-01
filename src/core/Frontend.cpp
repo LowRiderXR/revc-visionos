@@ -654,6 +654,17 @@ CMenuManager::Initialise(void)
 		m_nCurrScreen = MENUPAGE_NONE;
 #endif
 
+#ifdef LIBRW_VISIONOS
+	// The menu-start chime was cut after one frame (heard on visionOS at game start and
+	// after loading a save): the stock order plays the sound and services audio HERE,
+	// and only sets the user pause at the END of this function. The next Service then
+	// sees the pause transition (cAudioManager::ServiceSoundEffects: m_bIsPaused &&
+	// !m_bWasPaused) and stops ALL channels -- including the chime that just started.
+	// Set the pause first and run the transition through one Service, then play.
+	// Front-end sounds are processed while paused (menu ticks work), so the chime plays.
+	CTimer::StartUserPause();
+	DMAudio.Service();
+#endif
 	DMAudio.ChangeMusicMode(MUSICMODE_FRONTEND);
 	DMAudio.PlayFrontEndSound(SOUND_FRONTEND_MENU_STARTING, 0);
 	DMAudio.Service();

@@ -1506,8 +1506,8 @@ static std::atomic<bool> g_stop{false};
 // through black into the menu. Rules: the hold starts AFTER initialisation (nothing is
 // skipped but the extra time); a skip press must not leak into the menu -> we leave the
 // hold only once every button is released again, and clear the pad before the frontend
-// starts. Once per process (not after quit-to-menu). VC_TITLE_HOLD_MS (default 2500)
-// tunes the hold during acceptance; the fade is fixed at 400 ms.
+// starts. Once per process (not after quit-to-menu). 2.5 s hold + 400 ms fade, fixed
+// after device acceptance 2026-10-01 ("funktioniert sehr gut").
 void vcTitleSplashFrame(int blackAlpha);   // main.cpp
 static uint64_t g_titleShownAt = 0;         // mach time of the first LOADSC0 frame
 
@@ -1524,9 +1524,7 @@ vcTitleHold(void)
 	static bool done = false;
 	if (done) return;
 	done = true;
-	int holdMs = 2500;
-	if (const char *e = getenv("VC_TITLE_HOLD_MS")) holdMs = atoi(e);
-	if (holdMs <= 0) return;
+	const int holdMs = 2500;
 	const double fadeMs = 400.0;
 
 	CPad *pad = CPad::GetPad(0);
