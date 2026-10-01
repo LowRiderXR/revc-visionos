@@ -684,6 +684,11 @@ CCoronas::RenderReflections(void)
 		RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDONE);
 		RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDONE);
 		RwRenderStateSet(rwRENDERSTATETEXTURERASTER, RwTextureGetRaster(gpCoronaTexture[3]));
+#ifdef LIBRW_VISIONOS
+		void *vcReflSavedCull = nil;
+		RwRenderStateGet(rwRENDERSTATECULLMODE, &vcReflSavedCull);
+		if(vcWorldCoronaOn()) RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);   // world quads have a back
+#endif
 
 		for(i = 0; i < NUMCORONAS; i++){
 			if(aCoronas[i].id == 0 ||
@@ -725,6 +730,19 @@ CCoronas::RenderReflections(void)
 						float heightFade = (20.0f - aCoronas[i].heightAboveRoad)/20.0f;
 						int intensity = distanceFade*heightFade * 230.0 * CWeather::WetRoads;
 
+#ifdef LIBRW_VISIONOS
+						// S1 (wet-road reflections): same upright world billboard as the
+						// coronas, at the MIRRORED position below the road; no depth pull
+						// (ZTEST is off here, as in the 2D path), no near fade, no roll.
+						if(vcWorldCoronaOn()){
+							vcRenderCoronaWorldQuad(coors, spriteCoors.z, spriteCoors.z, spriteh,
+								spritew * aCoronas[i].size * 0.75f, spriteh * aCoronas[i].size * 2.0f,
+								(intensity * CCoronas::aCoronas[i].red)>>8,
+								(intensity * CCoronas::aCoronas[i].green)>>8,
+								(intensity * CCoronas::aCoronas[i].blue)>>8,
+								255, 0.0f, 255, false, spriteCoors.x);
+						}else
+#endif
 						CSprite::RenderBufferedOneXLUSprite(
 #ifdef FIX_BUGS
 							spriteCoors.x, spriteCoors.y, spriteCoors.z,
@@ -750,6 +768,9 @@ CCoronas::RenderReflections(void)
 		RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
 		RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
 		RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
+#ifdef LIBRW_VISIONOS
+		RwRenderStateSet(rwRENDERSTATECULLMODE, vcReflSavedCull);
+#endif
 
 		POP_RENDERGROUP();
 	}else{

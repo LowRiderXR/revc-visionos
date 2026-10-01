@@ -470,6 +470,24 @@ void CWeather::AddRain()
 		}
 	}
 
+#ifdef LIBRW_VISIONOS
+	// Time base (multiview-plan.md "Springbrunnen"/Regen): this runs once per FRAME and
+	// emits ~100 particles per call at full rain (15 screen drops + up to 5x17 ground
+	// splashes), authored for 30 fps. At 90-100 fps that is 3x the rain and it saturates
+	// the 750-particle pool, starving every other effect. Emit once per 30-fps frame
+	// equivalent (same accumulator idea as CParticleObject::UpdateClose); the streaks
+	// (RenderRainStreaks) are already timer-based and untouched. Hurricane splashes get
+	// the same gate.
+	{
+		static float acc = 0.0f;
+		acc += CTimer::GetTimeStepFix();
+		if (acc < 1.0f)
+			return;
+		acc -= 1.0f;
+		if (acc > 1.0f) acc = 1.0f;   // after a stall: at most one catch-up emission
+	}
+#endif
+
 	if (Wind > 1.1f)
 		AddSplashesDuringHurricane();
 
