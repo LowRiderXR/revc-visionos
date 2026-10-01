@@ -856,6 +856,31 @@ LoadingScreen(const char *str1, const char *str2, const char *splashscreen)
 	}
 }
 
+#ifdef LIBRW_VISIONOS
+// Title hold (visionos.cpp vcTitleHold): one frame of the title splash (LOADSC0) with a
+// black veil of the given alpha (0 = none, 255 = black) -- the fade-through-black into
+// the menu. Same frame recipe as LoadingScreen, without the progress bar.
+void
+vcTitleSplashFrame(int blackAlpha)
+{
+	CSprite2d *splash = LoadSplash("LOADSC0");
+	g_vcSplashActive = 1;
+	if(RsGlobal.quit)
+		return;
+	if(DoRWStuffStartOfFrame(0, 0, 0, 0, 0, 0, 255)){
+		CSprite2d::SetRecipNearClip();
+		CSprite2d::InitPerFrame();
+		CFont::InitPerFrame();
+		DefinedState();
+		RwRenderStateSet(rwRENDERSTATETEXTUREADDRESS, (void*)rwTEXTUREADDRESSCLAMP);
+		splash->Draw(CRect(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT), CRGBA(255, 255, 255, 255));
+		if(blackAlpha > 0)
+			CSprite2d::DrawRect(CRect(0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT), CRGBA(0, 0, 0, Min(blackAlpha, 255)));
+		DoRWStuffEndOfFrame();
+	}
+}
+#endif
+
 void
 LoadingIslandScreen(const char *levelName)
 {

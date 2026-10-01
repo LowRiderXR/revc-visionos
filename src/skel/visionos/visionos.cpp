@@ -1499,6 +1499,64 @@ static RwBool RwInitialised   = TRUE;
 
 static std::atomic<bool> g_stop{false};
 
+// ---- Title hold (multiview-plan.md "Titelbildschirm") -------------------------------
+// The PC shows two intro movies before the LOADSC0 title; we skip the movies, and the
+// device initialises in ~0.5 s, so the title flashed by. Hold it for a minimum time
+// (from the moment it first appeared), skippable with any gamepad button, then fade
+// through black into the menu. Rules: the hold starts AFTER initialisation (nothing is
+// skipped but the extra time); a skip press must not leak into the menu -> we leave the
+// hold only once every button is released again, and clear the pad before the frontend
+// starts. Once per process (not after quit-to-menu). VC_TITLE_HOLD_MS (default 2500)
+// tunes the hold during acceptance; the fade is fixed at 400 ms.
+void vcTitleSplashFrame(int blackAlpha);   // main.cpp
+static uint64_t g_titleShownAt = 0;         // mach time of the first LOADSC0 frame
+
+static double vcMachMs(uint64_t t)
+{
+	static mach_timebase_info_data_t tb = {0, 0};
+	if (tb.denom == 0) mach_timebase_info(&tb);
+	return (double)t * tb.numer / tb.denom / 1e6;
+}
+
+static void
+vcTitleHold(void)
+{
+	static bool done = false;
+	if (done) return;
+	done = true;
+	int holdMs = 2500;
+	if (const char *e = getenv("VC_TITLE_HOLD_MS")) holdMs = atoi(e);
+	if (holdMs <= 0) return;
+	const double fadeMs = 400.0;
+
+	CPad *pad = CPad::GetPad(0);
+	bool wasPressed = pad->NewState.IsAnyButtonPressed();   // a button held from the start does not count as a skip
+	bool skipped = false;
+	double fadeStart = -1.0;
+	int frames = 0;
+	for (;;) {
+		if (g_stop.load() || RsGlobal.quit) break;
+		CPad::UpdatePads();
+		bool pressed = pad->NewState.IsAnyButtonPressed();
+		if (pressed && !wasPressed) skipped = true;
+		wasPressed = pressed;
+
+		double now = vcMachMs(mach_absolute_time());
+		double shown = now - vcMachMs(g_titleShownAt);
+		if (fadeStart < 0.0 && (skipped || shown >= holdMs)) fadeStart = now;
+		int alpha = 0;
+		if (fadeStart >= 0.0) alpha = (int)((now - fadeStart) / fadeMs * 255.0);
+		if (alpha > 255) alpha = 255;
+		vcTitleSplashFrame(alpha);
+		frames++;
+		if (alpha >= 255 && !pressed) break;   // fully black AND nothing held -> hand over to the menu
+		usleep(8000);
+	}
+	pad->Clear(false);   // nothing of the skip press reaches the menu
+	printf("[vc-title] hold %.0f ms shown%s, %d frames, fade %.0f ms\n",
+	       vcMachMs(mach_absolute_time()) - vcMachMs(g_titleShownAt), skipped ? " (skipped)" : "", frames, fadeMs);
+}
+
 // Polled by the ANGLE-side throttle (vcrt_begin_frame) so a parked game thread
 // wakes and unwinds cleanly when shutdown is requested.
 extern "C" bool vc_should_stop(void) { return g_stop.load(); }
@@ -1637,6 +1695,7 @@ run_game_loop(void)
 						break;
 
 					case GS_INIT_ONCE:
+						if (g_titleShownAt == 0) g_titleShownAt = mach_absolute_time();   // title hold counts from here
 						LoadingScreen(nil, nil, "loadsc0");
 						if (!CGame::InitialiseOnceAfterRW())
 							RsGlobal.quit = TRUE;
@@ -1645,6 +1704,7 @@ run_game_loop(void)
 
 					case GS_INIT_FRONTEND:
 						LoadingScreen(nil, nil, "loadsc0");
+						vcTitleHold();   // minimum title time + fade to black, skippable (once per process)
 						FrontEndMenuManager.m_bGameNotLoaded = true;
 						FrontEndMenuManager.m_bStartUpFrontEndRequested = true;
 						gGameState = GS_FRONTEND;
