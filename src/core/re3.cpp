@@ -506,6 +506,21 @@ static bool vcIsIslandLoadingOption(const CMenuScreenCustom::CMenuEntry &option)
 
 bool LoadINISettings()
 {
+#ifdef LIBRW_VISIONOS
+	// reVC.ini lives next to the save games in "GTA Vice City User Files" (not in the data
+	// root): the data root is Documents/Game, which the launcher replaces/removes as a whole,
+	// and the ini must survive that. The launcher migrates an old root-level reVC.ini there.
+	extern const char *_psGetUserFilesFolder();
+	{
+		static bool relocated = false;
+		if (!relocated) {
+			std::string p = std::string(_psGetUserFilesFolder()) + "/reVC.ini";
+			ini = mINI::INIFile(p);
+			relocated = true;
+			printf("[vc-fs] reVC.ini at %s\n", p.c_str());
+		}
+	}
+#endif
 	if (!ini.read(cfg))
 		return false;
 
