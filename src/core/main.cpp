@@ -270,7 +270,15 @@ static int g_vcSplashActive = 0;
 // frontend/loading screens (confirm dialog + "please wait" + splash cycling in the buffer
 // ring). Deliberately NOT gated on splash so the interactive start menu is unaffected.
 int g_vcLoadingActive = 0;
-extern "C" int vc_loading_active(void) { return g_vcLoadingActive; }
+// Texture conversion (txd.img, CreateTxdImageForVideoCard) in progress. It runs inside
+// CGame::Initialise, which on the LOAD path happens while g_vcLoadingActive is set -> the
+// host showed black for the whole conversion and the player saw a dead screen ("the
+// conversion does not start when loading a save right after installing", 2026-10-05).
+// While converting: not "loading" (no black hold) and "splash" (the progress screen is
+// drawn like LoadingScreen, fullscreen overlay, stale world hidden).
+int g_vcConverting = 0;
+extern "C" void vc_converting_set(int on) { g_vcConverting = on; }
+extern "C" int vc_loading_active(void) { return g_vcLoadingActive && !g_vcConverting; }
 // Stereo: true during the fade TO/FROM a splash screen. reVC keeps running the eye passes
 // (3D cutscene) while FadeValue ramps and DoFade crossfades the 2D splash over it -- a 2D
 // image at infinity over a 3D scene cannot fuse in VR (binocular rivalry / flicker). So we
@@ -285,7 +293,7 @@ static int vcStereoSplashFade(void)
 	// fade-in injection below clears it at the fade-out end, so this never stays stuck on.
 	return vc_render_mode() == 1 && TheCamera.m_FadeTargetIsSplashScreen;
 }
-extern "C" int vc_splash_active(void) { return g_vcSplashActive || vcStereoSplashFade(); }
+extern "C" int vc_splash_active(void) { return g_vcSplashActive || g_vcConverting || vcStereoSplashFade(); }
 
 // Fade THROUGH BLACK: VC uses one fade for the splash and does NOT fade the game in
 // afterwards (measured: after the splash fade-out FadeValue stays 0, m_FadeTargetIsSplashScreen

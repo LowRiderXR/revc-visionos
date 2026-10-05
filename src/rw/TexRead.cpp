@@ -26,6 +26,11 @@
 #include "Text.h"
 #include "RwHelper.h"
 #include "Frontend.h"
+#ifdef LIBRW_VISIONOS
+#include <errno.h>
+extern "C" double vc_mem_footprint_mb(void);   // visionos_angle.mm: task phys_footprint
+extern "C" void vc_converting_set(int on);      // main.cpp: progress screen visible to the host
+#endif
 #endif //GTA_PC
 
 float texLoadTime;
@@ -353,12 +358,20 @@ ConvertingTexturesScreen(uint32 num, uint32 count, const char *text)
 void
 DealWithTxdWriteError(uint32 num, uint32 count, const char *text)
 {
+#ifdef LIBRW_VISIONOS
+	// No Escape key on the headset: show the error screen for a few seconds, then quit
+	// like stock does below. The reason is already in the log ([vc-txd]).
+	double vcEnd = psTimer() + 4000.0;
+	while (!RsGlobal.quit && psTimer() < vcEnd)
+		ConvertingTexturesScreen(num, count, text);
+#else
 	while (!RsGlobal.quit) {
 		ConvertingTexturesScreen(num, count, text);
 		CPad::UpdatePads();
 		if (CPad::GetPad(0)->GetEscapeJustDown())
 			break;
 	}
+#endif
 	RsGlobal.quit = false;
 	LoadingScreen(nil, nil, nil);
 	RsGlobal.quit = true;
@@ -383,8 +396,18 @@ CreateTxdImageForVideoCard()
 	RwFileFunctions *filesys = RwOsGetFileInterface();
 #endif
 
+#ifdef LIBRW_VISIONOS
+	// Make the progress screen visible on every path out of this function (see
+	// g_vcConverting in main.cpp): on the save-load path the host otherwise holds black.
+	struct VcConvertScope { VcConvertScope() { vc_converting_set(1); } ~VcConvertScope() { vc_converting_set(0); } } vcScope;
+	double vcT0 = psTimer();
+	printf("[vc-txd] convert: start, footprint %.0f MB\n", vc_mem_footprint_mb());
+#endif
 	RwStream *img = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMWRITE, "models\\txd.img");
 	if (img == nil) {
+#ifdef LIBRW_VISIONOS
+		printf("[vc-txd] convert: cannot open models/txd.img for writing (errno=%d %s)\n", errno, strerror(errno));
+#endif
 		// original code does otherwise and it leaks
 		delete []buf;
 		delete pDir;
@@ -433,6 +456,10 @@ CreateTxdImageForVideoCard()
 				int32 pos = STREAMTELL(img);
 
 				if (RwTexDictionaryStreamWrite(CTxdStore::GetSlot(i)->texDict, img) == nil) {
+#ifdef LIBRW_VISIONOS
+					printf("[vc-txd] convert: write FAILED at slot %d (%s), footprint %.0f MB\n",
+					       i, filename, vc_mem_footprint_mb());
+#endif
 					DealWithTxdWriteError(i, TXDSTORESIZE, "CVT_ERR");
 					RwStreamClose(img, nil);
 					delete []buf;
@@ -478,6 +505,9 @@ CreateTxdImageForVideoCard()
 #endif
 
 	if (!pDir->WriteDirFile("models\\txd.dir")) {
+#ifdef LIBRW_VISIONOS
+		printf("[vc-txd] convert: cannot write models/txd.dir\n");
+#endif
 		DealWithTxdWriteError(i, TXDSTORESIZE, "CVT_ERR");
 		delete pDir;
 		return false;
@@ -486,6 +516,10 @@ CreateTxdImageForVideoCard()
 	delete pDir;
 
 	WriteVideoCardCapsFile();
+#ifdef LIBRW_VISIONOS
+	printf("[vc-txd] convert: done in %.1f s, footprint %.0f MB\n",
+	       (psTimer() - vcT0) / 1000.0, vc_mem_footprint_mb());
+#endif
 	return true;
 }
 #endif // GTA_PC

@@ -264,6 +264,16 @@ CStreaming::Init(void)
 		int txdHandle = CFileMgr::OpenFile("MODELS\\TXD.IMG", "r");
 		if (txdHandle)
 			CFileMgr::CloseFile(txdHandle);
+#ifdef LIBRW_VISIONOS
+		// [vc-txd]: names the branch taken at this start (install-then-play without an
+		// app restart reportedly fails; the log tells whether conversion ran at all).
+		{
+			bool capsChanged = CheckVideoCardCaps();
+			printf("[vc-txd] init: txd.img %s, caps %s -> %s\n",
+			       txdHandle ? "present" : "missing", capsChanged ? "changed/absent" : "match",
+			       (!capsChanged && txdHandle) ? "use existing archive" : "convert textures now");
+		}
+#endif
 		if (!CheckVideoCardCaps() && txdHandle) {
 			CdStreamAddImage("MODELS\\TXD.IMG");
 			CStreaming::Init2();
@@ -273,7 +283,14 @@ CStreaming::Init(void)
 				CStreaming::Shutdown();
 				CdStreamAddImage("MODELS\\TXD.IMG");
 				CStreaming::Init2();
+#ifdef LIBRW_VISIONOS
+				printf("[vc-txd] init: archive created, streaming restarted on txd.img\n");
+#endif
 			}
+#ifdef LIBRW_VISIONOS
+			else
+				printf("[vc-txd] init: conversion FAILED, continuing without txd.img\n");
+#endif
 		}
 	} else
 		CStreaming::Init2();
