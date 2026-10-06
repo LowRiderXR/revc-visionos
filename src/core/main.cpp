@@ -451,6 +451,18 @@ DoFade(void)
 // switch the single overlay quad between head-locked (HUD) and world-anchored (menu)
 // on this flag alone.
 extern "C" int vc_menu_active(void) { return FrontEndMenuManager.m_bMenuActive ? 1 : 0; }
+// Pause menu with a LIVE world (2026-10-06, user request): in stereo the eye passes keep
+// running while the pause menu is up, so the paused scene follows the head like during
+// play (look around, no picture edges); only the HUD (Render2dStuff) is skipped so the
+// overlay buffer carries the menu alone. Game logic stays paused (CTimer). Streaming does
+// not run in the pause, so areas that were never visible may lack models until resume.
+// VC_MENU_LIVE=0 = old behaviour (world frozen, eye passes skipped in the menu).
+static bool vcMenuLiveWorldOn(void)
+{
+	static int v = -1;
+	if (v < 0) { const char *e = getenv("VC_MENU_LIVE"); v = e ? (atoi(e) ? 1 : 0) : 1; }
+	return v == 1;
+}
 
 // Quit request: 1 once the game asked to exit (menu Quit -> rsQUITAPP -> RsGlobal.quit).
 // The game thread's loop leaves on this, but nothing on visionOS closes the app/immersive
@@ -2332,7 +2344,15 @@ Idle(void *arg)
 	vcStereoSplashFadeInCheck();   // splash just ended? -> kick a black game fade-in (fade through black)
 #endif
 
-	if(!FrontEndMenuManager.m_bMenuActive && TheCamera.GetScreenFadeStatus() != FADE_2
+#ifdef LIBRW_VISIONOS
+	// Live world under the pause menu (stereo): run the in-game block, HUD skipped below.
+	const bool vcMenuLive = FrontEndMenuManager.m_bMenuActive && vc_render_mode() == 1 && vcMenuLiveWorldOn();
+#endif
+	if((!FrontEndMenuManager.m_bMenuActive
+#ifdef LIBRW_VISIONOS
+	    || vcMenuLive
+#endif
+	   ) && TheCamera.GetScreenFadeStatus() != FADE_2
 #ifdef LIBRW_VISIONOS
 	   && !vcStereoSplashFade()   // stereo: don't render the 3D world under a splash fade -> hard cut
 #endif
@@ -2613,6 +2633,11 @@ Idle(void *arg)
 		tbEndTimer("RenderMotionBlur");
 
 		tbStartTimer(0, "Render2dStuff");
+#ifdef LIBRW_VISIONOS
+		// Pause menu with live world: no HUD -- the overlay holds the menu alone
+		// (RenderMenus below), as before when this whole block was skipped.
+		if (!vcMenuLive)
+#endif
 		Render2dStuff();
 		tbEndTimer("Render2dStuff");
 #ifdef LIBRW_VISIONOS
