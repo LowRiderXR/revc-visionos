@@ -304,20 +304,25 @@ extern "C" void vc_get_projection_matrix(float m[16])
 // on always (throttled 10 s -- first line of defence for a future perf problem);
 // the finer probes ([vc-pose-age], [vc-pose-latency], [vc-begin], [vc-publish])
 // are gated behind this so normal runs are quiet.
-// Device class for the per-device standards (multiview-plan.md, Gerätestandards 2026-09-29).
-// The launcher classifies the Metal device name and hands the result down as VC_DEVICE_M2
-// (1 = first Vision Pro / M2, 0 = M5 or newer). Unset -> treated as M2, the conservative
-// side: the M2 values (1.8 / Mittel) are assumptions, the M5 values are measured
-// (V3/V4/V5: 2.2 + Hoch hold 90/100 fps with Multiview + MSAA 4, Release, no validation).
+// Device class for the per-device standards (multiview-plan.md, device defaults 2026-09-29):
+// 1 = first Vision Pro / M2, 0 = M5 or newer. The M2 values (1.8 / MEDIUM) are assumptions,
+// the M5 values are measured (V3/V4/V5: 2.2 + HIGH hold 90/100 fps with multiview + MSAA 4).
+// Source of truth is the Metal device name, queried HERE (vc_metal_device_is_m2 in
+// visionos_angle.mm). The first caller is the global CMenuManager constructor, which runs
+// during static initialisation -- BEFORE the Swift launcher can setenv anything, so the old
+// "read VC_DEVICE_M2 from the environment" fell back to M2 on every device and the M5 got
+// 1.8 / MEDIUM as its defaults (found 2026-10-08). VC_DEVICE_M2 set in the Xcode scheme is
+// still honoured as an override (scheme variables exist from process start).
+extern "C" int vc_metal_device_is_m2(void);
 extern "C" int vc_device_is_m2(void)
 {
 	static int v = -1;
 	if (v < 0) {
 		const char *e = getenv("VC_DEVICE_M2");
-		v = (e && e[0] == '0') ? 0 : 1;
-		printf("[vc-device] class=%s -> draw-distance max %.1f, island loading default %s%s\n",
+		v = e ? ((e[0] == '0') ? 0 : 1) : vc_metal_device_is_m2();
+		printf("[vc-device] class=%s -> draw-distance max %.1f, island loading default %s (%s)\n",
 		       v ? "M2 (assumed values)" : "M5 or newer (measured)", v ? 1.8f : 2.2f, v ? "MEDIUM" : "HIGH",
-		       e ? "" : "  (VC_DEVICE_M2 unset -> conservative M2 class)");
+		       e ? "VC_DEVICE_M2 override" : "Metal device name");
 	}
 	return v;
 }

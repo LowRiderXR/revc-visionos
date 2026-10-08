@@ -3332,3 +3332,19 @@ vc_mem_footprint_mb(void)
 	if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return -1.0;
 	return (double)info.phys_footprint / (1024.0 * 1024.0);
 }
+
+// ---------------------------------------------------------------------------------------
+// Device class from the Metal device name ("Apple M2" on the first Vision Pro). Used by
+// vc_device_is_m2() in visionos.cpp when VC_DEVICE_M2 is not set in the environment; that
+// path runs during static initialisation (global CMenuManager), so it must not depend on
+// anything the Swift launcher sets later. MTLCreateSystemDefaultDevice is cheap here (the
+// system device is a shared singleton).
+// ---------------------------------------------------------------------------------------
+extern "C" int vc_metal_device_is_m2(void)
+{
+	@autoreleasepool {
+		id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+		NSString *name = dev ? dev.name : @"";
+		return [name containsString:@"M2"] ? 1 : 0;
+	}
+}

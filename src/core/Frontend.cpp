@@ -3292,6 +3292,11 @@ CMenuManager::LoadSettings()
 #ifdef LEGACY_MENU_OPTIONS
 	m_PrefsVsync = m_PrefsVsyncDisp;
 #endif
+#ifdef LIBRW_VISIONOS
+	// A gta_vc.set carried over from another device (save-game import, M5 -> M2) may hold a
+	// draw distance above this device's ceiling; the slider only clamps on change.
+	m_PrefsLOD = Clamp(m_PrefsLOD, 0.925f, VC_LOD_MAX);
+#endif
 	CRenderer::ms_lodDistScale = m_PrefsLOD;
 
 	if (m_nPrefsAudio3DProviderIndex == NO_AUDIO_PROVIDER)
