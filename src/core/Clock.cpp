@@ -43,6 +43,24 @@ CClock::Initialise(uint32 scale)
 void
 CClock::Update(void)
 {
+#ifdef LIBRW_VISIONOS
+	// VC_DEBUG_HOUR=0..23: set the game clock once, on the first clock tick of the session.
+	// Update() only runs with the game loaded, so this lands AFTER a loaded save game has
+	// restored its own time. Test aid for time-of-day effects (sun core far clamp, sunset).
+	{
+		static int once = -1;
+		if(once < 0){
+			const char *e = getenv("VC_DEBUG_HOUR");
+			once = (e && e[0]) ? atoi(e) : 24;
+			if(once >= 0 && once <= 23){
+				ms_nGameClockHours = (uint8)once;
+				ms_nGameClockMinutes = 0;
+				ms_nLastClockTick = CTimer::GetTimeInMilliseconds();
+				printf("[vc-clock] VC_DEBUG_HOUR: game clock set to %02d:00\n", once);
+			}
+		}
+	}
+#endif
 	if(CPad::GetPad(1)->GetRightShoulder1())
 	{
 		ms_nGameClockMinutes += 8;

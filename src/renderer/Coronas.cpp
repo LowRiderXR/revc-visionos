@@ -24,6 +24,7 @@ extern "C" int vc_render_mode(void);   // gl3device: 1 = stereo VR, 0 = cinema
 extern "C" int vc_get_eye_view_mv(int eye, float m[16]);   // one-pass: per-eye views the GPU twins use
 extern "C" int vc_get_eye_proj(float m[16]);
 extern "C" void vc_im3d_pull(float delta);   // librw gl3immed: per-eye view-space depth pull for the next im3d draws
+extern "C" void vc_im3d_pull_clamp(float zmax);   // gl3immed: per-corner far clamp for the next im3d draws (0 = off)
 
 // S1 Koronas (multiview-plan.md, Sprite-Familie S1, Entscheidung B): in stereo the corona
 // disc is no longer a CPU-projected 2D sprite (projected ONCE with the centre camera and
@@ -56,6 +57,16 @@ static bool vcWorldReflectOn(void)
 	if(e < 0){ const char *s = getenv("VC_WORLD_REFLECT"); e = (s && s[0] == '0') ? 0 : 1; }
 	return e != 0 && vcWorldCoronaOn();
 }
+// Sun core far clamp (see im3d.vert u_im3dPull.y): the core is pulled to 0.95*far with ZTEST
+// on (LOSCHECK_OFF) so buildings occlude it; tilted against the eye's view axis its outer
+// corners crossed the far plane -> hard-edged bright rectangle at sunset (2026-10-08).
+// VC_SUN_CLAMP=0 disables the clamp for the A/B run.
+static bool vcSunClampOn(void)
+{
+	static int e = -1;
+	if(e < 0){ const char *s = getenv("VC_SUN_CLAMP"); e = (s && s[0] == '0') ? 0 : 1; }
+	return e != 0;
+}
 // Known original behaviour (checked against the macOS reference build 2026-09-30): the
 // coronas of the VERTICAL traffic lights are half hidden by their housing, the horizontal
 // ones are not. Same in the flat game -- not a stereo defect, not fixed here.
@@ -72,7 +83,7 @@ static float vcCoronaAxLen = 0.0f, vcCoronaAyLen = 0.0f, vcCoronaAxAyDot = 0.0f;
 static void
 vcRenderCoronaWorldQuad(const CVector &coors, float zorig, float zdraw, float outh,
 	float wpx, float hpx, uint8 r, uint8 g, uint8 b, int16 intens, float rotation, uint8 a,
-	bool nearFade, float x2d)
+	bool nearFade, float x2d, float zclamp = 0.0f)   // zclamp > 0: per-corner far clamp (sun core)
 {
 	if(zorig <= 0.001f || outh <= 0.0f || zdraw <= 0.001f) return;
 	// near fade of RenderOneXLUSprite_Rotate_Aspect
@@ -144,11 +155,13 @@ vcRenderCoronaWorldQuad(const CVector &coors, float zorig, float zdraw, float ou
 	float pull = zdraw / zorig - 1.0f;
 	if(pull < -0.95f) pull = -0.95f;   // never collapse onto the eye
 	vc_im3d_pull(pull);
+	vc_im3d_pull_clamp(zclamp);
 	if(RwIm3DTransform(verts, 4, nil, rwIM3D_VERTEXXYZ|rwIM3D_VERTEXRGBA|rwIM3D_VERTEXUV)){
 		RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST, idx, 6);
 		RwIm3DEnd();
 	}
 	vc_im3d_pull(0.0f);
+	vc_im3d_pull_clamp(0.0f);
 	vcCoronaDrawn++;
 	if(!vcCoronaNearest.valid || zdraw < vcCoronaNearest.z){
 		vcCoronaNearest.valid = true; vcCoronaNearest.z = zdraw; vcCoronaNearest.zTrue = zorig; vcCoronaNearest.wpx = wpx;
@@ -543,10 +556,14 @@ CCoronas::Render(void)
 								aCoronas[i].red / fogscale, aCoronas[i].green / fogscale, aCoronas[i].blue / fogscale,
 								totalFade, 0.0f, 255, false, spriteCoors.x);
 						}else{
+							// sun core: keep every corner of the 0.95*far-pulled quad inside the
+							// far plane (vcSunClampOn, im3d.vert u_im3dPull.y)
+							const float zclamp = (aCoronas[i].id == SUN_CORE && vcSunClampOn()) ?
+								0.98f * RwCameraGetFarClipPlane(Scene.camera) : 0.0f;
 							vcRenderCoronaWorldQuad(aCoronas[i].coors, zorig, spriteCoors.z, spriteh,
 								spritew * aCoronas[i].size * fogscale, spriteh * aCoronas[i].size * fogscale,
 								aCoronas[i].red / fogscale, aCoronas[i].green / fogscale, aCoronas[i].blue / fogscale,
-								totalFade, 20.0f * recipz, 255, true, spriteCoors.x);
+								totalFade, 20.0f * recipz, 255, true, spriteCoors.x, zclamp);
 						}
 					}else
 #endif
