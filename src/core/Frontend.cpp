@@ -14,6 +14,12 @@ extern "C" float vc_lod_scale_max(void);
 const char *_psGetUserFilesFolder();   // visionos.cpp: Documents/GTA Vice City User Files (saves, gta_vc.set, reVC.ini)
 #define VC_LOD_MAX     vc_lod_scale_max()
 #define VC_LOD_DEFAULT vc_lod_scale_max()   // default = device maximum (measured on M5, assumed on M2)
+// Map-memory ("Kartenspeichernutzung") default per device class. Both HIGH since the M2
+// dress rehearsal (2026-10-09): MEDIUM gave disturbing pop-in when crossing the bridges on
+// the M2, and the M2 holds HIGH. Kept as two named values so a slower class can be split
+// off again without touching vcApplyDeviceDefaults.
+#define VC_MEM_DEFAULT_M2 CMenuManager::ISLAND_LOADING_HIGH
+#define VC_MEM_DEFAULT_M5 CMenuManager::ISLAND_LOADING_HIGH
 #else
 #define VC_LOD_MAX     1.8f
 #define VC_LOD_DEFAULT 1.2f
@@ -3188,9 +3194,10 @@ CMenuManager::LoadAllTextures()
 // been set without CRenderer::ms_lodDistScale):
 //   draw distance = device maximum (M5 2.2 measured, M2 1.8 assumed; vc_lod_scale_max() is
 //                   evaluated at run time from the Metal device name, not a constant),
-//   map memory    = HIGH on the M5, MEDIUM on the M2. (HIGH keeps both islands resident, no
-//                   island streaming stalls; 2026-09-29 V5: HIGH held 100 fps on the M5, the
-//                   earlier "-12 fps" had been the validation layer. M2 MEDIUM is assumed.)
+//   map memory    = VC_MEM_DEFAULT_M5 / VC_MEM_DEFAULT_M2 (both HIGH, see the defines above:
+//                   HIGH keeps both islands resident, no island streaming stalls and no bridge
+//                   pop-in; 2026-09-29 V5: HIGH held 100 fps on the M5, the earlier "-12 fps"
+//                   had been the validation layer; M2 confirmed 2026-10-09).
 // Callers (which = what to set): the constructor (ALL, static init, silent), LoadSettings on
 // a first start (ALL; no gta_vc.set AND no reVC.ini), RestoreDefDisplay (DIST only, the
 // display screen owns the slider), RestoreDefGraphics (MEM only, the graphics screen owns
@@ -3205,7 +3212,7 @@ CMenuManager::vcApplyDeviceDefaults(int which, const char *source)
 	}
 #ifdef NO_ISLAND_LOADING
 	if (which & VCDEF_MEM) {
-		const int8 def = vc_device_is_m2() ? (int8)ISLAND_LOADING_MEDIUM : (int8)ISLAND_LOADING_HIGH;
+		const int8 def = vc_device_is_m2() ? (int8)VC_MEM_DEFAULT_M2 : (int8)VC_MEM_DEFAULT_M5;
 #ifdef CUSTOM_FRONTEND_OPTIONS
 		if (!m_bGameNotLoaded && m_PrefsIslandLoading != def) {
 			extern void IslandLoadingAfterChange(int8 before, int8 after);   // MenuScreensCustom.cpp

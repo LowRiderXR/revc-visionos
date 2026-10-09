@@ -1533,6 +1533,7 @@ extern "C" int  vc_render_mode(void);          // 1 = VC_MODE_STEREO
 #include <mach/mach_time.h>                     // [vc-rm] RenderMenus own-wall-time probe
 extern "C" void vc_stereo_eye_pass(int eye);   // gl3device: bind slice FBO + per-eye matrices
 extern "C" void vc_stereo_restore_main(void);  // gl3device: rebind cinema FBO + mono matrices
+extern "C" void vc_stereo_mark_world(void);    // visionos_angle: this publish carries rendered eye slices
 extern "C" void vc_hud_clear_transparent(void); // visionos_angle: wipe stale opaque HUD-buffer colour
 extern "C" void vc_stereo_readback_log(void);  // visionos_angle: one-time slice read-back proof
 extern "C" void vc_frame_mark(int id);         // visionos: per-frame phase timing probe
@@ -2480,6 +2481,7 @@ Idle(void *arg)
 		// shared overlay) instead of the cinema buffer.
 		if (vc_render_mode() == 1 /* VC_MODE_STEREO */) {
 			g_vcSplashActive = 0;   // real world render resumes -> leave the splash overlay
+			vc_stereo_mark_world(); // this frame's publish carries freshly rendered eye slices
 			// Sky: fill the eye slices with the sky colour (mid of the time-cycle sky
 			// gradient) so the sky is world-anchored; the screen-space horizon band is
 			// skipped in DoRWRenderHorizon. VC_STEREO_SKY=0 disables (old band).

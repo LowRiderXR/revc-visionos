@@ -394,7 +394,15 @@ typedef struct {
 	VCBufState     state;
 	uint64_t       waitValue;  // shared-event value to wait for (0 = no wait)
 	uint64_t       poseSetTime; // mach time the head pose of THIS slice was pushed (latency probe)
+	bool           worldDrawn;  // the stereo eye passes rendered into this buffer's slices this publish
 } VCBuffer;
+
+// Set by reVC (vc_stereo_mark_world) when the in-game block renders the eye passes; copied
+// into the buffer at publish and reset. Frontend/splash/loading frames publish WITHOUT eye
+// passes (eye_count is still 2), so their array slices hold stale or never-rendered content;
+// the host must not display those (New Game flash, 2026-10-09). Game thread only.
+static bool g_worldDrawnThisFrame = false;
+extern "C" void vc_stereo_mark_world(void) { g_worldDrawnThisFrame = true; }
 
 static VCBuffer g_buf[VC_NUM_BUFFERS];
 static int      g_rtWidth = 0, g_rtHeight = 0;
@@ -432,6 +440,7 @@ typedef struct {
 	uint32_t eye_count;   // 1 = mono 2D texture; 2 = stereo 2D-array (slice per eye)
 	void    *hud_texture; // stereo only: 2D transparent HUD/2D/menu overlay; NULL in cinema
 	uint64_t pose_set_time; // mach time of the head pose this frame was RENDERED with (reproj fix)
+	uint32_t world_valid; // 1 = the eye slices were rendered for this publish; 0 = stale/never rendered
 } vc_ready_frame_t;
 
 // Defined in visionos.cpp; lets the throttle wake up for vc_game_thread_stop().
@@ -1080,6 +1089,8 @@ vcrt_publish_frame(void)
 	g_buf[back].state = VC_BUF_READY;         // IN_FLIGHT -> READY
 	g_buf[back].waitValue = value;            // 0 under VC_NOFENCE -> compositor won't wait
 	g_buf[back].poseSetTime = vc_last_consumed_pose_time();  // latency probe: pose age of this slice
+	g_buf[back].worldDrawn = g_worldDrawnThisFrame;           // eye passes ran for this publish?
+	g_worldDrawnThisFrame = false;
 	g_readyIndex = back;
 	g_haveBack = false;                        // reservation consumed
 	uint64_t n = ++g_frameCount;
@@ -1201,6 +1212,7 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	// Cinema: no separate HUD layer.
 	out->hud_texture = stereo ? VC_OBJ_TO_VOID(g_buf[idx].mtlTexture) : NULL;
 	out->pose_set_time = g_buf[idx].poseSetTime;   // render pose of THIS buffer (reproj fix)
+	out->world_valid   = g_buf[idx].worldDrawn ? 1u : 0u;
 	void    *outTex = out->texture;
 	uint64_t outWait = out->wait_value;
 	uint64_t poseSetT = g_buf[idx].poseSetTime;
