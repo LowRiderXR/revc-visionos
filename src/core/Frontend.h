@@ -822,6 +822,11 @@ public:
 	void InitialiseChangedLanguageSettings();
 	void LoadAllTextures();
 	void LoadSettings();
+#ifdef LIBRW_VISIONOS
+	enum { VCDEF_DIST = 1, VCDEF_MEM = 2, VCDEF_ALL = VCDEF_DIST | VCDEF_MEM };   // which per-device standards to apply
+	void vcApplyDeviceDefaults(int which, const char *source);   // the one place for per-device standards; source != nil logs
+	void vcLogDefaults(const char *source);                      // [vc-defaults] class=.. source=.. dist=.. mem=..
+#endif
 	void MessageScreen(const char *str, bool);
 	void SmallMessageScreen(const char *str);
 	void PrintBriefs();

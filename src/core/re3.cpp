@@ -201,6 +201,9 @@ CustomFrontendOptionsPopulate(void)
 
 mINI::INIFile ini("reVC.ini");
 mINI::INIStructure cfg;
+#ifdef LIBRW_VISIONOS
+static std::string vcIniPath;   // absolute path once LoadINISettings relocated the ini (user files folder)
+#endif
 
 bool ReadIniIfExists(const char *cat, const char *key, uint32 *out)
 {
@@ -514,15 +517,23 @@ bool LoadINISettings()
 	{
 		static bool relocated = false;
 		if (!relocated) {
-			std::string p = std::string(_psGetUserFilesFolder()) + "/reVC.ini";
-			ini = mINI::INIFile(p);
+			vcIniPath = std::string(_psGetUserFilesFolder()) + "/reVC.ini";
+			ini = mINI::INIFile(vcIniPath);
 			relocated = true;
-			printf("[vc-fs] reVC.ini at %s\n", p.c_str());
 		}
 	}
-#endif
+	// This is THE settings store on visionOS: with LOAD_INI_SETTINGS SaveSettings never
+	// writes gta_vc.set (that file is only read, for an imported PC copy).
+	{
+		const bool found = ini.read(cfg);
+		printf("[vc-settings] load path=%s found=%d\n", vcIniPath.c_str(), found ? 1 : 0);
+		if (!found)
+			return false;
+	}
+#else
 	if (!ini.read(cfg))
 		return false;
+#endif
 
 #ifdef IMPROVED_VIDEOMODE
 	ReadIniIfExists("VideoMode", "Width", &FrontEndMenuManager.m_nPrefsWidth);
@@ -742,7 +753,14 @@ void SaveINISettings()
 	}
 #endif
 
+#ifdef LIBRW_VISIONOS
+	{
+		const bool ok = ini.write(cfg);
+		printf("[vc-settings] save path=%s ok=%d\n", vcIniPath.c_str(), ok ? 1 : 0);
+	}
+#else
 	ini.write(cfg);
+#endif
 }
 
 #endif

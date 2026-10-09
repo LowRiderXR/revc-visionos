@@ -31,11 +31,6 @@
 #include "CarCtrl.h"
 #include "Population.h"
 
-#ifdef LIBRW_VISIONOS
-extern "C" int vc_device_is_m2(void);      // visionos.cpp: device class for per-device defaults
-extern "C" float vc_lod_scale_max(void);
-#endif
-
 // Menu screens array is at the bottom of the file.
 
 #ifdef PC_MENU
@@ -121,10 +116,6 @@ void FPSLimitChanged(int8 before, int8 after) {
 	}
 }
 
-#if defined(LIBRW_VISIONOS) && defined(NO_ISLAND_LOADING)
-void IslandLoadingAfterChange(int8 before, int8 after);   // defined below; reused by the restore
-#endif
-
 void RestoreDefGraphics(int8 action) {
 	if (action != FEOPTION_ACTION_SELECT)
 		return;
@@ -143,19 +134,12 @@ void RestoreDefGraphics(int8 action) {
 	#ifdef MULTISAMPLING
 		FrontEndMenuManager.m_nPrefsMSAALevel = FrontEndMenuManager.m_nDisplayMSAALevel = 0;
 	#endif
-	#ifdef NO_ISLAND_LOADING
 	#ifdef LIBRW_VISIONOS
-		// visionOS default is MEDIUM (see Frontend.cpp LoadSettings for the measurement:
-		// HIGH costs 12 fps in the dense centre through ANGLE's per-draw CPU cost; LOW brings
-		// back the island-transition stalls). Reuse the option's own change handler so the
-		// streaming side effects match what the menu does.
-		{
-			const int8 def = vc_device_is_m2() ? (int8)FrontEndMenuManager.ISLAND_LOADING_MEDIUM : (int8)FrontEndMenuManager.ISLAND_LOADING_HIGH;
-			if (!FrontEndMenuManager.m_bGameNotLoaded)
-				IslandLoadingAfterChange(FrontEndMenuManager.m_PrefsIslandLoading, def);
-			FrontEndMenuManager.m_PrefsIslandLoading = def;
-		}
-	#else
+		// Per-device standard for map memory -- one rule, Frontend.cpp (this screen owns the option).
+		FrontEndMenuManager.vcApplyDeviceDefaults(CMenuManager::VCDEF_MEM, "restore");
+	#endif
+	#ifdef NO_ISLAND_LOADING
+	#ifndef LIBRW_VISIONOS
 	    	if (!FrontEndMenuManager.m_bGameNotLoaded) {
 	    		FrontEndMenuManager.m_PrefsIslandLoading = FrontEndMenuManager.ISLAND_LOADING_LOW;
 				CStreaming::RemoveUnusedBigBuildings(CGame::currLevel);
@@ -215,11 +199,12 @@ void RestoreDefDisplay(int8 action) {
 	#ifdef GRAPHICS_MENU_OPTIONS // otherwise Frontend will handle those
 		FrontEndMenuManager.m_PrefsBrightness = 256;
 #ifdef LIBRW_VISIONOS
-		FrontEndMenuManager.m_PrefsLOD = vc_lod_scale_max();   // device maximum (M5 2.2 measured, M2 1.8 assumed)
+		// Per-device standard for the draw distance -- one rule, Frontend.cpp (this screen owns the slider).
+		FrontEndMenuManager.vcApplyDeviceDefaults(CMenuManager::VCDEF_DIST, "restore");
 #else
 		FrontEndMenuManager.m_PrefsLOD = 1.2f;
-#endif
 		CRenderer::ms_lodDistScale = FrontEndMenuManager.m_PrefsLOD;
+#endif
 		FrontEndMenuManager.m_PrefsShowSubtitles = false;
 		FrontEndMenuManager.m_PrefsShowLegends = true;
 		FrontEndMenuManager.m_PrefsRadarMode = 0;

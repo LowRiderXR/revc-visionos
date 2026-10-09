@@ -11,6 +11,7 @@
 // Per-device standards (visionos.cpp): slider ceiling and default of "Distanz-Darstellung".
 extern "C" int vc_device_is_m2(void);
 extern "C" float vc_lod_scale_max(void);
+const char *_psGetUserFilesFolder();   // visionos.cpp: Documents/GTA Vice City User Files (saves, gta_vc.set, reVC.ini)
 #define VC_LOD_MAX     vc_lod_scale_max()
 #define VC_LOD_DEFAULT vc_lod_scale_max()   // default = device maximum (measured on M5, assumed on M2)
 #else
@@ -578,23 +579,12 @@ CMenuManager::CMenuManager()
 	DMAudio.SetMusicMasterVolume(m_PrefsMusicVolume);
 	DMAudio.SetEffectsMasterVolume(m_PrefsSfxVolume);
 
-#ifdef NO_ISLAND_LOADING
 #ifdef LIBRW_VISIONOS
-	// visionOS default MEDIUM (was HIGH until 2026-09-29). HIGH keeps both islands resident
-	// and removes the synchronous island streaming stalls while driving (device-confirmed),
-	// but the draw-distance measurement (multiview-plan.md, Danach-Liste 2, run K) showed its
-	// price: both big-building lists are scanned every frame, visEnt 538 vs 390, +430 draws,
-	// and ANGLE's per-draw replay cost (~3.5 us/draw) puts the render thread over the 90 Hz
-	// budget in the dense centre -> 72 fps vs 84 with MEDIUM. MEDIUM keeps the far island as
-	// its LOD model (no stall on the island transition either; only LOW reloads). HIGH stays a
-	// menu choice for players who prefer it. Note: the option applies on Enter only.
-	// 2026-09-29, V5 (Release, no validation, 2.2, rain, 100 Hz display): HIGH held 100 fps,
-	// the -12 fps had been the validation layer -> HIGH is the M5 default (user rule: "if HIGH
-	// holds with Multiview + MSAA 4 on the M5 it is the standard"); M2 stays MEDIUM (assumed).
-	m_PrefsIslandLoading = vc_device_is_m2() ? ISLAND_LOADING_MEDIUM : ISLAND_LOADING_HIGH;
-#else
+	// Per-device standards (draw distance, map memory) -- one rule, see vcApplyDeviceDefaults.
+	// Static init: the game is not loaded, so no streaming side effects; silent (no log).
+	vcApplyDeviceDefaults(VCDEF_ALL, nil);
+#elif defined(NO_ISLAND_LOADING)
 	m_PrefsIslandLoading = ISLAND_LOADING_LOW;
-#endif
 #endif
 
 #ifdef GAMEPAD_MENU
@@ -3192,6 +3182,56 @@ CMenuManager::LoadAllTextures()
 	CTimer::Update();
 }
 
+#ifdef LIBRW_VISIONOS
+// The ONE place that knows the per-device standards (user rule 2026-10-08, after the
+// fresh-install test showed the slider at 2.2 while rendering ran with 1.2 -- m_PrefsLOD had
+// been set without CRenderer::ms_lodDistScale):
+//   draw distance = device maximum (M5 2.2 measured, M2 1.8 assumed; vc_lod_scale_max() is
+//                   evaluated at run time from the Metal device name, not a constant),
+//   map memory    = HIGH on the M5, MEDIUM on the M2. (HIGH keeps both islands resident, no
+//                   island streaming stalls; 2026-09-29 V5: HIGH held 100 fps on the M5, the
+//                   earlier "-12 fps" had been the validation layer. M2 MEDIUM is assumed.)
+// Callers (which = what to set): the constructor (ALL, static init, silent), LoadSettings on
+// a first start (ALL; no gta_vc.set AND no reVC.ini), RestoreDefDisplay (DIST only, the
+// display screen owns the slider), RestoreDefGraphics (MEM only, the graphics screen owns
+// the option). With the game loaded, the island-loading change goes through the option's
+// own handler so the streaming side effects match the menu. source != nil logs the result.
+void
+CMenuManager::vcApplyDeviceDefaults(int which, const char *source)
+{
+	if (which & VCDEF_DIST) {
+		m_PrefsLOD = VC_LOD_DEFAULT;
+		CRenderer::ms_lodDistScale = m_PrefsLOD;
+	}
+#ifdef NO_ISLAND_LOADING
+	if (which & VCDEF_MEM) {
+		const int8 def = vc_device_is_m2() ? (int8)ISLAND_LOADING_MEDIUM : (int8)ISLAND_LOADING_HIGH;
+#ifdef CUSTOM_FRONTEND_OPTIONS
+		if (!m_bGameNotLoaded && m_PrefsIslandLoading != def) {
+			extern void IslandLoadingAfterChange(int8 before, int8 after);   // MenuScreensCustom.cpp
+			IslandLoadingAfterChange(m_PrefsIslandLoading, def);
+		}
+#endif
+		m_PrefsIslandLoading = def;
+	}
+#endif
+	if (source)
+		vcLogDefaults(source);
+}
+
+void
+CMenuManager::vcLogDefaults(const char *source)
+{
+	const char *mem = "n/a";
+#ifdef NO_ISLAND_LOADING
+	static const char *const names[] = { "LOW", "MEDIUM", "HIGH" };
+	mem = (m_PrefsIslandLoading >= 0 && m_PrefsIslandLoading <= 2) ? names[m_PrefsIslandLoading] : "?";
+#endif
+	printf("[vc-defaults] class=%s source=%s dist=%.2f mem=%s\n",
+	       vc_device_is_m2() ? "M2" : "M5", source, CRenderer::ms_lodDistScale, mem);
+}
+#endif
+
 void
 CMenuManager::LoadSettings()
 {
@@ -3277,10 +3317,29 @@ CMenuManager::LoadSettings()
 	CFileMgr::CloseFile(fileHandle);
 	CFileMgr::SetDir("");
 
+#ifdef LIBRW_VISIONOS
+	// gta_vc.set is read for compatibility only (a PC/imported file): with LOAD_INI_SETTINGS
+	// SaveSettings never writes it, every setting lives in reVC.ini (SaveINISettings). So the
+	// store that decides "first start" is the ini, not this file (finding 2026-10-09: every
+	// start logged source=firststart although the ini had the player's values).
+	printf("[vc-settings] load path=%s/gta_vc.set found=%d\n", _psGetUserFilesFolder(), fileHandle ? 1 : 0);
+	bool iniLoaded = false;
+#endif
+
 #ifdef LOAD_INI_SETTINGS
 	if (LoadINISettings()) {
 		LoadINIControllerSettings();
+#ifdef LIBRW_VISIONOS
+		iniLoaded = true;
+#endif
 	}
+#endif
+
+#ifdef LIBRW_VISIONOS
+	// First start (neither gta_vc.set nor reVC.ini): the per-device standards, same rule as
+	// "restore defaults". Logged below, after the clamp.
+	if (!fileHandle && !iniLoaded)
+		vcApplyDeviceDefaults(VCDEF_ALL, nil);
 #endif
 
 #ifdef FIX_BUGS
@@ -3298,6 +3357,10 @@ CMenuManager::LoadSettings()
 	m_PrefsLOD = Clamp(m_PrefsLOD, 0.925f, VC_LOD_MAX);
 #endif
 	CRenderer::ms_lodDistScale = m_PrefsLOD;
+#ifdef LIBRW_VISIONOS
+	// source: ini = reVC.ini (the normal case), file = gta_vc.set present (imported), firststart
+	vcLogDefaults(fileHandle ? "file" : iniLoaded ? "ini" : "firststart");
+#endif
 
 	if (m_nPrefsAudio3DProviderIndex == NO_AUDIO_PROVIDER)
 		m_nPrefsAudio3DProviderIndex = -2;
@@ -5026,11 +5089,13 @@ CMenuManager::ProcessUserInput(uint8 goDown, uint8 goUp, uint8 optionSelected, u
 					SaveSettings();
 				} else if (m_nCurrScreen == MENUPAGE_DISPLAY_SETTINGS) {
 					m_PrefsBrightness = 256;
+#ifndef LIBRW_VISIONOS   // visionOS: draw distance via vcApplyDeviceDefaults (RestoreDefDisplay below)
 					m_PrefsLOD = VC_LOD_DEFAULT;
+					CRenderer::ms_lodDistScale = m_PrefsLOD;
+#endif
 #ifdef LEGACY_MENU_OPTIONS
 					m_PrefsVsync = true;
 #endif
-					CRenderer::ms_lodDistScale = m_PrefsLOD;
 					m_PrefsShowSubtitles = false;
 #ifdef ASPECT_RATIO_SCALE
 					m_PrefsUseWideScreen = AR_AUTO;
