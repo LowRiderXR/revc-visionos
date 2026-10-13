@@ -3071,9 +3071,22 @@ CMenuManager::InitialiseChangedLanguageSettings()
 		if (gGameState > GS_INIT_ONCE)
 #endif
 		CTimer::Stop();
+#ifdef FIX_BUGS
+		// CText::Unload drops the mission text table (bIsMissionTextLoaded = false,
+		// szMissionTableName cleared) and nothing reloads it: a language change in the
+		// pause menu during a mission left every mission string as "<key> missing" until
+		// the script loaded the table again (device, "Love Juice", 2026-10-12). Keep the
+		// table name across the reload. szMissionTableName is char[8] with no
+		// terminator guarantee, so copy the raw bytes and terminate ourselves.
+		char missionTable[9];
+		memcpy(missionTable, TheText.GetMissionTableName(), 8);
+		missionTable[8] = '\0';
+#endif
 		TheText.Unload();
 		TheText.Load();
 #ifdef FIX_BUGS
+		if (missionTable[0] != '\0')
+			TheText.LoadMissionText(missionTable);
 		if (gGameState > GS_INIT_ONCE)
 #endif
 		CTimer::Update();

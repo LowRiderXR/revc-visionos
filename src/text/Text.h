@@ -93,6 +93,11 @@ public:
 	wchar GetUpperCase(wchar c);
 	void UpperCase(wchar *s);
 	void GetNameOfLoadedMissionText(char *outName);
+#ifdef FIX_BUGS
+	// Raw 8-byte table name (not guaranteed to be NUL-terminated; copy with memcpy).
+	// Lets the language reload in the frontend preserve the mission text table.
+	const char *GetMissionTableName(void) const { return szMissionTableName; }
+#endif
 	void ReadChunkHeader(ChunkHeader *buf, int32 file, size_t *bytes_read);
 	void LoadMissionText(char *MissionTableName);
 };
