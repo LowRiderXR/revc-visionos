@@ -1183,6 +1183,37 @@ vc_set_gamepad_type(int type)
 	pthread_mutex_unlock(&g_padMutex);
 }
 
+// Vibration output, host side (GamepadInput.swift, declared in VCPlatform.h). Called on
+// the game thread with the motor strength 0..1; the host hands it to its own queue.
+extern "C" void vc_set_gamepad_rumble(float intensity);
+
+// Mirror of the XInput block in CPad::Update (Pad.cpp): the game sets ShakeDur/ShakeFreq
+// in StartShake*, this counts the duration down per frame and reports the strength on
+// change only. It mirrors the game state and never zeroes it itself: pause menu, menu
+// toggle and restarts stop through CPad::StopPadsShaking (GTA_PS2_STUFF resets the two
+// fields). With the game timer paused (menu) the step is 0, so ShakeDur holds until the
+// menu's TimeToStopPadShaking fires -- that is the PC behaviour too.
+static void
+vcpad_rumble(CPad *pad)
+{
+	static float last = -1.0f;
+	float intensity = (float)pad->ShakeFreq / 255.0f;
+
+	uint32 step = CTimer::GetTimeStepInMilliseconds();
+	if ((uint32)pad->ShakeDur < step)
+		pad->ShakeDur = 0;
+	else
+		pad->ShakeDur -= (int16)step;
+	if (pad->ShakeDur == 0)
+		pad->ShakeFreq = 0;
+
+	if (intensity != last) {
+		last = intensity;
+		printf("[vc-pad] rumble %.2f\n", intensity);
+		vc_set_gamepad_rumble(intensity);
+	}
+}
+
 // Sticks: reVC uses up = negative and (matching the glfw path) an ~8-bit range
 // with a 0.3 deadzone. GCController gives up = +1, so Y is negated by the caller.
 static int16
@@ -1296,6 +1327,7 @@ CapturePad(RwInt32 padID)
 	js.RightStickY = vcpad_axis(-s.right_y);
 
 	vcpad_log(s);
+	vcpad_rumble(pad);
 }
 
 // ===========================================================================
