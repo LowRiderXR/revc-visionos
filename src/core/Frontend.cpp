@@ -6213,11 +6213,86 @@ const char* controllerTypesPaths[] = {
 	"MODELS/FRONTEND_NSW.TXD",
 };
 
+#ifdef LIBRW_VISIONOS
+// visionOS: the 2D layout is pinned to the 4:3 design aspect (VC_HUD_ASPECT), so the menu's
+// wrap limit SCREEN_WIDTH is design x 640 -- about 107 design px less room to the right of
+// the controller picture than on a 16:9 PC window (746). Three labels of this page (mode 0)
+// stop fitting on one line there: FEC_ATT (DE), FEC_EXV (DE, FR) and, by one px, FEC_VES
+// (FR). Everything else fits, or wraps by reVC's own explicit limits (L2/R2 in FR/ES,
+// Select and Square in the vehicle view) exactly as on the PC -- untouched. Short texts
+// only for this page, only for those labels, only on visionOS; the GXT files stay. Accented
+// letters use the font's own codes as stored in the GXT (0x9E = e-acute in french.gxt).
+// Width model, table and prediction: Docs vicecity/steuerung-analyse.md.
+struct VcCtrlShortText { int8 lang; const char *key; const wchar *text; };
+static const VcCtrlShortText vcCtrlShortTexts[] = {
+	{ CMenuManager::LANGUAGE_GERMAN, "FEC_ATT", (const wchar *)u"Angreifen/Waffe abfeuern" },
+	{ CMenuManager::LANGUAGE_GERMAN, "FEC_EXV", (const wchar *)u"Fahrzeuge ein-/aussteigen" },
+	{ CMenuManager::LANGUAGE_FRENCH, "FEC_EXV", (const wchar *)u"Entrer/sortir du v\u009Ehicule" },
+	{ CMenuManager::LANGUAGE_FRENCH, "FEC_VES", (const wchar *)u"Commandes v\u009Ehicule" },
+};
+static int8        vcCtrlLang = 0;
+static uint32      vcCtrlVisit = 0;        // m_LastScreenSwitch of the page visit being logged
+static const char *vcCtrlLogged[32];       // keys already logged during this visit
+static int         vcCtrlLoggedCount = 0;
+
+// Draws one label of the controller page: short text if the table has one, else the GXT
+// text. Safety net: labels reVC lays out single-line, i.e. printed with PrintString under
+// the page default bound (SetWrapx(SCREEN_WIDTH) left, SetRightJustifyWrap(0) right), are
+// measured as a whole against that room and logged once per page visit and key. Labels
+// with their own bound (L2/R2 in FR/ES, Select in the vehicle) or PrintStringFromBottom
+// (Square in the vehicle) are meant to wrap and are not checked.
+static void
+vcCtrlPrint(float x, float y, const char *key, bool fromBottom)
+{
+	wchar *s = nil;
+	for (size_t i = 0; i < ARRAY_SIZE(vcCtrlShortTexts); i++)
+		if (vcCtrlShortTexts[i].lang == vcCtrlLang && strcmp(vcCtrlShortTexts[i].key, key) == 0) {
+			s = (wchar *)vcCtrlShortTexts[i].text;
+			break;
+		}
+	if (s == nil)
+		s = TheText.Get(key);
+
+	const CFontDetails &d = CFont::Details;
+	bool defaultBound = !fromBottom && !d.centre &&
+	                    (d.rightJustify ? d.rightJustifyWrap == 0.0f : d.wrapX == SCREEN_WIDTH);
+	float avail = d.rightJustify ? x - d.rightJustifyWrap : d.wrapX - x;
+	float width = defaultBound ? CFont::GetStringWidth(s, true) : 0.0f;
+	if (defaultBound && width > avail) {
+		bool logged = false;
+		for (int i = 0; i < vcCtrlLoggedCount; i++)
+			if (strcmp(vcCtrlLogged[i], key) == 0) { logged = true; break; }
+		if (!logged) {
+			if (vcCtrlLoggedCount < (int)ARRAY_SIZE(vcCtrlLogged))
+				vcCtrlLogged[vcCtrlLoggedCount++] = key;
+			printf("[vc-menu] controller label wider than its space: key=%s lang=%d width=%.0f avail=%.0f (%s)\n",
+			       key, vcCtrlLang, width, avail, d.rightJustify ? "right" : "left");
+		}
+	}
+	if (fromBottom)
+		CFont::PrintStringFromBottom(x, y, s);
+	else
+		CFont::PrintString(x, y, s);
+}
+#define VC_CTRL_PRINT(x, y, key)        vcCtrlPrint(x, y, key, false)
+#define VC_CTRL_PRINT_BOTTOM(x, y, key) vcCtrlPrint(x, y, key, true)
+#else
+#define VC_CTRL_PRINT(x, y, key)        CFont::PrintString(x, y, TheText.Get(key))
+#define VC_CTRL_PRINT_BOTTOM(x, y, key) CFont::PrintStringFromBottom(x, y, TheText.Get(key))
+#endif
+
 void
 CMenuManager::PrintController(void)
 {
 	// Don't print anything if controller texture is missing
 	if (!m_aFrontEndSprites[MENUSPRITE_CONTROLLER].m_pTexture) return;
+#ifdef LIBRW_VISIONOS
+	vcCtrlLang = m_PrefsLanguage;
+	if (vcCtrlVisit != m_LastScreenSwitch) {   // new page visit -> log each wide label once again
+		vcCtrlVisit = m_LastScreenSwitch;
+		vcCtrlLoggedCount = 0;
+	}
+#endif
 
 	const float scale = 0.9f;
 	const float CONTROLLER_SIZE_X = 235.2f;
@@ -6350,12 +6425,12 @@ CMenuManager::PrintController(void)
 				CFont::SetRightJustifyWrap(0);
 				break;
 			}
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_L2_X)), MENU_Y(Y(TEXT_L2_Y)), TheText.Get("FEC_CWL"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_L2_X)), MENU_Y(Y(TEXT_L2_Y)), "FEC_CWL");
 			CFont::SetRightJustifyWrap(0);
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_L1_X)), MENU_Y(Y(TEXT_L1_Y)), TheText.Get("FEC_LOF"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_DPAD_X)), MENU_Y(Y(TEXT_DPAD_Y)), TheText.Get("FEC_MOV"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_LSTICK_X)), MENU_Y(Y(TEXT_LSTICK_Y)), TheText.Get("FEC_MOV"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_LSTICK_X)), MENU_Y(Y(TEXT_R3_Y)), TheText.Get("FEC_CR3"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_L1_X)), MENU_Y(Y(TEXT_L1_Y)), "FEC_LOF");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_DPAD_X)), MENU_Y(Y(TEXT_DPAD_Y)), "FEC_MOV");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_LSTICK_X)), MENU_Y(Y(TEXT_LSTICK_Y)), "FEC_MOV");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_LSTICK_X)), MENU_Y(Y(TEXT_R3_Y)), "FEC_CR3");
 			CFont::SetRightJustifyOn();
 			switch (m_PrefsLanguage)
 			{
@@ -6368,9 +6443,9 @@ CMenuManager::PrintController(void)
 			default:
 				break;
 			}
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_SELECT_X)), MENU_Y(Y(TEXT_SELECT_Y)), TheText.Get("FEC_CAM"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_SELECT_X)), MENU_Y(Y(TEXT_SELECT_Y)), "FEC_CAM");
 			CFont::SetJustifyOn();
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_START_X)), MENU_Y(Y(TEXT_START_Y)), TheText.Get("FEC_PAU"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_START_X)), MENU_Y(Y(TEXT_START_Y)), "FEC_PAU");
 			switch (m_PrefsLanguage)
 			{
 			case LANGUAGE_FRENCH:
@@ -6382,19 +6457,19 @@ CMenuManager::PrintController(void)
 			default:
 				break;
 			}
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_R2_X)), MENU_Y(Y(TEXT_R2_Y)), TheText.Get("FEC_CWR"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_R2_X)), MENU_Y(Y(TEXT_R2_Y)), "FEC_CWR");
 			CFont::SetJustifyOn();
 			CFont::SetWrapx(SCREEN_WIDTH);
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_R1_X)), MENU_Y(Y(TEXT_R1_Y)), TheText.Get("FEC_TAR"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_R1_X)), MENU_Y(Y(TEXT_R1_Y)), "FEC_TAR");
 			CFont::SetRightJustifyOn();
-			CFont::PrintStringFromBottom(MENU_X_LEFT_ALIGNED(X(TEXT_SQUARE_X)), MENU_Y(Y(TEXT_SQUARE_Y)), TheText.Get("FEC_JUM"));
+			VC_CTRL_PRINT_BOTTOM(MENU_X_LEFT_ALIGNED(X(TEXT_SQUARE_X)), MENU_Y(Y(TEXT_SQUARE_Y)), "FEC_JUM");
 			CFont::SetJustifyOn();
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_TRIANGLE_X)), MENU_Y(Y(TEXT_TRIANGLE_Y)), TheText.Get("FEC_ENV"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_CIRCLE_X)), MENU_Y(Y(TEXT_CIRCLE_Y)), TheText.Get("FEC_ATT"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_CROSS_X)), MENU_Y(Y(TEXT_CROSS_Y)), TheText.Get("FEC_RUN"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_RSTICK_X)), MENU_Y(Y(TEXT_RSTICK_Y)), TheText.Get("FEC_FPC"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_R3_X)), MENU_Y(Y(TEXT_R3_Y)), TheText.Get("FEC_LB3"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_R3_X)), MENU_Y(Y(TEXT_R3_Y + 13.0f)), TheText.Get("FEC_R3"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_TRIANGLE_X)), MENU_Y(Y(TEXT_TRIANGLE_Y)), "FEC_ENV");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_CIRCLE_X)), MENU_Y(Y(TEXT_CIRCLE_Y)), "FEC_ATT");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_CROSS_X)), MENU_Y(Y(TEXT_CROSS_Y)), "FEC_RUN");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_RSTICK_X)), MENU_Y(Y(TEXT_RSTICK_Y)), "FEC_FPC");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_R3_X)), MENU_Y(Y(TEXT_R3_Y)), "FEC_LB3");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_R3_X)), MENU_Y(Y(TEXT_R3_Y + 13.0f)), "FEC_R3");
 			break;
 		case 1:
 			CFont::SetRightJustifyOn();
@@ -6587,17 +6662,17 @@ CMenuManager::PrintController(void)
 		default:
 			break;
 		}
-		CFont::PrintString(MENU_X_LEFT_ALIGNED(X(0.0f)), MENU_Y(Y(TEXT_L2R2_Y)), TheText.Get("FEC_LB"));
+		VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(0.0f)), MENU_Y(Y(TEXT_L2R2_Y)), "FEC_LB");
 		CFont::SetScale(MENU_X(SMALLESTTEXT_X_SCALE * 2 * scale * 0.9f), MENU_Y(SMALLESTTEXT_Y_SCALE* scale * 0.9f));
 		switch (CPad::GetPad(0)->Mode) {
 		case 0:
 			CFont::SetRightJustifyOn();
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_L2_X)), MENU_Y(Y(TEXT_L2_Y)), TheText.Get("FEC_LL"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_L1_X)), MENU_Y(Y(TEXT_L1_Y_VEH)), TheText.Get("FEC_RSC"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_DPAD_X)), MENU_Y(Y(TEXT_DPAD_Y)), TheText.Get("FEC_VES"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_LSTICK_X)), MENU_Y(Y(TEXT_LSTICK_Y)), TheText.Get("FEC_VES"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_L2_X)), MENU_Y(Y(TEXT_L2_Y)), "FEC_LL");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_L1_X)), MENU_Y(Y(TEXT_L1_Y_VEH)), "FEC_RSC");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_DPAD_X)), MENU_Y(Y(TEXT_DPAD_Y)), "FEC_VES");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_LSTICK_X)), MENU_Y(Y(TEXT_LSTICK_Y)), "FEC_VES");
 			CFont::SetRightJustifyOn();
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_L3_X)), MENU_Y(Y(TEXT_L3_Y)), TheText.Get("FEC_HO3"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_L3_X)), MENU_Y(Y(TEXT_L3_Y)), "FEC_HO3");
 			switch (m_PrefsLanguage)
 			{
 			case LANGUAGE_FRENCH:
@@ -6613,17 +6688,17 @@ CMenuManager::PrintController(void)
 				break;
 			}
 			CFont::SetRightJustifyWrap(MENU_X_LEFT_ALIGNED(X(TEXT_SELECT_X)) - SCREEN_SCALE_X(80));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_SELECT_X)), MENU_Y(Y(TEXT_SELECT_Y)), TheText.Get("FEC_CAM"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_SELECT_X)), MENU_Y(Y(TEXT_SELECT_Y)), "FEC_CAM");
 			CFont::SetJustifyOn();
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_START_X)), MENU_Y(Y(TEXT_START_Y)), TheText.Get("FEC_PAU"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_R2_X)), MENU_Y(Y(TEXT_R2_Y)), TheText.Get("FEC_LR"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_R1_X)), MENU_Y(Y(TEXT_R1_Y)), TheText.Get("FEC_HAB"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_START_X)), MENU_Y(Y(TEXT_START_Y)), "FEC_PAU");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_R2_X)), MENU_Y(Y(TEXT_R2_Y)), "FEC_LR");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_R1_X)), MENU_Y(Y(TEXT_R1_Y)), "FEC_HAB");
 			CFont::SetJustifyOn();
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_TRIANGLE_X)), MENU_Y(Y(TEXT_TRIANGLE_Y)), TheText.Get("FEC_EXV"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_CIRCLE_X)), MENU_Y(Y(TEXT_CIRCLE_Y)), TheText.Get("FEC_CAW"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_CROSS_X)), MENU_Y(Y(TEXT_CROSS_Y)), TheText.Get("FEC_ACC"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_RSTICK_X)), MENU_Y(Y(TEXT_RSTICK_Y)), TheText.Get("FEC_TUC"));
-			CFont::PrintString(MENU_X_LEFT_ALIGNED(X(TEXT_R3_X)), MENU_Y(Y(TEXT_R3_Y)), TheText.Get("FEC_SM3"));
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_TRIANGLE_X)), MENU_Y(Y(TEXT_TRIANGLE_Y)), "FEC_EXV");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_CIRCLE_X)), MENU_Y(Y(TEXT_CIRCLE_Y)), "FEC_CAW");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_CROSS_X)), MENU_Y(Y(TEXT_CROSS_Y)), "FEC_ACC");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_RSTICK_X)), MENU_Y(Y(TEXT_RSTICK_Y)), "FEC_TUC");
+			VC_CTRL_PRINT(MENU_X_LEFT_ALIGNED(X(TEXT_R3_X)), MENU_Y(Y(TEXT_R3_Y)), "FEC_SM3");
 			CFont::SetRightJustifyOn();
 			switch (m_PrefsControllerType)
 			{
@@ -6672,7 +6747,7 @@ CMenuManager::PrintController(void)
 				}
 				break;
 			}
-			CFont::PrintStringFromBottom(MENU_X_LEFT_ALIGNED(X(TEXT_SQUARE_X)), MENU_Y(Y(TEXT_SQUARE_Y)), TheText.Get("FEC_BRA"));
+			VC_CTRL_PRINT_BOTTOM(MENU_X_LEFT_ALIGNED(X(TEXT_SQUARE_X)), MENU_Y(Y(TEXT_SQUARE_Y)), "FEC_BRA");
 			break;
 		case 1:
 			CFont::SetRightJustifyOn();
