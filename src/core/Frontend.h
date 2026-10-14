@@ -867,6 +867,9 @@ public:
 #ifdef GAMEPAD_MENU
 	void LoadController(int8 type);
 	void PrintController(void);
+#ifdef LIBRW_VISIONOS
+	void vcSetGamepadType(int8 type);   // from the connected controller (vc_set_gamepad_type), game thread
+#endif
 #endif
 };
 

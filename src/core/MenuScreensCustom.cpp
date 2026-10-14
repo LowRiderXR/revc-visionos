@@ -441,6 +441,19 @@ void ControllerTypeAfterChange(int8 before, int8 after)
 {
 	FrontEndMenuManager.LoadController(after);
 }
+#ifdef LIBRW_VISIONOS
+// visionOS: the gamepad type is not chosen in the menu but reported by the host from the
+// connected controller (GamepadInput.swift -> vc_set_gamepad_type -> CMenuManager::
+// vcSetGamepadType). The entry only shows it, greyed out.
+wchar* ControllerTypeDraw(bool* disabled, bool userHovering)
+{
+	*disabled = true;
+	int8 t = FrontEndMenuManager.m_PrefsControllerType;
+	if (t < 0 || t >= ARRAY_SIZE(controllerTypes))
+		t = CMenuManager::CONTROLLER_XBOXONE;
+	return TheText.Get(controllerTypes[t]);
+}
+#endif
 #endif
 
 CMenuScreenCustom aScreens[] = {
@@ -712,7 +725,11 @@ CMenuScreenCustom aScreens[] = {
 
 	// MENUPAGE_OPTIONS = 27
 	{ "FET_OPT", MENUPAGE_NONE, nil, nil,
-#ifdef GTA_HANDHELD
+#if defined(GTA_HANDHELD) || defined(LIBRW_VISIONOS)
+		 // visionOS: straight to the gamepad page. MENUPAGE_CONTROLLER_PC with its keyboard,
+		 // mouse and joystick-detect pages stays compiled (macOS reference build) but has no
+		 // way in: the host reads no keyboard or mouse, and the pad bypasses ControllerConfig
+		 // (Docs: vicecity/steuerung-analyse.md).
 		 MENUACTION_CHANGEMENU,		"FEO_CON", {nil, SAVESLOT_NONE, MENUPAGE_CONTROLLER_SETTINGS}, 320, 132, MENUALIGN_CENTER,
 #else
 		 MENUACTION_CHANGEMENU,		"FEO_CON", {nil, SAVESLOT_NONE, MENUPAGE_CONTROLLER_PC}, 320, 132, MENUALIGN_CENTER,
@@ -772,16 +789,26 @@ CMenuScreenCustom aScreens[] = {
 	{ "", 0, nil, nil, },
 
 #ifdef GAMEPAD_MENU
-#ifdef GTA_HANDHELD
+#if defined(GTA_HANDHELD) || defined(LIBRW_VISIONOS)
 	{ "FET_AGS", MENUPAGE_OPTIONS, new CCustomScreenLayout({40, 78, 25, true, true}), nil,
 #else
 	{ "FET_AGS", MENUPAGE_CONTROLLER_PC, new CCustomScreenLayout({40, 78, 25, true, true}), nil,
 #endif
+#ifdef LIBRW_VISIONOS
+		// No "Configuration 1-4": CapturePad feeds the fixed PS2 layout and CPad::Mode stays
+		// 0, so the picture below (PrintController, Mode 0) is the layout that is in effect.
+		// Vibration stays as an option; the haptics hook-up follows (no effect until then).
+		MENUACTION_CTRLDISPLAY,		"FEC_CDP", { nil, SAVESLOT_NONE, MENUPAGE_CONTROLLER_SETTINGS }, 40, 76, MENUALIGN_LEFT,
+		INVERT_PAD_SELECTOR
+		MENUACTION_CTRLVIBRATION,	"FEC_VIB", { nil, SAVESLOT_NONE, MENUPAGE_CONTROLLER_SETTINGS }, 0, 0, MENUALIGN_LEFT,
+		MENUACTION_CFO_DYNAMIC,		"FEC_TYP", { new CCFODynamic(nil, nil, nil, ControllerTypeDraw, nil) }, 0, 0, MENUALIGN_LEFT,
+#else
 		MENUACTION_CTRLCONFIG,		"FEC_CCF", { nil, SAVESLOT_NONE, MENUPAGE_CONTROLLER_SETTINGS }, 40, 76, MENUALIGN_LEFT,
 		MENUACTION_CTRLDISPLAY,		"FEC_CDP", { nil, SAVESLOT_NONE, MENUPAGE_CONTROLLER_SETTINGS }, 0, 0, MENUALIGN_LEFT,
 		INVERT_PAD_SELECTOR
 		MENUACTION_CTRLVIBRATION,	"FEC_VIB", { nil, SAVESLOT_NONE, MENUPAGE_CONTROLLER_SETTINGS }, 0, 0, MENUALIGN_LEFT,
 		SELECT_CONTROLLER_TYPE
+#endif
 		MENUACTION_GOBACK,		"FEDS_TB", { nil, SAVESLOT_NONE, MENUPAGE_NONE }, 0, 0, MENUALIGN_LEFT,
 	},
 #endif

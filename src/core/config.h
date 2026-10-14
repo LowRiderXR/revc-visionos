@@ -363,8 +363,8 @@ enum Config {
 //#	define PS2_MENU_USEALLPAGEICONS
 #else
 #	define MAP_ENHANCEMENTS			// Adding waypoint and better mouse support
-#	if defined(XINPUT) || defined(GTA_HANDHELD)
-#		define GAMEPAD_MENU		// Add gamepad menu
+#	if defined(XINPUT) || defined(GTA_HANDHELD) || defined(LIBRW_VISIONOS)
+#		define GAMEPAD_MENU		// Add gamepad menu (visionOS: controller picture + read-only type, see MenuScreensCustom.cpp)
 #	endif
 #	define TRIANGLE_BACK_BUTTON
 //#	define CIRCLE_BACK_BUTTON

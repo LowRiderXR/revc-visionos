@@ -6969,6 +6969,43 @@ CMenuManager::LoadController(int8 type)
 		m_aFrontEndSprites[i].SetAddressing(rwTEXTUREADDRESSBORDER);
 	}
 }
+
+#ifdef LIBRW_VISIONOS
+// Gamepad type from the host (GamepadInput.swift -> vc_set_gamepad_type), applied on the
+// game thread by CapturePad on connect and on every controller change. Replaces the menu
+// selector on visionOS: the picture on the controller page and the button icons of the
+// in-game hints (GetWideStringOfCommandKeys -> PlayStation/Xbox/Switch tables) follow the
+// connected controller. LoadController needs the frontend sprites; outside the menu only
+// the icon TXD is swapped, the menu loads its picture itself when it opens
+// (LoadAllTextures -> LoadController).
+void
+CMenuManager::vcSetGamepadType(int8 type)
+{
+	if (type < CONTROLLER_DUALSHOCK2 || type > CONTROLLER_NINTENDO_SWITCH)
+		type = CONTROLLER_XBOXONE;
+	if (type == m_PrefsControllerType)
+		return;
+	m_PrefsControllerType = type;
+	if (m_bSpritesLoaded) {
+		LoadController(type);
+	} else {
+		switch (type) {
+		case CONTROLLER_DUALSHOCK2:
+		case CONTROLLER_DUALSHOCK3:
+		case CONTROLLER_DUALSHOCK4:
+			CFont::LoadButtons("MODELS/PS3BTNS.TXD");
+			break;
+		case CONTROLLER_NINTENDO_SWITCH:
+			CFont::LoadButtons("MODELS/NSWBTNS.TXD");
+			break;
+		default:
+			CFont::LoadButtons("MODELS/X360BTNS.TXD");
+			break;
+		}
+	}
+	printf("[vc-pad] gamepad type %d -> %s\n", type, controllerTypesPaths[type]);
+}
+#endif
 #endif // GAMEPAD_MENU
 
 #undef GetBackJustUp

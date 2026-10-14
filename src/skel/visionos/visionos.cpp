@@ -1171,6 +1171,18 @@ vc_set_gamepad_state(const vc_gamepad_t *state)
 	pthread_mutex_unlock(&g_padMutex);
 }
 
+// Controller type (VCPlatform.h vc_gamepad_type_t == CMenuManager CONTROLLER_*), written by
+// the host on connect/change, applied by CapturePad on the game thread. -1 = none yet.
+static int g_padType = -1;
+
+extern "C" void
+vc_set_gamepad_type(int type)
+{
+	pthread_mutex_lock(&g_padMutex);
+	g_padType = type;
+	pthread_mutex_unlock(&g_padMutex);
+}
+
 // Sticks: reVC uses up = negative and (matching the glfw path) an ~8-bit range
 // with a 0.3 deadzone. GCController gives up = +1, so Y is negated by the caller.
 static int16
@@ -1242,9 +1254,17 @@ CapturePad(RwInt32 padID)
 	// Snapshot the buffered state under the lock, then release before touching
 	// reVC state.
 	vc_gamepad_t s;
+	int padType;
 	pthread_mutex_lock(&g_padMutex);
 	s = g_pad;
+	padType = g_padType;
 	pthread_mutex_unlock(&g_padMutex);
+
+#ifdef GAMEPAD_MENU
+	// Controller picture + hint icons follow the connected pad (no-op when unchanged).
+	if (padType >= 0)
+		FrontEndMenuManager.vcSetGamepadType((int8)padType);
+#endif
 
 	// Fill PCTempJoyState (a CControllerState) DIRECTLY. CPad::Update reconciles
 	// it with the empty PCTempKeyState into NewState (and rotates OldState itself),
