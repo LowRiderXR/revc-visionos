@@ -542,7 +542,15 @@ CMenuManager::CMenuManager()
 	m_PrefsAllowNastyGame = 1;
 	m_PrefsSpeakers = 0;
 	field_8 = 0;
+#ifdef LIBRW_VISIONOS
+	// Gamepad-only platform with the CoreHaptics output wired up (CapturePad -> host), so
+	// vibration is on by default. This is the start value for a reVC.ini without the key
+	// (new installation); a stored Controller/Vibration value still wins (LoadINISettings).
+	// Neither gta_vc.set nor "restore defaults" carries this setting.
+	m_PrefsUseVibration = 1;
+#else
 	m_PrefsUseVibration = 0;
+#endif
 	m_PrefsShowHud = 1;
 	m_PrefsRadarMode = 0;
 	m_DisplayControllerOnFoot = false;
