@@ -797,7 +797,8 @@ CMenuScreenCustom aScreens[] = {
 #ifdef LIBRW_VISIONOS
 		// No "Configuration 1-4": CapturePad feeds the fixed PS2 layout and CPad::Mode stays
 		// 0, so the picture below (PrintController, Mode 0) is the layout that is in effect.
-		// Vibration stays as an option; the haptics hook-up follows (no effect until then).
+		// Vibration: output via CoreHaptics (CapturePad -> vc_set_gamepad_rumble), on by
+		// default on visionOS (Frontend.cpp constructor, one-time ini migration in re3.cpp).
 		MENUACTION_CTRLDISPLAY,		"FEC_CDP", { nil, SAVESLOT_NONE, MENUPAGE_CONTROLLER_SETTINGS }, 40, 76, MENUALIGN_LEFT,
 		INVERT_PAD_SELECTOR
 		MENUACTION_CTRLVIBRATION,	"FEC_VIB", { nil, SAVESLOT_NONE, MENUPAGE_CONTROLLER_SETTINGS }, 0, 0, MENUALIGN_LEFT,

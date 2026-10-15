@@ -203,6 +203,9 @@ mINI::INIFile ini("reVC.ini");
 mINI::INIStructure cfg;
 #ifdef LIBRW_VISIONOS
 static std::string vcIniPath;   // absolute path once LoadINISettings relocated the ini (user files folder)
+// [visionOS] SettingsVersion, written with every SaveINISettings. 1 = v1.0 (no key).
+// 2 = vibration output exists; a Controller/Vibration=0 from before is migrated to 1 once.
+#define VC_SETTINGS_VERSION 2
 #endif
 
 bool ReadIniIfExists(const char *cat, const char *key, uint32 *out)
@@ -549,6 +552,21 @@ bool LoadINISettings()
 	ReadIniIfExists("Controller", "InvertMouseVertically", &MousePointerStateHelper.bInvertVertically);
 	ReadIniIfExists("Controller", "DisableMouseSteering", &CVehicle::m_bDisableMouseSteering);
 	ReadIniIfExists("Controller", "Vibration", &FrontEndMenuManager.m_PrefsUseVibration);
+#ifdef LIBRW_VISIONOS
+	// One-time migration, in memory only: nothing is written at load, the next
+	// SaveINISettings (any menu change) persists the result together with
+	// SettingsVersion=2. v1.0 stored Controller/Vibration=0 on every save while no output
+	// existed, so that 0 is not a choice; below version 2 it becomes 1. A 0 saved from now
+	// on carries SettingsVersion=2 and stays. Until the first save this runs on every start.
+	{
+		uint32 ver = 1;   // v1.0 wrote no version key
+		ReadIniIfExists("visionOS", "SettingsVersion", &ver);
+		if (ver < VC_SETTINGS_VERSION && !FrontEndMenuManager.m_PrefsUseVibration) {
+			FrontEndMenuManager.m_PrefsUseVibration = true;
+			printf("[vc-ini] settings v%u -> %d: Vibration 0 -> 1\n", ver, VC_SETTINGS_VERSION);
+		}
+	}
+#endif
 	ReadIniIfExists("Audio", "SfxVolume", &FrontEndMenuManager.m_PrefsSfxVolume);
 	ReadIniIfExists("Audio", "MusicVolume", &FrontEndMenuManager.m_PrefsMusicVolume);
 	ReadIniIfExists("Audio", "MP3BoostVolume", &FrontEndMenuManager.m_PrefsMP3BoostVolume);
@@ -755,6 +773,7 @@ void SaveINISettings()
 
 #ifdef LIBRW_VISIONOS
 	{
+		StoreIni("visionOS", "SettingsVersion", (uint32)VC_SETTINGS_VERSION);   // see LoadINISettings
 		const bool ok = ini.write(cfg);
 		printf("[vc-settings] save path=%s ok=%d\n", vcIniPath.c_str(), ok ? 1 : 0);
 	}
