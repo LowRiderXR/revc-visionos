@@ -45,6 +45,14 @@
 #include "Pad.h"      // CPad, CControllerState (gamepad input)
 #include "DMAudio.h"  // DMAudio (music mode on restart/load)
 #include "Draw.h"     // AR_AUTO (pinned 2D layout aspect)
+#if VC_DIAGNOSTICS
+#include "vc_diag.h"  // stutter recorder (Diagnostics configuration only)
+#include "Camera.h"       // TheCamera.GetScreenFadeStatus (frame state for the recorder)
+#include "CutsceneMgr.h"  // CCutsceneMgr::IsRunning
+extern "C" int vc_splash_active(void);   // main.cpp
+extern "C" int vc_loading_active(void);  // main.cpp
+extern "C" int vc_menu_active(void);     // main.cpp
+#endif
 
 // Game render-target size. THE single source: feeds the two vcrt MTLTextures,
 // rsCAMERASIZE, RsGlobal and the librw open params. This is the OFFSCREEN size
@@ -564,11 +572,22 @@ extern "C" int vc_draw_profile(void)
 // in main.cpp; accumulates over both eye passes, reset with the other counters at mark 0.
 enum { VC_SC_SKY = 0, VC_SC_ROADS, VC_SC_EBR, VC_SC_WATER, VC_SC_FADE, VC_SC_MISC,
        VC_SC_EYESET, VC_SC_EYEEND, VC_SC_FXPART, VC_SC_FXSHAD, VC_SC_FXGLAS,
-       VC_SC_FXCORO, VC_SC_FXREST, VC_SC_EYBIND, VC_SC_EYCLR, VC_SC_EYMTX, VC_SC_EYPRE, VC_SC_N };
+       VC_SC_FXCORO, VC_SC_FXREST, VC_SC_EYBIND, VC_SC_EYCLR, VC_SC_EYMTX, VC_SC_EYPRE,
+#if VC_DIAGNOSTICS
+       VC_SC_VEH, VC_SC_PED,   // stutter recorder: vehicles / peds inside RenderEverythingBarRoads (Renderer.cpp)
+#endif
+       VC_SC_N };
 static const char *kScNames[VC_SC_N] = { "sky", "roads", "ebr", "water", "fade", "misc",
                                          "eyeset", "eyeend", "fxPart", "fxShad",
                                          "fxGlas", "fxCoro", "fxRest",
-                                         "eyBind", "eyClr", "eyMtx", "eyPre" };
+                                         "eyBind", "eyClr", "eyMtx", "eyPre"
+#if VC_DIAGNOSTICS
+                                         , "veh", "ped"
+#endif
+                                       };
+#if VC_DIAGNOSTICS
+static_assert(VC_SC_VEH == VC_DIAG_SC_VEH && VC_SC_PED == VC_DIAG_SC_PED, "vc_diag.h slot ids must match the VC_SC enum");
+#endif
 // Accumulated PER EYE PASS ([slot][0|1]). The eye split is what decides whether the
 // pass-boundary wait is a BETWEEN-EYES dependency (eye 1 waiting for eye 0, which the
 // shared MSAA target would explain and per-eye targets would fix) or a FRAME-TO-FRAME
@@ -583,7 +602,12 @@ static int g_scEye = 0;
 extern "C" void vc_scene_set_eye(int eye) { g_scEye = (eye == 1) ? 1 : 0; }
 extern "C" void vc_scene_begin(int id)
 {
-	if (id < 0 || id >= VC_SC_N || !vc_draw_profile()) return;
+	if (id < 0 || id >= VC_SC_N) return;
+#if VC_DIAGNOSTICS
+	if (!vc_draw_profile() && !vc_diag_on()) return;   // recorder: stage times feed the long-frame line
+#else
+	if (!vc_draw_profile()) return;
+#endif
 	g_scStart[id] = mach_absolute_time();
 }
 extern "C" void vc_scene_end(int id)
@@ -648,6 +672,60 @@ extern "C" void vc_frame_mark(int id)
 	// wait. This is the number to compare against the display period (11.1 ms at 90 Hz) --
 	// "total" below is only the render part.
 	static uint64_t prevT0 = 0, framePeriod = 0;
+#if VC_DIAGNOSTICS
+	// Stutter recorder: one record per Idle ITERATION at mark 5, which sits outside the
+	// if/else in Idle (main.cpp) and therefore fires for world frames AND for the menu/fade
+	// iterations that skip the world block (mark 0 only runs inside it). The interval seen
+	// here is the game's publish cadence; `world` tells the two apart. Scene-stage
+	// accumulators and marks 0..9 belong to the last world frame -- reported only then.
+	static bool vcDiagSawMark0 = false;
+	if (id == 0) vcDiagSawMark0 = true;
+	if (id == 5 && vc_diag_on()) {
+		static uint64_t vcDiagPrevT5 = 0;
+		vc_diag_frame_t df; memset(&df, 0, sizeof(df));
+		bool world = vcDiagSawMark0 && t[0] != 0 && t[5] >= t[0];
+		df.periodTicks = vcDiagPrevT5 ? t[5] - vcDiagPrevT5 : 0;
+		vcDiagPrevT5 = t[5];
+		df.world       = world ? 1 : 0;
+		df.logicTicks  = g_lgAccum[VC_LG_TOTAL];
+		df.streamTicks = g_lgAccum[VC_LG_STREAM];
+		if (world) {
+			df.renderTicks = t[5] - t[0];
+			#define VC_DSEG(a, b) ((t[a] && t[b] && t[b] >= t[a]) ? t[b] - t[a] : 0ull)
+			#define VC_DSC(i)     (g_scAccum[i][0] + g_scAccum[i][1])
+			df.sec[VC_DIAG_SEC_CNSTR]     = VC_DSEG(0, 6);
+			df.sec[VC_DIAG_SEC_PRE]       = VC_DSEG(6, 7);
+			df.sec[VC_DIAG_SEC_SETUP]     = VC_DSEG(7, 1);
+			df.sec[VC_DIAG_SEC_SKY]       = VC_DSC(VC_SC_SKY);
+			df.sec[VC_DIAG_SEC_ROADS]     = VC_DSC(VC_SC_ROADS);
+			df.sec[VC_DIAG_SEC_EBR]       = VC_DSC(VC_SC_EBR);
+			df.sec[VC_DIAG_SEC_VEH]       = VC_DSC(VC_SC_VEH);
+			df.sec[VC_DIAG_SEC_PED]       = VC_DSC(VC_SC_PED);
+			df.sec[VC_DIAG_SEC_WATER]     = VC_DSC(VC_SC_WATER);
+			df.sec[VC_DIAG_SEC_ALPHA]     = VC_DSC(VC_SC_FADE);
+			df.sec[VC_DIAG_SEC_MISC]      = VC_DSC(VC_SC_MISC);
+			df.sec[VC_DIAG_SEC_FX]        = VC_DSC(VC_SC_FXPART) + VC_DSC(VC_SC_FXSHAD) + VC_DSC(VC_SC_FXGLAS) + VC_DSC(VC_SC_FXCORO) + VC_DSC(VC_SC_FXREST);
+			df.sec[VC_DIAG_SEC_EYEPASS]   = VC_DSC(VC_SC_EYESET) + VC_DSC(VC_SC_EYEEND) + VC_DSC(VC_SC_EYBIND) + VC_DSC(VC_SC_EYCLR) + VC_DSC(VC_SC_EYMTX) + VC_DSC(VC_SC_EYPRE);
+			df.sec[VC_DIAG_SEC_READBACK]  = VC_DSEG(2, 3);
+			df.sec[VC_DIAG_SEC_HUD]       = VC_DSEG(3, 4);
+			df.sec[VC_DIAG_SEC_MENU]      = VC_DSEG(4, 8);
+			df.sec[VC_DIAG_SEC_AFTERFADE] = VC_DSEG(8, 9);
+			df.sec[VC_DIAG_SEC_PRESENT]   = VC_DSEG(9, 5);
+			#undef VC_DSEG
+			#undef VC_DSC
+		}
+		df.splash      = vc_splash_active();
+		df.loading     = vc_loading_active();
+		df.menu        = vc_menu_active();
+		df.timerPaused = CTimer::GetIsPaused() ? 1 : 0;
+		df.fade        = TheCamera.GetScreenFadeStatus();   // 0 none, 1 fading, 2 fully faded (world block skipped)
+		df.cutscene    = CCutsceneMgr::IsRunning() ? 1 : 0;
+		df.level       = (int32_t)CGame::currLevel;
+		df.area        = (int32_t)CGame::currArea;
+		vc_diag_frame(&df);
+	}
+	if (id == 5) vcDiagSawMark0 = false;
+#endif
 	if (id == 0) {
 		if (prevT0) framePeriod = t[0] - prevT0;
 		prevT0 = t[0];
@@ -1657,6 +1735,13 @@ run_game_loop(void)
 		printf("[vc-loop] FAIL: could not create render target\n");
 		return;
 	}
+
+#if VC_DIAGNOSTICS
+	// Stutter recorder (Diagnostics configuration): reads VC_DIAG_RECORD (launcher toggle),
+	// opens Documents/Diagnostics/stutter.log and starts the background writer. Must run
+	// before CdStreamInit below creates the reader thread, so every hook sees the flag.
+	vc_diag_init();
+#endif
 
 	// VC_SLICE_TEST: one-shot probe of EGLImage wrapping of Metal 2D-array slices
 	// (RGBA8/RGBA16Float). Runs here (GL context current, ANGLE resolved), then

@@ -18,6 +18,11 @@
 #include "Collision.h"
 #include "VisibilityPlugins.h"
 #include "Clock.h"
+#if VC_DIAGNOSTICS
+#include "skel/visionos/vc_diag.h"   // stutter recorder: vehicle / ped render sections
+extern "C" void vc_scene_begin(int id);   // visionos.cpp stage accumulators (active while recording)
+extern "C" void vc_scene_end(int id);
+#endif
 #include "World.h"
 #include "Camera.h"
 #include "ModelIndices.h"
@@ -264,6 +269,16 @@ CRenderer::RenderOneNonRoad(CEntity *e)
 
 	PUSH_RENDERGROUP(CModelInfo::GetModelInfo(e->GetModelIndex())->GetModelName());
 
+#if VC_DIAGNOSTICS
+	// Stutter recorder: time vehicles (incl. their seated peds and alpha atomics) and peds
+	// as their own sections; a few dozen entities per frame, two clock reads each.
+	int vcDiagSlot = -1;
+	if(vc_diag_on()){
+		if(e->IsVehicle()) vcDiagSlot = VC_DIAG_SC_VEH;
+		else if(e->IsPed()) vcDiagSlot = VC_DIAG_SC_PED;
+		if(vcDiagSlot >= 0) vc_scene_begin(vcDiagSlot);
+	}
+#endif
 	resetLights = e->SetupLighting();
 
 	if(e->IsVehicle()){
@@ -292,6 +307,9 @@ CRenderer::RenderOneNonRoad(CEntity *e)
 	}
 
 	e->RemoveLighting(resetLights);
+#if VC_DIAGNOSTICS
+	if(vcDiagSlot >= 0) vc_scene_end(vcDiagSlot);
+#endif
 
 	POP_RENDERGROUP();
 }

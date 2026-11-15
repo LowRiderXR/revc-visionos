@@ -22,6 +22,9 @@
 
 #include "CdStream.h"
 #include "MemoryMgr.h"
+#if VC_DIAGNOSTICS
+#include "skel/visionos/vc_diag.h"   // stutter recorder: read() count/bytes/duration (reader thread)
+#endif
 
 #define CDDEBUG(f, ...)   debug ("%s: " f "\n", "cdvd_stream", ## __VA_ARGS__)
 #define CDTRACE(f, ...)   printf("%s: " f "\n", "cdvd_stream", ## __VA_ARGS__)
@@ -492,6 +495,9 @@ void *CdStreamThread(void *param)
 			ASSERT(pChannel->hFile >= 0);
 			ASSERT(pChannel->pBuffer != nil );
 
+#if VC_DIAGNOSTICS
+			uint64_t vcDiagT0 = VC_DIAG_NOW();
+#endif
 			lseek(pChannel->hFile, (size_t)pChannel->nSectorOffset * (size_t)CDSTREAM_SECTOR_SIZE, SEEK_SET);
 			if (read(pChannel->hFile, pChannel->pBuffer, pChannel->nSectorsToRead * CDSTREAM_SECTOR_SIZE) == -1) {
 				// pChannel->nSectorsToRead == 0 at this point means we wanted to flush channel
@@ -500,6 +506,13 @@ void *CdStreamThread(void *param)
 			} else {
 				pChannel->nStatus = STREAM_NONE;
 			}
+#if VC_DIAGNOSTICS
+			if (vcDiagT0) {
+				vc_diag_count(VC_DIAG_C_CD_READS, 1);
+				vc_diag_count(VC_DIAG_C_CD_BYTES, (uint64_t)pChannel->nSectorsToRead * CDSTREAM_SECTOR_SIZE);
+				vc_diag_max(VC_DIAG_M_CD_READ, mach_absolute_time() - vcDiagT0);
+			}
+#endif
 		}
 
 #ifndef ONE_THREAD_PER_CHANNEL

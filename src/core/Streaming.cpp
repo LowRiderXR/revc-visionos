@@ -37,6 +37,9 @@
 #include "Font.h"
 #include "Frontend.h"
 #include "VarConsole.h"
+#if VC_DIAGNOSTICS
+#include "skel/visionos/vc_diag.h"   // stutter recorder counters (Diagnostics configuration only)
+#endif
 
 bool CStreaming::ms_disableStreaming;
 bool CStreaming::ms_bLoadingBigModel;
@@ -686,6 +689,9 @@ CStreaming::ConvertBufferToObject(int8 *buf, int32 streamId)
 #ifndef USE_CUSTOM_ALLOCATOR
 		ms_memoryUsed += ms_aInfoForModel[streamId].GetCdSize() * CDSTREAM_SECTOR_SIZE;
 #endif
+#if VC_DIAGNOSTICS
+		VC_DIAG_COUNT(VC_DIAG_C_STREAM_LOADED, 1);
+#endif
 	}
 
 	endTime = CTimer::GetCurrentTimeInCycles() / CTimer::GetCyclesPerMillisecond();
@@ -753,6 +759,9 @@ CStreaming::FinishLoadingLargeFile(int8 *buf, int32 streamId)
 #ifndef USE_CUSTOM_ALLOCATOR
 	ms_memoryUsed += ms_aInfoForModel[streamId].GetCdSize() * CDSTREAM_SECTOR_SIZE;
 #endif
+#if VC_DIAGNOSTICS
+	VC_DIAG_COUNT(VC_DIAG_C_STREAM_LOADED, 1);
+#endif
 
 	if(!success){
 		RemoveModel(streamId);
@@ -817,6 +826,9 @@ CStreaming::RequestModel(int32 id, int32 flags)
 			ms_numModelsRequested++;
 			if(flags & STREAMFLAGS_PRIORITY)
 				ms_numPriorityRequests++;
+#if VC_DIAGNOSTICS
+			VC_DIAG_COUNT(VC_DIAG_C_STREAM_REQ, 1);
+#endif
 		}
 
 		ms_aInfoForModel[id].m_loadState = STREAMSTATE_INQUEUE;
@@ -2473,6 +2485,9 @@ CStreaming::LoadAllRequestedModels(bool priority)
 	if(bInsideLoadAll)
 		return;
 	bInsideLoadAll = true;
+#if VC_DIAGNOSTICS
+	uint64_t vcDiagT0 = VC_DIAG_NOW();   // synchronous load: the game thread blocks for its whole duration
+#endif
 
 	if(priority)
 		numRequests = ms_numPriorityRequests;
@@ -2519,6 +2534,9 @@ CStreaming::LoadAllRequestedModels(bool priority)
 	}
 	ms_channel[1].state = CHANNELSTATE_IDLE;
 	bInsideLoadAll = false;
+#if VC_DIAGNOSTICS
+	if(vcDiagT0) vc_diag_blocking_load(mach_absolute_time() - vcDiagT0);
+#endif
 }
 #endif
 

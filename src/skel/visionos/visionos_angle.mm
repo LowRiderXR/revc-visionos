@@ -26,6 +26,9 @@
 #include <mach/mach_time.h> // mach_absolute_time for the rate-window measurement
 #include <mach/mach.h>      // task_info / phys_footprint (memory probe)
 #include <os/proc.h>        // os_proc_available_memory (headroom before jetsam)
+#if VC_DIAGNOSTICS
+#include "vc_diag.h"        // stutter recorder (Diagnostics configuration only)
+#endif
 
 #if __has_feature(objc_arc)
   #define VC_OBJ_TO_VOID(o) ((__bridge void *)(o))
@@ -395,6 +398,7 @@ typedef struct {
 	uint64_t       waitValue;  // shared-event value to wait for (0 = no wait)
 	uint64_t       poseSetTime; // mach time the head pose of THIS slice was pushed (latency probe)
 	bool           worldDrawn;  // the stereo eye passes rendered into this buffer's slices this publish
+	uint64_t       publishTick; // mach time of the publish: FIFO order, age rule, recorder's publish->acquire wait
 } VCBuffer;
 
 // Set by reVC (vc_stereo_mark_world) when the in-game block renders the eye passes; copied
@@ -422,6 +426,26 @@ static uint64_t g_discardCount = 0;      // phantom publishes suppressed by the 
 //                    (~2x display rate here), compositor always sees the freshest.
 static bool     g_recycleOlderReady = false;
 static uint64_t g_recycleCount      = 0;  // READY->FREE recycles (0 in "wait")
+// Buffer mode (VC_BUFFER_MODE). "fifo" is the stereo default since 2026-11-01, finding H2
+// (stutter.log 25.10./29.10./01.11., M5): the game thread starts its frames on its own
+// slot grid (vcrt_begin_frame), not on the compositor's. While the publish drifts through
+// the acquire moment, render-time jitter decides frame by frame whether a publish lands
+// just before or just after the acquire: a late one is a repeat, and under "newest" the
+// following acquire finds two READY frames and recycles the older one UNSHOWN -- the
+// player sees k-1, k-1, k+1, a two-frame jump at 15-45 Hz for 1-12 s (measured: drop ~= rep,
+// publish->acquire min 0.1 ms in those phases, 3 ms outside). "fifo" shows the older
+// frame first and lets the newer one wait one slot, so nothing is dropped and the sequence
+// stays k-1, k, k+1 with one slot of extra latency while a frame waits.
+typedef enum {
+	VC_BUFMODE_WAIT = 0,    // acquire takes g_readyIndex only; no recycle; game paces to releases
+	VC_BUFMODE_NEWEST,      // acquire takes the newest, recycles older READY unshown (game runs ahead)
+	VC_BUFMODE_FIFO,        // acquire takes the OLDEST READY; at most one frame waits (see vcrt_fifo_select)
+} VCBufMode;
+static VCBufMode g_bufferMode   = VC_BUFMODE_WAIT;
+extern "C" const char *vcrt_buffer_mode_name(void);   // defined with the fifo selection below
+static uint64_t  g_dropCount    = 0;      // fifo: READY frames recycled unshown (age / overflow / drain)
+static uint64_t  g_drainCount   = 0;      // fifo: of those, drops by the drain rule
+static uint32_t  g_fifoWaitRun  = 0;      // fifo: consecutive acquires that left a frame waiting
 static id<MTLSharedEvent>   g_sharedEvent = nil;
 static id<MTLCommandQueue>  g_cmdQueue    = nil;
 static bool     g_useSharedEvent = false; // extension present and not disabled
@@ -594,7 +618,7 @@ vcrt_create(int width, int height)
 	// 3 buffers (was 4): the 4th was against the 145-vs-90 beat, which the phase/cap work
 	// removed; 3 keeps enough run-ahead for the newest-recycle. At high VC_RES each buffer
 	// is large (slice array + HUD), so a buffer saved is ~85 MB. VC_NUM_BUFFERS overrides.
-	if (stereo) { g_numBuffers = 3; g_recycleOlderReady = true; g_frameCapHz = -1; }
+	if (stereo) { g_numBuffers = 3; g_bufferMode = VC_BUFMODE_FIFO; g_frameCapHz = -1; }
 
 	// Buffer count (env VC_NUM_BUFFERS, clamped to the array capacity).
 	const char *nb = getenv("VC_NUM_BUFFERS");
@@ -615,13 +639,18 @@ vcrt_create(int width, int height)
 	// invisible from the Metal side, hence an explicit A/B switch.
 	g_noFence = (getenv("VC_NOFENCE") != NULL);
 
-	// Buffer strategy. Stereo defaults to "newest" (above); cinema to "wait" (no
-	// recycle, exactly the display rate, half the GPU work). VC_BUFFER_MODE overrides.
+	// Buffer strategy. Stereo defaults to "fifo" (above, see the VCBufMode comment); cinema
+	// to "wait" (no recycle, exactly the display rate, half the GPU work). VC_BUFFER_MODE
+	// overrides: fifo | newest (the pre-2026-11 behaviour, kept for A/B runs) | wait.
 	const char *mode = getenv("VC_BUFFER_MODE");
-	if (mode) g_recycleOlderReady = (strcmp(mode, "newest") == 0);
-	VCLOG(@"[vc-rt] buffer mode: %s (%d buffers, cap %s)", g_recycleOlderReady
-	      ? "newest (recycle older READY at acquire -> game runs ahead)"
-	      : "wait (game paces to real releases, no recycle)",
+	if (mode) {
+		if      (strcmp(mode, "fifo")   == 0) g_bufferMode = VC_BUFMODE_FIFO;
+		else if (strcmp(mode, "newest") == 0) g_bufferMode = VC_BUFMODE_NEWEST;
+		else if (strcmp(mode, "wait")   == 0) g_bufferMode = VC_BUFMODE_WAIT;
+		else VCLOG(@"[vc-rt] VC_BUFFER_MODE='%s' unknown (fifo|newest|wait) -- keeping the default", mode);
+	}
+	g_recycleOlderReady = (g_bufferMode == VC_BUFMODE_NEWEST);
+	VCLOG(@"[vc-rt] buffer mode: %s (%d buffers, cap %s)", vcrt_buffer_mode_name(),
 	      g_numBuffers, g_frameCapHz < 0 ? "auto=display" : (g_frameCapHz > 0 ? "fixed" : "off"));
 
 	const char *exts = p_eglQueryString ? p_eglQueryString(g_display, VC_EGL_EXTENSIONS) : NULL;
@@ -711,12 +740,13 @@ vcrt_log_rate(void)
 	// window: actual duration of THIS counting window (should be ~1 s; if it's
 	// e.g. 1.06 s while pubs=95, instRate is still ~90 -> case a).
 	// total/runtime -> longRate: the true long-term rate. ~90 = case a, 95+ = case b.
-	VCLOG(@"[vc-pub] readyIndex=%d pubs=%llu window=%.4fs instRate=%.1f/s parks=%llu discards=%llu recycles=%llu | total=%llu runtime=%.2fs longRate=%.2f/s",
+	VCLOG(@"[vc-pub] readyIndex=%d pubs=%llu window=%.4fs instRate=%.1f/s parks=%llu discards=%llu recycles=%llu drops=%llu drains=%llu | total=%llu runtime=%.2fs longRate=%.2f/s",
 	      g_readyIndex,
 	      (unsigned long long)pubs, window, instRate,
 	      (unsigned long long)(g_waitCount    - lastW),
 	      (unsigned long long)(g_discardCount - lastD),
 	      (unsigned long long)(g_recycleCount - lastR),
+	      (unsigned long long)g_dropCount, (unsigned long long)g_drainCount,
 	      (unsigned long long)g_frameCount, runtime, longRate);
 
 	lastLog = now; lastN = g_frameCount; lastW = g_waitCount; lastD = g_discardCount; lastR = g_recycleCount;
@@ -1091,10 +1121,14 @@ vcrt_publish_frame(void)
 	g_buf[back].poseSetTime = vc_last_consumed_pose_time();  // latency probe: pose age of this slice
 	g_buf[back].worldDrawn = g_worldDrawnThisFrame;           // eye passes ran for this publish?
 	g_worldDrawnThisFrame = false;
+	g_buf[back].publishTick = mach_absolute_time();           // FIFO order + age rule (+ recorder)
 	g_readyIndex = back;
 	g_haveBack = false;                        // reservation consumed
 	uint64_t n = ++g_frameCount;
 	pthread_mutex_unlock(&g_bufMutex);
+#if VC_DIAGNOSTICS
+	VC_DIAG_COUNT(VC_DIAG_C_PUBLISHES, 1);   // every frame handed to the compositor, whichever path drew it
+#endif
 
 	// First four publishes individually so the index rotation 0,1,0,1 is
 	// provable even when only two frames ever publish (no consumer yet).
@@ -1133,6 +1167,121 @@ static void vc_log_memory(void)
 	      (unsigned long long)(foot / 1000000u), metalMB, avail / 1000000u);
 }
 
+// Name of the active buffer mode, for the startup log and the recorder's session header.
+extern "C" const char *
+vcrt_buffer_mode_name(void)
+{
+	switch (g_bufferMode) {
+		case VC_BUFMODE_FIFO:   return "fifo (oldest READY first, at most one frame waits)";
+		case VC_BUFMODE_NEWEST: return "newest (recycle older READY at acquire -> game runs ahead)";
+		default:                return "wait (game paces to real releases, no recycle)";
+	}
+}
+extern "C" int vcrt_num_buffers(void) { return g_numBuffers; }
+
+// mach ticks in one second (timebase read once).
+static uint64_t
+vcrt_ticks_per_second(void)
+{
+	static uint64_t tps = 0;
+	if (tps == 0) {
+		mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+		tps = (uint64_t)((double)tb.denom * 1.0e9 / (double)tb.numer + 0.5);
+	}
+	return tps;
+}
+
+// Recycle a READY buffer unshown (fifo). Caller holds g_bufMutex.
+static void
+vcrt_drop_ready(int i)
+{
+	g_buf[i].state = VC_BUF_FREE;
+	g_dropCount++;
+	pthread_cond_signal(&g_bufCond);   // the game thread may be waiting for a FREE buffer
+#if VC_DIAGNOSTICS
+	VC_DIAG_COUNT(VC_DIAG_C_DROPS, 1);
+#endif
+}
+
+// FIFO selection. Caller holds g_bufMutex; `now` is this acquire's mach time. Returns the
+// buffer to hand out, or -1 when nothing is READY. Rules, in order:
+//   1. age: a READY frame older than two display periods is stale (pause, host gap, rate
+//      switch) and is dropped -- except the newest, which is always kept;
+//   2. overflow: at most one frame may wait behind the one shown now; older ones are
+//      dropped (needs 4 buffers to ever trigger: with 3, the game blocks on FREE first);
+//   3. drain: when a frame has been left waiting after `hz` consecutive acquires (about one
+//      second: the game is a fraction of a frame faster than the display, e.g. the integer
+//      cap 90 against 89.97 Hz, or the queue filled after one late frame), the older frame
+//      is dropped ONCE and the newer shown -- but only if the newer one was finished at
+//      least a quarter period before this acquire. That quarter is the margin: the drop
+//      hands the game a FREE buffer immediately, so the next frame starts now and must be
+//      published before the next acquire; a frame that was ready P/4 early has that slack
+//      (render time <= ~3/4 P), while a frame that was ready just in time would be followed
+//      by a repeat, i.e. the very pattern fifo removes. One second between drains keeps the
+//      visible effect to one two-frame step per second at most, and only with slack.
+static int
+vcrt_fifo_select(uint64_t now)
+{
+	int hz = g_displayHz > 0 ? g_displayHz : 90;
+	uint64_t period = vcrt_ticks_per_second() / (uint64_t)hz;
+	int oldest = -1, newest = -1, nReady = 0;
+	for (int i = 0; i < g_numBuffers; i++) {
+		if (g_buf[i].state != VC_BUF_READY) continue;
+		nReady++;
+		if (oldest < 0 || g_buf[i].publishTick < g_buf[oldest].publishTick) oldest = i;
+		if (newest < 0 || g_buf[i].publishTick > g_buf[newest].publishTick) newest = i;
+	}
+	if (nReady == 0) { g_fifoWaitRun = 0; return -1; }
+
+	// 1. age rule (never the newest)
+	for (int i = 0; i < g_numBuffers && nReady > 1; i++) {
+		if (i == newest || g_buf[i].state != VC_BUF_READY) continue;
+		if (now > g_buf[i].publishTick && now - g_buf[i].publishTick > 2 * period) { vcrt_drop_ready(i); nReady--; }
+	}
+	// 2. overflow rule: keep the two newest
+	while (nReady > 2) {
+		oldest = -1;
+		for (int i = 0; i < g_numBuffers; i++)
+			if (g_buf[i].state == VC_BUF_READY && (oldest < 0 || g_buf[i].publishTick < g_buf[oldest].publishTick)) oldest = i;
+		vcrt_drop_ready(oldest); nReady--;
+	}
+	oldest = -1;
+	for (int i = 0; i < g_numBuffers; i++)
+		if (g_buf[i].state == VC_BUF_READY && (oldest < 0 || g_buf[i].publishTick < g_buf[oldest].publishTick)) oldest = i;
+
+	// 3. drain rule
+	if (nReady == 2) {
+		g_fifoWaitRun++;
+		if (g_fifoWaitRun >= (uint32_t)hz && now > g_buf[newest].publishTick
+		    && now - g_buf[newest].publishTick >= period / 4) {
+			vcrt_drop_ready(oldest);
+			g_drainCount++;
+			g_fifoWaitRun = 0;
+#if VC_DIAGNOSTICS
+			VC_DIAG_COUNT(VC_DIAG_C_DRAIN, 1);
+#endif
+			return newest;
+		}
+#if VC_DIAGNOSTICS
+		VC_DIAG_COUNT(VC_DIAG_C_WAIT, 1);   // a frame still waits after this acquire
+#endif
+	} else {
+		g_fifoWaitRun = 0;
+	}
+	return oldest;
+}
+
+#if VC_DIAGNOSTICS
+// Effective frame cap for the recorder -- the same expression vcrt_begin_frame uses
+// (keep in sync): fixed (>0), auto (= measured display rate, 90 until known), or 0 = off.
+static inline int vcrt_diag_cap_hz(void)
+{
+	return (g_frameCapHz > 0) ? g_frameCapHz
+	     : (g_frameCapHz < 0) ? (g_displayHz > 0 ? g_displayHz : 90)
+	     : 0;
+}
+#endif
+
 // --- C seam consumed by the compositor (next step) -------------------------
 extern "C" bool
 vc_acquire_ready_frame(vc_ready_frame_t *out)
@@ -1140,6 +1289,10 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	if (!out) return false;
 	vc_log_memory();
 
+#if VC_DIAGNOSTICS
+	uint64_t diagPeriod = 0;   // unfiltered acquire-to-acquire period for the recorder
+#endif
+	uint64_t acqNow = 0;       // this acquire's mach time (fifo: age and drain rules)
 	// Measure the DISPLAY RATE from the acquire-call frequency: the compositor calls
 	// this once per display frame, so its period is the refresh period. Feeds the
 	// auto frame-cap (g_frameCapHz == -1) so we never hardcode 90 (M2 vs M5 differ).
@@ -1148,6 +1301,10 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 		if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
 		static uint64_t sLastAcq = 0;
 		uint64_t nowT = mach_absolute_time();
+		acqNow = nowT;
+#if VC_DIAGNOSTICS
+		if (sLastAcq != 0) diagPeriod = nowT - sLastAcq;
+#endif
 		if (sLastAcq != 0) {
 			double periodMs = (double)(nowT - sLastAcq) * (double)sNum / (double)sDen / 1.0e6;
 			if (periodMs > 4.0 && periodMs < 40.0) {   // 25-250 Hz sane
@@ -1161,16 +1318,27 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	}
 
 	pthread_mutex_lock(&g_bufMutex);
-	int idx = g_readyIndex;
+	// Which READY buffer goes out: fifo picks the oldest (and applies its drop rules);
+	// newest and wait take g_readyIndex, the most recent publish.
+	int idx;
+	if (g_bufferMode == VC_BUFMODE_FIFO) {
+		idx = vcrt_fifo_select(acqNow);
+	} else {
+		idx = g_readyIndex;
+		if (idx >= 0 && g_buf[idx].state != VC_BUF_READY) idx = -1;
+	}
 	// Nothing new to hand out: never published, or the latest was already acquired
 	// (and not yet republished). The compositor keeps its last texture -- a MISSED
 	// SLOT (the same frame is shown twice). Kept on always (throttled 10 s): first
 	// signal of a future perf regression.
 	static uint64_t sAcqTotal = 0, sAcqMiss = 0;
 	sAcqTotal++;
-	if (idx < 0 || g_buf[idx].state != VC_BUF_READY) {
+	if (idx < 0) {
 		sAcqMiss++;
 		pthread_mutex_unlock(&g_bufMutex);
+#if VC_DIAGNOSTICS
+		if (vc_diag_on()) vc_diag_acquire(diagPeriod, 0, g_displayHz, vcrt_diag_cap_hz());   // miss: frame re-shown
+#endif
 		if (vc_render_mode() == 1) {
 			static double lastMissLog = 0.0;
 			double nowS = vc_now_seconds();
@@ -1194,8 +1362,12 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 				g_buf[i].state = VC_BUF_FREE;
 				g_recycleCount++;
 				pthread_cond_signal(&g_bufCond);
+#if VC_DIAGNOSTICS
+				VC_DIAG_COUNT(VC_DIAG_C_DROPS, 1);   // a finished frame nobody will see
+#endif
 			}
 	g_buf[idx].state = VC_BUF_ACQUIRED;        // READY -> ACQUIRED (won't be reused)
+	uint64_t diagPublishTick = g_buf[idx].publishTick;   // recorder: how long THIS frame sat in READY
 	// Stereo: hand out the 2-slice array texture for this index and eye_count=2;
 	// cinema: the plain 2D texture and eye_count=1. The index/state/wait_value
 	// machinery is shared, so the shared-event sync covers whichever texture the
@@ -1217,6 +1389,14 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	uint64_t outWait = out->wait_value;
 	uint64_t poseSetT = g_buf[idx].poseSetTime;
 	pthread_mutex_unlock(&g_bufMutex);
+#if VC_DIAGNOSTICS
+	if (vc_diag_on()) {
+		vc_diag_acquire(diagPeriod, 1, g_displayHz, vcrt_diag_cap_hz());   // hit: new frame handed out
+		if (diagPublishTick) vc_diag_pub_to_acq(acqNow > diagPublishTick ? acqNow - diagPublishTick : 0);
+	}
+#else
+	(void)diagPublishTick;
+#endif
 
 	// Latency probe: full push -> acquire (~display) age of THIS slice's head pose.
 	// Push->consume is measured on the game side ([vc-pose-age]); this adds the
