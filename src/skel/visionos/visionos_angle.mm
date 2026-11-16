@@ -26,6 +26,7 @@
 #include <mach/mach_time.h> // mach_absolute_time for the rate-window measurement
 #include <mach/mach.h>      // task_info / phys_footprint (memory probe)
 #include <os/proc.h>        // os_proc_available_memory (headroom before jetsam)
+#include <atomic>           // display-period estimate shared between render and game thread
 #if VC_DIAGNOSTICS
 #include "vc_diag.h"        // stutter recorder (Diagnostics configuration only)
 #endif
@@ -373,7 +374,79 @@ static PFN_eglQueryString             p_eglQueryString = NULL;
 #define VC_NUM_BUFFERS 4
 static int g_numBuffers = 3;
 static int g_frameCapHz = 0;   // >0 = fixed cap Hz; 0 = uncapped; -1 = auto (= display rate)
-static int g_displayHz = 0;    // measured compositor rate (acquire-call frequency), 0 until known
+// Display-period estimator (2026-11-15). Replaces the EWMA of integer Hz: the cap must track
+// the display exactly (100.4 Hz against an integer cap of 100 left the game 0.4 frames/s
+// behind, a repeat every 2.5 s), and one skipped host slot must not pull it down (a 20 ms
+// period at alpha 0.1 took the old mean from 100 to 95 for 0.3 s after every blocking load).
+//   * Averages the PERIOD in seconds, never rounded. Two sources: the compositor's
+//     presentation times (vc_note_presentation_time, exact vsync schedule, differences are
+//     whole display periods) and, while none arrive, the acquire-call intervals.
+//   * Outliers: a period outside 0.5x..1.5x of the estimate (a skipped or doubled slot) is
+//     ignored instead of averaged in.
+//   * Slow averaging (1/64 per presentation sample, 1/256 per acquire sample) for accuracy;
+//     a real rate switch (90 <-> 100 Hz) is caught by 16 consecutive samples more than 3 %
+//     off on the same side, which reset the estimate to their mean (0.2 s at 90 Hz).
+static std::atomic<double> g_dispPeriodS{0.0};   // estimated display period, seconds; 0 until known
+static int      g_dispSource     = 0;             // 1 = presentation times, 2 = acquire intervals (fallback)
+static uint64_t g_dispLastPtTick = 0;             // mach time of the last presentation-time sample
+
+static double vcrt_display_period(void)
+{
+	double p = g_dispPeriodS.load(std::memory_order_relaxed);
+	return p > 0.0 ? p : 1.0 / 90.0;   // 90 Hz until the first sample
+}
+
+// Effective frame cap in Hz: fixed (>0), auto (= estimated display rate), or 0 = off.
+static double vcrt_cap_hz_exact(void)
+{
+	return (g_frameCapHz > 0) ? (double)g_frameCapHz
+	     : (g_frameCapHz < 0) ? 1.0 / vcrt_display_period()
+	     : 0.0;
+}
+
+// Render thread only (both sources are called from it).
+static void vcrt_rate_sample(double periodS, int source)
+{
+	if (periodS < 0.004 || periodS > 0.040) return;   // 25..250 Hz sane
+	double est = g_dispPeriodS.load(std::memory_order_relaxed);
+	if (est <= 0.0) {
+		g_dispPeriodS.store(periodS, std::memory_order_relaxed);
+		return;
+	}
+	double ratio = periodS / est;
+	if (ratio > 1.5 || ratio < 0.5) return;           // skipped / doubled slot: not a rate sample
+	static int devRun = 0, devSign = 0; static double devSum = 0.0;
+	int sign = ratio > 1.03 ? 1 : (ratio < 0.97 ? -1 : 0);
+	if (sign != 0 && sign == devSign) { devRun++; devSum += periodS; }
+	else { devRun = sign ? 1 : 0; devSign = sign; devSum = sign ? periodS : 0.0; }
+	if (devRun >= 16) {                                // a real switch: jump to the new rate
+		est = devSum / (double)devRun;
+		devRun = 0; devSign = 0; devSum = 0.0;
+	} else {
+		double a = (source == 1) ? (1.0 / 64.0) : (1.0 / 256.0);
+		est += a * (periodS - est);
+	}
+	g_dispPeriodS.store(est, std::memory_order_relaxed);
+}
+
+// Host seam: the presentation time of the compositor frame being rendered (seconds on the
+// LayerRenderer clock; only differences are used). Preferred rate source: the schedule is
+// exact, consecutive values differ by whole display periods.
+extern "C" void
+vc_note_presentation_time(double seconds)
+{
+	static double last = 0.0;
+	if (last > 0.0 && seconds > last) {
+		double d = seconds - last;
+		vcrt_rate_sample(d, 1);
+#if VC_DIAGNOSTICS
+		if (vc_diag_on()) vc_diag_rate_sample(1, d);
+#endif
+	}
+	last = seconds;
+	g_dispLastPtTick = mach_absolute_time();
+	g_dispSource = 1;
+}
 
 // One bit ("busy") could not tell "finished but not yet fetched" from "in use by
 // the compositor" -- and the second must never be reclaimed while Metal reads it.
@@ -931,12 +1004,12 @@ vcrt_begin_frame(void)
 	// phase-locked cap "A" -- g_lastAcqSec grid, VC_CAP_LEAD_MS/GUARD_MS -- was removed as
 	// symptom treatment once the fix addressed the cause; on device: no visible difference,
 	// and it dropped the recycles the free-run wastes.)
-	int capHz = (g_frameCapHz > 0) ? g_frameCapHz
-	          : (g_frameCapHz < 0) ? (g_displayHz > 0 ? g_displayHz : 90)
-	          : 0;
-	if (capHz > 0) {
+	// The period is the estimated display period as a double (vcrt_display_period), not an
+	// integer Hz: the grid has to follow 100.4 Hz as 9.96 ms, not 10.00 ms.
+	double capHz = vcrt_cap_hz_exact();
+	if (capHz > 0.0) {
 		static double nextSlot = 0.0;
-		double period = 1.0 / (double)capHz;
+		double period = 1.0 / capHz;
 		double now = vc_now_seconds();
 		if (nextSlot == 0.0) nextSlot = now;
 		if (now < nextSlot) { usleep((useconds_t)((nextSlot - now) * 1.0e6)); now = vc_now_seconds(); }
@@ -1222,8 +1295,9 @@ vcrt_drop_ready(int i)
 static int
 vcrt_fifo_select(uint64_t now)
 {
-	int hz = g_displayHz > 0 ? g_displayHz : 90;
-	uint64_t period = vcrt_ticks_per_second() / (uint64_t)hz;
+	double periodS = vcrt_display_period();
+	uint64_t period = (uint64_t)(periodS * (double)vcrt_ticks_per_second());
+	int hz = (int)(1.0 / periodS + 0.5);   // drain rule: about one second of acquires
 	int oldest = -1, newest = -1, nReady = 0;
 	for (int i = 0; i < g_numBuffers; i++) {
 		if (g_buf[i].state != VC_BUF_READY) continue;
@@ -1271,17 +1345,6 @@ vcrt_fifo_select(uint64_t now)
 	return oldest;
 }
 
-#if VC_DIAGNOSTICS
-// Effective frame cap for the recorder -- the same expression vcrt_begin_frame uses
-// (keep in sync): fixed (>0), auto (= measured display rate, 90 until known), or 0 = off.
-static inline int vcrt_diag_cap_hz(void)
-{
-	return (g_frameCapHz > 0) ? g_frameCapHz
-	     : (g_frameCapHz < 0) ? (g_displayHz > 0 ? g_displayHz : 90)
-	     : 0;
-}
-#endif
-
 // --- C seam consumed by the compositor (next step) -------------------------
 extern "C" bool
 vc_acquire_ready_frame(vc_ready_frame_t *out)
@@ -1293,12 +1356,10 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	uint64_t diagPeriod = 0;   // unfiltered acquire-to-acquire period for the recorder
 #endif
 	uint64_t acqNow = 0;       // this acquire's mach time (fifo: age and drain rules)
-	// Measure the DISPLAY RATE from the acquire-call frequency: the compositor calls
-	// this once per display frame, so its period is the refresh period. Feeds the
-	// auto frame-cap (g_frameCapHz == -1) so we never hardcode 90 (M2 vs M5 differ).
+	// Display-rate fallback from the acquire-call interval: the compositor calls this once
+	// per display frame. Used by the estimator only while no presentation-time samples
+	// arrive (vc_note_presentation_time); otherwise just recorded for the jitter comparison.
 	{
-		static uint64_t sNum = 0, sDen = 0;
-		if (sDen == 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); sNum = tb.numer; sDen = tb.denom; }
 		static uint64_t sLastAcq = 0;
 		uint64_t nowT = mach_absolute_time();
 		acqNow = nowT;
@@ -1306,13 +1367,14 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 		if (sLastAcq != 0) diagPeriod = nowT - sLastAcq;
 #endif
 		if (sLastAcq != 0) {
-			double periodMs = (double)(nowT - sLastAcq) * (double)sNum / (double)sDen / 1.0e6;
-			if (periodMs > 4.0 && periodMs < 40.0) {   // 25-250 Hz sane
-				static double ewma = 0.0;
-				double hz = 1000.0 / periodMs;
-				ewma = (ewma == 0.0) ? hz : ewma * 0.9 + hz * 0.1;
-				g_displayHz = (int)(ewma + 0.5);
+			double periodS = (double)(nowT - sLastAcq) / (double)vcrt_ticks_per_second();
+			if (g_dispLastPtTick == 0 || nowT - g_dispLastPtTick > 2 * vcrt_ticks_per_second()) {
+				vcrt_rate_sample(periodS, 2);
+				g_dispSource = 2;
 			}
+#if VC_DIAGNOSTICS
+			if (vc_diag_on()) vc_diag_rate_sample(2, periodS);
+#endif
 		}
 		sLastAcq = nowT;
 	}
@@ -1337,7 +1399,7 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 		sAcqMiss++;
 		pthread_mutex_unlock(&g_bufMutex);
 #if VC_DIAGNOSTICS
-		if (vc_diag_on()) vc_diag_acquire(diagPeriod, 0, g_displayHz, vcrt_diag_cap_hz());   // miss: frame re-shown
+		if (vc_diag_on()) vc_diag_acquire(diagPeriod, 0, 1.0 / vcrt_display_period(), vcrt_cap_hz_exact(), g_dispSource);   // miss: frame re-shown
 #endif
 		if (vc_render_mode() == 1) {
 			static double lastMissLog = 0.0;
@@ -1391,7 +1453,7 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 	pthread_mutex_unlock(&g_bufMutex);
 #if VC_DIAGNOSTICS
 	if (vc_diag_on()) {
-		vc_diag_acquire(diagPeriod, 1, g_displayHz, vcrt_diag_cap_hz());   // hit: new frame handed out
+		vc_diag_acquire(diagPeriod, 1, 1.0 / vcrt_display_period(), vcrt_cap_hz_exact(), g_dispSource);   // hit: new frame handed out
 		if (diagPublishTick) vc_diag_pub_to_acq(acqNow > diagPublishTick ? acqNow - diagPublishTick : 0);
 	}
 #else
@@ -1417,7 +1479,7 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 		int b = (int)ageMs; if (b < 0) b = 0; if (b > 63) b = 63;
 		hist[b]++; hn++;
 		if (ageMs > hmax) hmax = ageMs;
-		double periodMs = 1000.0 / (double)(g_displayHz > 0 ? g_displayHz : 90);
+		double periodMs = vcrt_display_period() * 1000.0;
 		if (ageMs > 1.5 * periodMs) hout++;
 		if (lastLatLog == 0.0) lastLatLog = nowS;
 		if (nowS - lastLatLog >= 2.0 && hn > 0) {

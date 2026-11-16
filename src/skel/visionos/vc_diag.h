@@ -119,7 +119,12 @@ extern std::atomic<int> g_vcDiagOn;   // 1 = recording (VC_DIAG_RECORD=1 seen at
 extern "C" {
 void vc_diag_init(void);                                    // game thread, once, before the game loop
 void vc_diag_frame(const vc_diag_frame_t *f);              // game thread, once per Idle iteration (mark 5)
-void vc_diag_acquire(uint64_t periodTicks, int hit, int ewmaHz, int capHz);   // render thread, per acquire
+// Render thread, per acquire. rateHz = estimated display rate, capHz = effective frame cap
+// (both exact doubles), source = 1 presentation times, 2 acquire intervals.
+void vc_diag_acquire(uint64_t periodTicks, int hit, double rateHz, double capHz, int source);
+// Render thread: one raw period sample (seconds) of a rate source, for the per-second
+// jitter comparison of the two sources (ptjit / acqjit).
+void vc_diag_rate_sample(int source, double periodS);
 // Render thread, per acquired frame: publish -> acquire distance of the frame handed out
 // (how long it waited in READY). Small values = the frame was finished just in time.
 void vc_diag_pub_to_acq(uint64_t ageTicks);

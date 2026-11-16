@@ -45,18 +45,23 @@ static std::atomic<uint64_t> g_acqLastPeriod{0};       // most recent acquire pe
 // bucket = overflow). Filled on the render thread, drained (exchange 0) by the game-thread tick.
 #define VCD_P2A_N 256
 static std::atomic<uint32_t> g_p2aHist[VCD_P2A_N];
-static std::atomic<int> g_ewmaHz{0}, g_capHz{0};
+static std::atomic<int> g_rate100{0}, g_cap100{0};   // estimated display rate and effective cap, Hz x 100
+static std::atomic<int> g_rateSource{0};             // 1 = presentation times, 2 = acquire intervals
+// Raw period samples of both rate sources, window min/max in microseconds (jitter comparison).
+static std::atomic<uint32_t> g_srcMinUs[3], g_srcMaxUs[3];
 // Owned by the render thread: a 16-period window for the "rate changed" detector. The
 // window only counts as a reading when all 16 periods agree (max-min < 20 % of the mean),
 // so a single doubled frame (a hitch) cannot fake a display-rate change.
 #define VCD_RT_RING 16
 static uint64_t g_rtRing[VCD_RT_RING]; static int g_rtPos = 0; static int g_rtFilled = 0;
 static int      g_rtStableHz10 = 0;        // last accepted raw rate, Hz*10
-static int      g_rtLastCap = -1;
 static uint32_t g_rtRunCount = 0;          // current run of consecutive misses
-// Cap transition: one event per excursion (start -> extreme -> end) instead of one per Hz.
+// Cap transition: one event per excursion (start -> extreme -> end). With the exact (double)
+// cap the value moves a little every frame, so a transition opens only when the cap leaves
+// its base by more than 0.5 Hz and closes when it is back within 0.25 Hz (excursion) or has
+// rested for a second on a new value (a real rate change). Values in Hz x 100.
 static bool     g_capOpen = false;
-static int      g_capStart = 0, g_capExt = 0;
+static int      g_capBase = -1, g_capStart = 0, g_capExt = 0, g_capLastVal = 0;
 static uint64_t g_capStartTick = 0, g_capLastChangeTick = 0;
 
 // ---- game thread (vc_diag_frame) --------------------------------------------------------
@@ -87,7 +92,8 @@ typedef struct {
 	uint64_t maxv[VC_DIAG_M_N];                            // window maxima (ticks)
 	uint64_t acqTotal, acqHit, acqPeriodTicks, acqPeriodN, acqMaxPeriod, runMax;
 	int32_t  p2aMin, p2aP5, p2aP50;   // publish -> acquire, 0.1 ms buckets; -1 = no sample
-	int32_t  ewmaHz, capHz;
+	int32_t  rate100, cap100, rateSource;
+	uint32_t srcMinUs[3], srcMaxUs[3];   // raw period samples per rate source (1 pt, 2 acquire)
 	int32_t  splash, loading, menu, timerPaused, fade, cutscene, level, area;
 	uint32_t comboNew, comboTotal;
 	uint64_t probeSum, probeMax; uint32_t probeN;
@@ -192,15 +198,27 @@ extern "C" void vc_diag_combo(uint64_t key)
 	g_comboOverflow++;
 }
 
+extern "C" void vc_diag_rate_sample(int source, double periodS)
+{
+	if (!vc_diag_on() || source < 1 || source > 2) return;
+	uint32_t us = (uint32_t)(periodS * 1.0e6 + 0.5);
+	uint32_t cur = g_srcMinUs[source].load(std::memory_order_relaxed);
+	while ((cur == 0 || us < cur) && !g_srcMinUs[source].compare_exchange_weak(cur, us, std::memory_order_relaxed)) {}
+	cur = g_srcMaxUs[source].load(std::memory_order_relaxed);
+	while (us > cur && !g_srcMaxUs[source].compare_exchange_weak(cur, us, std::memory_order_relaxed)) {}
+}
+
 // Render thread, once per compositor acquire. periodTicks = time since the previous
 // acquire call (0 on the first), hit = a new game frame was handed out.
-extern "C" void vc_diag_acquire(uint64_t periodTicks, int hit, int ewmaHz, int capHz)
+extern "C" void vc_diag_acquire(uint64_t periodTicks, int hit, double rateHz, double capHzD, int source)
 {
 	if (!vc_diag_on()) return;
 	g_acqTotal.fetch_add(1, std::memory_order_relaxed);
 	if (hit) g_acqHit.fetch_add(1, std::memory_order_relaxed);
-	g_ewmaHz.store(ewmaHz, std::memory_order_relaxed);
-	g_capHz.store(capHz, std::memory_order_relaxed);
+	int capHz = (int)(capHzD * 100.0 + 0.5);   // Hz x 100 from here on
+	g_rate100.store((int)(rateHz * 100.0 + 0.5), std::memory_order_relaxed);
+	g_cap100.store(capHz, std::memory_order_relaxed);
+	g_rateSource.store(source, std::memory_order_relaxed);
 
 	// Repeats: consecutive misses = the compositor re-showed the held frame. Run length is
 	// approximated as misses x the current period (no extra clock read).
@@ -239,28 +257,30 @@ extern "C" void vc_diag_acquire(uint64_t periodTicks, int hit, int ewmaHz, int c
 		}
 	}
 
-	// Cap transitions: open on the first change away from the base value, track the
-	// extreme, close when the cap is back at the base (excursion) or has rested for 1 s
-	// on a new value (a real change). One event either way.
-	if (capHz != g_rtLastCap) {
-		if (g_rtLastCap >= 0) {
+	// Cap transitions (Hz x 100): open when the cap leaves its base by more than 0.5 Hz,
+	// track the extreme, close when it is back within 0.25 Hz of the base (excursion) or has
+	// rested for 1 s on a new value (a real change). One event either way.
+	if (g_capBase < 0) { g_capBase = capHz; g_capLastVal = capHz; }
+	int dBase = capHz - g_capBase; if (dBase < 0) dBase = -dBase;
+	if (!g_capOpen) {
+		if (dBase > 50) {
 			uint64_t now = mach_absolute_time();
-			if (!g_capOpen) { g_capOpen = true; g_capStart = g_rtLastCap; g_capExt = capHz; g_capStartTick = now; }
-			else {
-				int dExt = g_capExt - g_capStart, dNew = capHz - g_capStart;
-				if ((dNew < 0 ? -dNew : dNew) > (dExt < 0 ? -dExt : dExt)) g_capExt = capHz;
-			}
-			g_capLastChangeTick = now;
+			g_capOpen = true; g_capStart = g_capBase; g_capExt = capHz; g_capLastVal = capHz;
+			g_capStartTick = now; g_capLastChangeTick = now;
 		}
-		g_rtLastCap = capHz;
-	}
-	if (g_capOpen) {
-		if (capHz == g_capStart) {
-			vcdEvent4(VC_DIAG_EV_CAP, g_capStart, g_capExt, capHz, (int)vcdMs(g_capLastChangeTick - g_capStartTick));
+	} else {
+		int dExt = g_capExt - g_capStart; if (dExt < 0) dExt = -dExt;
+		int dNew = capHz - g_capStart; if (dNew < 0) dNew = -dNew;
+		if (dNew > dExt) g_capExt = capHz;
+		int dLast = capHz - g_capLastVal; if (dLast < 0) dLast = -dLast;
+		uint64_t now = mach_absolute_time();
+		if (dLast > 5) { g_capLastVal = capHz; g_capLastChangeTick = now; }
+		if (dBase <= 25) {
+			vcdEvent4(VC_DIAG_EV_CAP, g_capStart, g_capExt, capHz, (int)vcdMs(now - g_capStartTick));
 			g_capOpen = false;
-		} else if (periodTicks && (uint64_t)g_rtRunCount == 0 && mach_absolute_time() - g_capLastChangeTick > g_ticksPerSec) {
+		} else if (now - g_capLastChangeTick > g_ticksPerSec) {
 			vcdEvent4(VC_DIAG_EV_CAP, g_capStart, g_capExt, capHz, (int)vcdMs(g_capLastChangeTick - g_capStartTick));
-			g_capOpen = false;
+			g_capOpen = false; g_capBase = capHz;
 		}
 	}
 }
@@ -324,8 +344,13 @@ static void vcdTick(uint64_t now)
 			}
 		}
 	}
-	s.ewmaHz = g_ewmaHz.load(std::memory_order_relaxed);
-	s.capHz = g_capHz.load(std::memory_order_relaxed);
+	s.rate100 = g_rate100.load(std::memory_order_relaxed);
+	s.cap100 = g_cap100.load(std::memory_order_relaxed);
+	s.rateSource = g_rateSource.load(std::memory_order_relaxed);
+	for (int i = 1; i <= 2; i++) {
+		s.srcMinUs[i] = g_srcMinUs[i].exchange(0, std::memory_order_relaxed);
+		s.srcMaxUs[i] = g_srcMaxUs[i].exchange(0, std::memory_order_relaxed);
+	}
 	s.splash = g_stSplash; s.loading = g_stLoading; s.menu = g_stMenu; s.timerPaused = g_stTimerPaused;
 	s.fade = g_stFade; s.cutscene = g_stCutscene;
 	s.level = g_stLevel; s.area = g_stArea;
@@ -365,7 +390,7 @@ extern "C" void vc_diag_frame(const vc_diag_frame_t *f)
 		if (b >= VCD_HIST_N) b = VCD_HIST_N - 1;
 		g_hist[b]++;
 		if (f->periodTicks > g_maxPeriod) g_maxPeriod = f->periodTicks;
-		int cap = g_capHz.load(std::memory_order_relaxed); if (cap <= 0) cap = 90;
+		int cap = (g_cap100.load(std::memory_order_relaxed) + 50) / 100; if (cap <= 0) cap = 90;
 		// budget = 1 s / cap; missed when period > 1.5 budget; a long frame when > 3 budgets
 		if (f->periodTicks * (uint64_t)cap * 2 > g_ticksPerSec * 3) g_missed++;
 		if (f->periodTicks * (uint64_t)cap > g_ticksPerSec * 3) {
@@ -447,7 +472,8 @@ static void vcdWriteHeader(void)
 	        vcrt_num_buffers(), vcrt_buffer_mode_name());
 	fprintf(g_file, "# S HH:MM:SS win=<window s> frames=<game iterations> world=<of which with the world block> pub=<frames handed to the compositor>"
 	                " miss=<intervals > 1.5x budget> max/p95=<frame interval ms>"
-	                " | disp raw=<compositor rate Hz> ewma=<g_displayHz> cap=<frame cap Hz> acq=<new images>/<compositor frames> rep=<compositor frames without a new image> maxrep=<longest such run ms> acqmax=<longest acquire period ms>"
+	                " | disp raw=<compositor rate Hz from acquire intervals> ewma=<estimated display rate, exact> cap=<frame cap Hz, exact> src=<estimator source: pt presentation times, acq acquire intervals>"
+	                " acqjit=<max-min of acquire intervals ms> ptjit=<max-min of presentation-time differences ms> acq=<new images>/<compositor frames> rep=<compositor frames without a new image> maxrep=<longest such run ms> acqmax=<longest acquire period ms>"
 	                " p2a=<publish -> acquire wait of the frames shown: min/median/p5 ms> drop=<finished frames recycled unshown> wait=<acquires that left a frame waiting> drain=<drops by the fifo drain rule>"
 	                " | logic/stream/render=<max ms in window> | strm req ld rd kb rdmax(ms) blk=<n>/<max ms>"
 	                " | tex <uploads>/<kb>/<max ms> | link <n>/<max ms> | combo <new this second>/<total this session>"
@@ -483,8 +509,10 @@ static void vcdWriteEvent(const VcdEvent &e)
 		case VC_DIAG_EV_RATE:
 			fprintf(g_file, "%s E display-rate %.1f -> %.1f Hz (16-period window)\n", ts, e.a / 10.0, e.b / 10.0); break;
 		case VC_DIAG_EV_CAP:
-			if (e.a == e.c) fprintf(g_file, "%s E cap %d -> %d -> %d Hz over %d ms (excursion, back at base)\n", ts, e.a, e.b, e.c, e.d);
-			else            fprintf(g_file, "%s E cap %d -> %d -> %d Hz over %d ms (settled on a new value)\n", ts, e.a, e.b, e.c, e.d);
+			if (e.c - e.a <= 25 && e.a - e.c <= 25)
+				fprintf(g_file, "%s E cap %.2f -> %.2f -> %.2f Hz over %d ms (excursion, back at base)\n", ts, e.a / 100.0, e.b / 100.0, e.c / 100.0, e.d);
+			else
+				fprintf(g_file, "%s E cap %.2f -> %.2f -> %.2f Hz over %d ms (settled on a new value)\n", ts, e.a / 100.0, e.b / 100.0, e.c / 100.0, e.d);
 			break;
 		case VC_DIAG_EV_HOST_GAP:      fprintf(g_file, "%s E host gap %d ms (no compositor acquire)\n", ts, e.a); break;
 		case VC_DIAG_EV_LAYER_PAUSED:  fprintf(g_file, "%s E layer paused\n", ts); break;
@@ -544,14 +572,17 @@ static void vcdWriteSecond(const VcdSecond &s, int thermal, double memMb)
 	}
 	fprintf(g_file,
 	        "%s S win=%.2f frames=%u world=%u pub=%llu miss=%u max=%.1f p95=%.1f"
-	        " | disp raw=%.1f ewma=%d cap=%d acq=%llu/%llu rep=%llu maxrep=%.0f acqmax=%.1f p2a=%s/%s/%s drop=%llu wait=%llu drain=%llu"
+	        " | disp raw=%.1f ewma=%.2f cap=%.2f src=%s acqjit=%.2f ptjit=%.2f acq=%llu/%llu rep=%llu maxrep=%.0f acqmax=%.1f p2a=%s/%s/%s drop=%llu wait=%llu drain=%llu"
 	        " | logic=%.1f stream=%.1f render=%.1f"
 	        " | strm req=%llu ld=%llu rd=%llu kb=%llu rdmax=%.1f blk=%llu/%.1f"
 	        " | tex %llu/%llukb/%.1f | link %llu/%.1f | combo %u/%u"
 	        " | thermal=%s mem=%.0f lvl=%d area=%d st=%s"
 	        " | probe %.2f/%.1fus wr=%.2f\n",
 	        ts, vcdMs(s.winTicks) / 1000.0, s.frames, s.worldFrames, (unsigned long long)s.cnt[VC_DIAG_C_PUBLISHES], s.missed, vcdMs(s.maxPeriod), p95,
-	        rawHz, s.ewmaHz, s.capHz, (unsigned long long)s.acqHit, (unsigned long long)s.acqTotal, (unsigned long long)rep, vcdMs(s.runMax), vcdMs(s.acqMaxPeriod),
+	        rawHz, s.rate100 / 100.0, s.cap100 / 100.0, s.rateSource == 1 ? "pt" : s.rateSource == 2 ? "acq" : "-",
+	        s.srcMaxUs[2] >= s.srcMinUs[2] ? (s.srcMaxUs[2] - s.srcMinUs[2]) / 1000.0 : 0.0,
+	        s.srcMaxUs[1] >= s.srcMinUs[1] ? (s.srcMaxUs[1] - s.srcMinUs[1]) / 1000.0 : 0.0,
+	        (unsigned long long)s.acqHit, (unsigned long long)s.acqTotal, (unsigned long long)rep, vcdMs(s.runMax), vcdMs(s.acqMaxPeriod),
 	        p2aMin, p2aP50, p2aP5, (unsigned long long)s.cnt[VC_DIAG_C_DROPS],
 	        (unsigned long long)s.cnt[VC_DIAG_C_WAIT], (unsigned long long)s.cnt[VC_DIAG_C_DRAIN],
 	        vcdMs(s.maxLogic), vcdMs(s.maxStream), vcdMs(s.maxRender),
