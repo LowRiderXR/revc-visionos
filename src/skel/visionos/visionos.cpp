@@ -1934,12 +1934,15 @@ run_game_loop(void)
 	vcgl_release_current();
 }
 
+static std::atomic<bool> g_gameThreadExited{false};   // set by the game thread on its way out
+
 static void *
 game_thread_main(void *arg)
 {
 	(void)arg;
 	pthread_setname_np("reVC game");
 	run_game_loop();
+	g_gameThreadExited.store(true);
 	return nil;
 }
 
@@ -1953,12 +1956,47 @@ vc_game_thread_start(void)
 		return;
 	}
 	g_stop.store(false);
+	g_gameThreadExited.store(false);
 	if (pthread_create(&g_gameThread, nil, game_thread_main, nil) == 0) {
 		g_gameThreadRunning = true;
 		printf("[vc-loop] game thread created\n");
 	} else {
 		printf("[vc-loop] FAIL: pthread_create\n");
 	}
+}
+
+// Ordered shutdown before the host calls _exit(0). Background (M5, 2026-11-16): the host
+// ended the process with exit(0) from the render thread; exit() runs the global destructors,
+// among them reVC's global cAudioManager, whose Terminate() calls into OpenAL Soft after
+// OpenAL's own statics (its std::recursive_mutex list lock) were already destroyed ->
+// std::system_error "recursive_mutex lock failed" -> abort, while the mixer kept running on
+// torn-down state (the scratching noise). So: pause the audio device first (silence), stop
+// the game thread with a time limit, then let the host _exit(0) so no destructor runs. Each
+// step logs with a timestamp so a hang shows where it sits.
+extern "C" void vc_audio_interruption(int began);   // sampman_oal.cpp: alcDevicePauseSOFT
+
+extern "C" void
+vc_shutdown_for_exit(int timeoutMs)
+{
+	uint64_t t0 = mach_absolute_time();
+	printf("[vc-exit] shutdown begin (game thread %s)\n", g_gameThreadRunning ? "running" : "not running");
+	vc_audio_interruption(1);
+	printf("[vc-exit] audio device paused (%.0f ms)\n", vcTicksMs(mach_absolute_time() - t0));
+	if (g_gameThreadRunning) {
+		g_stop.store(true);
+		RsGlobal.quit = TRUE;
+		int waited = 0;
+		while (!g_gameThreadExited.load() && waited < timeoutMs) { usleep(10 * 1000); waited += 10; }
+		if (g_gameThreadExited.load()) {
+			pthread_join(g_gameThread, nil);
+			g_gameThreadRunning = false;
+			printf("[vc-exit] game thread stopped (%.0f ms)\n", vcTicksMs(mach_absolute_time() - t0));
+		} else {
+			printf("[vc-exit] game thread still running after %d ms -- exiting anyway\n", timeoutMs);
+		}
+	}
+	printf("[vc-exit] shutdown done (%.0f ms), host exits without destructors\n", vcTicksMs(mach_absolute_time() - t0));
+	fflush(stdout);
 }
 
 extern "C" void
