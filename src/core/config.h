@@ -400,7 +400,13 @@ static_assert(false, "SUPPORT_XBOX_SCRIPT and SUPPORT_MOBILE_SCRIPT are mutually
 #define USE_MISSION_REPLAY_OVERRIDE_FOR_NON_MOBILE_SCRIPT
 #endif
 #define USE_ADVANCED_SCRIPT_DEBUG_OUTPUT
-#define SCRIPT_LOG_FILE_LEVEL 1 // 0 == no log, 1 == overwrite every frame, 2 == full log
+// 0 == no log (upstream re3 default), 1 == overwrite every frame, 2 == full log.
+// Level 1 came in with the reVC-Mac fork and ran in every build: per frame it opened
+// SCRDBG.LOG in the user-files folder, formatted every executed script command and wrote
+// it (2.1 MB/s of file writes and about half of the game thread's CPU time on the Vision
+// Pro, system resource reports 2026-11-16). Back to 0: script assertions still print their
+// command name through the basic debug output.
+#define SCRIPT_LOG_FILE_LEVEL 0
 
 #if SCRIPT_LOG_FILE_LEVEL == 0
 #undef USE_ADVANCED_SCRIPT_DEBUG_OUTPUT
