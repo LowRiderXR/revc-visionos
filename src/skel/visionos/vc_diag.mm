@@ -49,6 +49,8 @@ static std::atomic<int> g_rate100{0}, g_cap100{0};   // estimated display rate a
 static std::atomic<int> g_rateSource{0};             // 1 = presentation times, 2 = acquire intervals
 // Raw period samples of both rate sources, window min/max in microseconds (jitter comparison).
 static std::atomic<uint32_t> g_srcMinUs[3], g_srcMaxUs[3];
+// Simulated timestep per CTimer::Update (game thread), window min/max in microseconds.
+static std::atomic<uint32_t> g_simdtMinUs{0}, g_simdtMaxUs{0};
 // Owned by the render thread: a 16-period window for the "rate changed" detector. The
 // window only counts as a reading when all 16 periods agree (max-min < 20 % of the mean),
 // so a single doubled frame (a hitch) cannot fake a display-rate change.
@@ -94,6 +96,7 @@ typedef struct {
 	int32_t  p2aMin, p2aP5, p2aP50;   // publish -> acquire, 0.1 ms buckets; -1 = no sample
 	int32_t  rate100, cap100, rateSource;
 	uint32_t srcMinUs[3], srcMaxUs[3];   // raw period samples per rate source (1 pt, 2 acquire)
+	uint32_t simdtMinUs, simdtMaxUs;     // simulated timestep (Timer.cpp), before the time scale
 	int32_t  splash, loading, menu, timerPaused, fade, cutscene, level, area;
 	uint32_t comboNew, comboTotal;
 	uint64_t probeSum, probeMax; uint32_t probeN;
@@ -206,6 +209,16 @@ extern "C" void vc_diag_rate_sample(int source, double periodS)
 	while ((cur == 0 || us < cur) && !g_srcMinUs[source].compare_exchange_weak(cur, us, std::memory_order_relaxed)) {}
 	cur = g_srcMaxUs[source].load(std::memory_order_relaxed);
 	while (us > cur && !g_srcMaxUs[source].compare_exchange_weak(cur, us, std::memory_order_relaxed)) {}
+}
+
+extern "C" void vc_diag_simdt(double ms)
+{
+	if (!vc_diag_on()) return;
+	uint32_t us = (uint32_t)(ms * 1000.0 + 0.5);
+	uint32_t cur = g_simdtMinUs.load(std::memory_order_relaxed);
+	while ((cur == 0 || us < cur) && !g_simdtMinUs.compare_exchange_weak(cur, us, std::memory_order_relaxed)) {}
+	cur = g_simdtMaxUs.load(std::memory_order_relaxed);
+	while (us > cur && !g_simdtMaxUs.compare_exchange_weak(cur, us, std::memory_order_relaxed)) {}
 }
 
 // Render thread, once per compositor acquire. periodTicks = time since the previous
@@ -351,6 +364,8 @@ static void vcdTick(uint64_t now)
 		s.srcMinUs[i] = g_srcMinUs[i].exchange(0, std::memory_order_relaxed);
 		s.srcMaxUs[i] = g_srcMaxUs[i].exchange(0, std::memory_order_relaxed);
 	}
+	s.simdtMinUs = g_simdtMinUs.exchange(0, std::memory_order_relaxed);
+	s.simdtMaxUs = g_simdtMaxUs.exchange(0, std::memory_order_relaxed);
 	s.splash = g_stSplash; s.loading = g_stLoading; s.menu = g_stMenu; s.timerPaused = g_stTimerPaused;
 	s.fade = g_stFade; s.cutscene = g_stCutscene;
 	s.level = g_stLevel; s.area = g_stArea;
@@ -467,15 +482,16 @@ static void vcdWriteHeader(void)
 	time_t secs = time(NULL); struct tm tmv; localtime_r(&secs, &tmv);
 	NSString *dev = @"?";
 	@autoreleasepool { id<MTLDevice> d = MTLCreateSystemDefaultDevice(); if (d) dev = d.name; }
-	fprintf(g_file, "# [vc-diag] stutter diagnostics v2  session %04d-%02d-%02d %s  device='%s'  pid=%d  buffers=%d mode=%s\n",
+	fprintf(g_file, "# [vc-diag] stutter diagnostics v2  session %04d-%02d-%02d %s  device='%s'  pid=%d  buffers=%d mode=%s  timestep=%s\n",
 	        tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, ts, dev.UTF8String, (int)getpid(),
-	        vcrt_num_buffers(), vcrt_buffer_mode_name());
+	        vcrt_num_buffers(), vcrt_buffer_mode_name(), vc_timestep_mode_name());
 	fprintf(g_file, "# S HH:MM:SS win=<window s> frames=<game iterations> world=<of which with the world block> pub=<frames handed to the compositor>"
 	                " miss=<intervals > 1.5x budget> max/p95=<frame interval ms>"
 	                " | disp raw=<compositor rate Hz from acquire intervals> ewma=<estimated display rate, exact> cap=<frame cap Hz, exact> src=<estimator source: pt presentation times, acq acquire intervals>"
 	                " acqjit=<max-min of acquire intervals ms> ptjit=<max-min of presentation-time differences ms> acq=<new images>/<compositor frames> rep=<compositor frames without a new image> maxrep=<longest such run ms> acqmax=<longest acquire period ms>"
 	                " p2a=<publish -> acquire wait of the frames shown: min/median/p5 ms> drop=<finished frames recycled unshown> wait=<acquires that left a frame waiting> drain=<drops by the fifo drain rule>"
-	                " | logic/stream/render=<max ms in window> | strm req ld rd kb rdmax(ms) blk=<n>/<max ms>"
+	                " | logic/stream/render=<max ms in window> simdt=<simulated timestep min/max ms, before the time scale; quant: whole display periods>"
+	                " | strm req ld rd kb rdmax(ms) blk=<n>/<max ms>"
 	                " | tex <uploads>/<kb>/<max ms> | link <n>/<max ms> | combo <new this second>/<total this session>"
 	                " | thermal mem(MB) lvl area st=<play|menu,splash,load,fade,fading,cut,tpause>"
 	                " | probe <avg>/<max> us per frame (own cost, game thread) wr=<writer ms>\n");
@@ -573,7 +589,7 @@ static void vcdWriteSecond(const VcdSecond &s, int thermal, double memMb)
 	fprintf(g_file,
 	        "%s S win=%.2f frames=%u world=%u pub=%llu miss=%u max=%.1f p95=%.1f"
 	        " | disp raw=%.1f ewma=%.2f cap=%.2f src=%s acqjit=%.2f ptjit=%.2f acq=%llu/%llu rep=%llu maxrep=%.0f acqmax=%.1f p2a=%s/%s/%s drop=%llu wait=%llu drain=%llu"
-	        " | logic=%.1f stream=%.1f render=%.1f"
+	        " | logic=%.1f stream=%.1f render=%.1f simdt=%.2f/%.2f"
 	        " | strm req=%llu ld=%llu rd=%llu kb=%llu rdmax=%.1f blk=%llu/%.1f"
 	        " | tex %llu/%llukb/%.1f | link %llu/%.1f | combo %u/%u"
 	        " | thermal=%s mem=%.0f lvl=%d area=%d st=%s"
@@ -585,7 +601,7 @@ static void vcdWriteSecond(const VcdSecond &s, int thermal, double memMb)
 	        (unsigned long long)s.acqHit, (unsigned long long)s.acqTotal, (unsigned long long)rep, vcdMs(s.runMax), vcdMs(s.acqMaxPeriod),
 	        p2aMin, p2aP50, p2aP5, (unsigned long long)s.cnt[VC_DIAG_C_DROPS],
 	        (unsigned long long)s.cnt[VC_DIAG_C_WAIT], (unsigned long long)s.cnt[VC_DIAG_C_DRAIN],
-	        vcdMs(s.maxLogic), vcdMs(s.maxStream), vcdMs(s.maxRender),
+	        vcdMs(s.maxLogic), vcdMs(s.maxStream), vcdMs(s.maxRender), s.simdtMinUs / 1000.0, s.simdtMaxUs / 1000.0,
 	        (unsigned long long)s.cnt[VC_DIAG_C_STREAM_REQ], (unsigned long long)s.cnt[VC_DIAG_C_STREAM_LOADED],
 	        (unsigned long long)s.cnt[VC_DIAG_C_CD_READS], (unsigned long long)(s.cnt[VC_DIAG_C_CD_BYTES] / 1024ull),
 	        vcdMs(s.maxv[VC_DIAG_M_CD_READ]), (unsigned long long)s.cnt[VC_DIAG_C_BLOCKING_LOADS], vcdMs(s.maxv[VC_DIAG_M_BLOCKING_LOAD]),

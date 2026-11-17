@@ -16,6 +16,56 @@
 
 #ifdef LIBRW_VISIONOS
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#if VC_DIAGNOSTICS
+#include "skel/visionos/vc_diag.h"   // stutter recorder: simulated timestep per frame
+#endif
+
+// Quantized timestep (2026-11-17). The game's frames are paced to the display (frame cap in
+// vcrt_begin_frame) and shown in whole display slots, but the wall-clock delta between two
+// Idle calls still scatters by up to +-35 % of a period. Integrating the camera and the
+// physics with that scattered delta while the pictures appear in even slots is micro-judder
+// with every slot filled. Mountain 64 avoids it by taking the delta from the presentation
+// schedule. Here: round the measured delta to whole display periods, carrying the remainder
+// so game time keeps following the wall clock (bounded by about half a period).
+//   VC_TIMESTEP=wall restores the measured delta (A/B); default quant.
+extern "C" double vc_timestep_period_ms(void);   // visionos_angle.mm: cap period, 0 = not paced
+static int vcTimestepQuant(void)
+{
+	static int quant = -1;
+	if (quant < 0) {
+		const char *e = getenv("VC_TIMESTEP");
+		quant = (e && strcmp(e, "wall") == 0) ? 0 : 1;
+		printf("[vc-timer] timestep = %s\n", quant ? "quant (whole display periods, remainder carried)" : "wall (measured delta, VC_TIMESTEP=wall)");
+	}
+	return quant;
+}
+extern "C" const char *vc_timestep_mode_name(void) { return vcTimestepQuant() ? "quant" : "wall"; }
+
+// Returns the delta to simulate, in ms, for a measured wall-clock delta of rawMs.
+static double vcQuantizeDelta(double rawMs)
+{
+	static double carryMs = 0.0;
+	double periodMs = vcTimestepQuant() ? vc_timestep_period_ms() : 0.0;
+	if (periodMs <= 0.0) { carryMs = 0.0; return rawMs; }           // not paced: wall clock
+	if (rawMs > 4.0 * periodMs) { carryMs = 0.0; return rawMs; }     // a stall or a load: take it as measured
+	double total = rawMs + carryMs;
+	long n = lround(total / periodMs);
+	// A real frame is never zero periods: the cap grid can hand out a short frame right
+	// after a catch-up, and the camera must not stand still for one picture. Deltas under a
+	// quarter period are the second Update() call of the same frame (loads, cutscene start)
+	// and get zero, exactly like the stock minimum step.
+	if (n < 1 && rawMs >= 0.25 * periodMs) n = 1;
+	if (n < 0) n = 0;
+	double used = (double)n * periodMs;
+	carryMs = total - used;
+	if (carryMs >  0.5 * periodMs) carryMs =  0.5 * periodMs;      // bounded: never grows across frames
+	if (carryMs < -0.5 * periodMs) carryMs = -0.5 * periodMs;
+	return used;
+}
+
 // DIAGNOSE: once per second, the smallest/largest per-frame delta in microseconds.
 // Direct proof the clock is now sub-millisecond (multiples of 1000 us before the
 // fix; ~11100 us with spread after). ns arg = raw 32-bit counter delta.
@@ -142,13 +192,21 @@ void CTimer::Update(void)
 		_oldPerfCounter = pc;
 #ifdef LIBRW_VISIONOS
 		vcTimerLogDelta(updInCycles); // updInCycles is nanoseconds (freq = 1e9)
-#endif
 
+		// Quantized timestep: one value for the frame, the time scale applied after rounding,
+		// and frameTime, dblUpdInMs and the pause-mode clock all derived from it.
+		dblUpdInMs = vcQuantizeDelta((double)updInCycles / (double)_nCyclesPerMS);
+		frameTime = GetIsPaused() ? dblUpdInMs : dblUpdInMs * ms_fTimeScale;
+#if VC_DIAGNOSTICS
+		if (vc_diag_on()) vc_diag_simdt(dblUpdInMs);
+#endif
+#else
 		float updInCyclesScaled = GetIsPaused() ? updInCycles : updInCycles * ms_fTimeScale;
 
 		frameTime = updInCyclesScaled / (double)_nCyclesPerMS;
 
 		dblUpdInMs = (double)updInCycles / (double)_nCyclesPerMS;
+#endif
 	}
 	else
 #endif

@@ -404,6 +404,16 @@ static double vcrt_cap_hz_exact(void)
 	     : 0.0;
 }
 
+// Period the game's frame start is paced to, in ms, for CTimer's quantized timestep
+// (Timer.cpp): the effective cap's period (auto = display period, fixed = 1/VC_FRAME_CAP_HZ),
+// or 0 when frames are not paced (cap off, cinema) and the timestep must follow the wall clock.
+extern "C" double
+vc_timestep_period_ms(void)
+{
+	double hz = vcrt_cap_hz_exact();
+	return hz > 0.0 ? 1000.0 / hz : 0.0;
+}
+
 // Render thread only (both sources are called from it).
 static void vcrt_rate_sample(double periodS, int source)
 {

@@ -131,6 +131,10 @@ void vc_diag_pub_to_acq(uint64_t ageTicks);
 // visionos_angle.mm: active buffer mode and pool size, for the session header.
 const char *vcrt_buffer_mode_name(void);
 int vcrt_num_buffers(void);
+// Timer.cpp: the simulated timestep of this frame in ms (before the time scale), once per
+// CTimer::Update, and the timestep mode name for the session header.
+void vc_diag_simdt(double ms);
+const char *vc_timestep_mode_name(void);
 void vc_diag_count(int counter, uint64_t add);              // any thread
 void vc_diag_max(int slot, uint64_t ticks);                 // any thread
 void vc_diag_event(int kind, int a, int b, int c);          // any thread
