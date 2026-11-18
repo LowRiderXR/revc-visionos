@@ -372,7 +372,7 @@ static double vcTicksMs(uint64_t ticks)
 	return (double)ticks * scale;
 }
 
-// --- fx spike probe (VC_FX_SPIKE_MS, default 4.0 ms) ---------------------------------
+// --- fx spike probe (VC_FX_SPIKE_MS, off unless set) ----------------------------------
 // [vc-frame] prints ONE sampled frame per 10 s. A RenderEffects call of 10.1 ms was seen
 // exactly once in that sampling and never again -- with a 10 s throttle we will essentially
 // never catch it, and "not reproduced" would be an artefact of the probe, not a fact about
@@ -381,13 +381,15 @@ static double vcTicksMs(uint64_t ticks)
 // only against those two numbers together.
 // Rate-limited to ~20 lines/s; the number of SUPPRESSED spikes is printed with the next
 // line, so a capped log never reads as "it happened 20 times" when it happened 200.
+// Off by default: the probe prints only when VC_FX_SPIKE_MS is set to a threshold in ms
+// (e.g. 4). The [vc-frame] fx segment is accumulated regardless of this switch.
 static double vcFxSpikeMs(void)
 {
 	static double v = -1.0;
 	if (v < 0.0) {
 		const char *e = getenv("VC_FX_SPIKE_MS");
-		v = e ? atof(e) : 4.0;
-		if (v <= 0.0) v = 1.0e9;   // VC_FX_SPIKE_MS=0 disables
+		v = e ? atof(e) : 0.0;
+		if (v <= 0.0) v = 1.0e9;   // unset or VC_FX_SPIKE_MS=0: disabled
 	}
 	return v;
 }
@@ -1287,7 +1289,9 @@ vcpad_rumble(CPad *pad)
 
 	if (intensity != last) {
 		last = intensity;
-		printf("[vc-pad] rumble %.2f\n", intensity);
+		// Strength changes several times per second during play; the line is a
+		// verbose probe, gated behind VC_PERF_LOG like the other perf lines.
+		if (vc_perf_log()) printf("[vc-pad] rumble %.2f\n", intensity);
 		vc_set_gamepad_rumble(intensity);
 	}
 }

@@ -1510,8 +1510,8 @@ vc_acquire_ready_frame(vc_ready_frame_t *out)
 
 	// Throttled handoff proof: which index / texture / wait the compositor is
 	// handed. Compare against [vc-stereo] PUBLISH -- idx and tex MUST match, and
-	// wait must be a sane increasing value.
-	if (stereo) {
+	// wait must be a sane increasing value. Verbose probe, gated behind VC_PERF_LOG.
+	if (stereo && vc_perf_log()) {
 		static double lastAcqLog = 0.0;
 		double now = vc_now_seconds();
 		if (now - lastAcqLog >= 1.0) {
@@ -2122,11 +2122,11 @@ extern "C" void vc_mv_use_counts(unsigned *mono, unsigned *mv, int reset);
 extern "C" int vc_mv_bind_switch_selftest(unsigned int mvFbo);
 
 static void
-vcrt_mv_use_poll(void)   // once per second, only while pairs exist
+vcrt_mv_use_poll(void)   // once per second, only while pairs exist and VC_PERF_LOG is set
 {
 	static double lastT = 0;
 	static bool modeChecked = false, on = false;
-	if (!modeChecked) { modeChecked = true; on = (vc_mv_pairs_mode() == 1); }
+	if (!modeChecked) { modeChecked = true; on = (vc_mv_pairs_mode() == 1) && vc_perf_log(); }
 	if (!on) return;
 	double now = vc_now_seconds();
 	if (now - lastT < 1.0) return;
