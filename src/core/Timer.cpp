@@ -65,27 +65,6 @@ static double vcQuantizeDelta(double rawMs)
 	if (carryMs < -0.5 * periodMs) carryMs = -0.5 * periodMs;
 	return used;
 }
-
-// DIAGNOSE: once per second, the smallest/largest per-frame delta in microseconds.
-// Direct proof the clock is now sub-millisecond (multiples of 1000 us before the
-// fix; ~11100 us with spread after). ns arg = raw 32-bit counter delta.
-static void vcTimerLogDelta(long long deltaNs)
-{
-	static long long minNs = 0x7FFFFFFFFFFFFFFFLL, maxNs = 0;
-	static int       count = 0;
-	static double    lastLogMs = -1.0;
-	if (deltaNs < minNs) minNs = deltaNs;
-	if (deltaNs > maxNs) maxNs = deltaNs;
-	count++;
-	LARGE_INTEGER now; QueryPerformanceCounter(&now);
-	double nowMs = (double)(unsigned long long)now.QuadPart / 1.0e6;
-	if (lastLogMs < 0.0) lastLogMs = nowMs;
-	if (nowMs - lastLogMs >= 1000.0) {
-		printf("[vc-timer] frame delta min=%lld us max=%lld us over %d frames\n",
-		       minNs / 1000, maxNs / 1000, count);
-		minNs = 0x7FFFFFFFFFFFFFFFLL; maxNs = 0; count = 0; lastLogMs = nowMs;
-	}
-}
 #endif
 
 uint32 CTimer::m_snTimeInMilliseconds;
@@ -191,8 +170,6 @@ void CTimer::Update(void)
 
 		_oldPerfCounter = pc;
 #ifdef LIBRW_VISIONOS
-		vcTimerLogDelta(updInCycles); // updInCycles is nanoseconds (freq = 1e9)
-
 		// Quantized timestep: one value for the frame, the time scale applied after rounding,
 		// and frameTime, dblUpdInMs and the pause-mode clock all derived from it.
 		dblUpdInMs = vcQuantizeDelta((double)updInCycles / (double)_nCyclesPerMS);
